@@ -107,6 +107,10 @@ Note: SVT-AV1 at preset 12 with GOP=2 is pipeline-bound, not compute-bound — i
 | CPU pinning with taskset | ~Same speed | OS scheduler already handles this reasonably |
 | SVT-AV1 2.3.0 (version upgrade) | ~Same speed | ABI break (different SONAME), API changes, no measurable gain at preset 12 |
 | av1_nvenc GPU encoding | 2x faster but 2.5x larger files | NVENC can't match libsvtav1's compression efficiency at GOP=2 |
+| GPU tonemapping (libplacebo/Vulkan) | Failed to initialize | Vulkan loader 1.3.275 too old for NVIDIA driver 580 |
+| OpenCL tonemapping | Failed to initialize | No OpenCL ICD installed on the system |
+| PyTorch CUDA tonemapping | ~Same speed | CPU↔GPU transfer overhead negated compute gains |
+| Reduced SVT-AV1 lookahead | ~Same speed | No measurable difference at preset 12 with GOP=2 |
 
 ## Requirements
 
