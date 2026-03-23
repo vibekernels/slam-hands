@@ -112,6 +112,17 @@ Note: SVT-AV1 at preset 12 with GOP=2 is pipeline-bound, not compute-bound — i
 | PyTorch CUDA tonemapping | ~Same speed | CPU↔GPU transfer overhead negated compute gains |
 | Reduced SVT-AV1 lookahead | ~Same speed | No measurable difference at preset 12 with GOP=2 |
 
+### Ideas not yet tried
+
+| Idea | Expected gain | Description |
+|------|--------------|-------------|
+| GOP-level parallel encoding | 3-4s | With GOP=2, each 2-frame group is independent. Decode once, distribute frame pairs round-robin to N SVT-AV1 instances, concatenate bitstreams. Avoids the seek overhead that killed segment-based parallelism. Two instances × 16 cores could nearly halve encode time. |
+| CUDA tonemapping kernel | ~1s | Custom CUDA kernel for BT.2020/HLG → BT.709. Keep frames on GPU from NVDEC decode, tonemap in CUDA, hwdownload to CPU for encoding. Eliminates CPU zscale and frees cores for the encoder. |
+| PGO-optimized SVT-AV1 | 0.5-1s | Build SVT-AV1 with `-fprofile-generate`, encode representative video, rebuild with `-fprofile-use`. PGO typically gives 5-15% on compute-heavy C code. |
+| Fix Vulkan for libplacebo | ~1s | Build vulkan-loader from source to fix version mismatch with NVIDIA 580 driver, enabling GPU-accelerated tonemapping via libplacebo. |
+| SVT-AV1 GOP=2 fast path | Unknown | Patch SVT-AV1 to skip unnecessary analysis stages (temporal prediction, lookahead) for keyframes, which are half of all frames at GOP=2. |
+| NVENC with strict bitrate target | 4-5s | NVENC in 2-pass VBR mode targeting ~2.5 Mbps (matching libsvtav1 output). Quality may be slightly worse at same bitrate — needs measurement. |
+
 ## Requirements
 
 - ffmpeg with libsvtav1 and libzimg (zscale filter)
