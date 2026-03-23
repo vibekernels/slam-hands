@@ -1,2 +1,104 @@
 # robot-video
+
 Optimized video processing for robot training data generation.
+
+Converts iPhone videos (HEVC 10-bit HDR / Dolby Vision) to [LeRobotDataset v3.0](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) compatible format.
+
+## Quick start
+
+```bash
+python3 convert_video.py /path/to/iphone_video.mov
+```
+
+Output: `<input>_lerobot.mp4` in the same directory, or specify `-o /path/to/output.mp4`.
+
+### Options
+
+```
+-o, --output     Output file path (default: <input>_lerobot.mp4)
+--no-gpu         Disable NVDEC hardware-accelerated decoding
+--quality N      CRF value (default: 30, lower = better quality)
+--gop N          GOP size (default: 2)
+--preset N       libsvtav1 speed preset (default: 12, fastest)
+```
+
+## Output format
+
+Matches LeRobotDataset v3.0 defaults (lerobot 0.5.0):
+
+| Parameter    | Value       |
+|-------------|-------------|
+| Codec       | AV1 (libsvtav1) |
+| Container   | MP4         |
+| Pixel format| yuv420p     |
+| CRF         | 30          |
+| GOP size    | 2 (every other frame is a keyframe, for fast random access) |
+| Audio       | Stripped    |
+| movflags    | +faststart  |
+
+Output is decodable by both PyAV and torchcodec (LeRobotDataset's video backends).
+
+## iPhone-specific handling
+
+iPhone videos are typically HEVC Main 10 with HDR (BT.2020 primaries, HLG transfer, Dolby Vision profile 8). The script performs:
+
+- **HDR to SDR tonemapping** via zscale (BT.2020/HLG → BT.709)
+- **10-bit to 8-bit** conversion (yuv420p10le → yuv420p)
+- **Color space conversion** (BT.2020 → BT.709 primaries, matrix, and transfer)
+
+Non-HDR inputs skip tonemapping and just do pixel format conversion.
+
+## Performance
+
+Benchmarked on a 60-second 1080p/30fps iPhone 16 Pro video (HEVC 10-bit HDR, 51 MB input) with a Ryzen 9 9950X (32 threads) and RTX 5090:
+
+| Version | Wall time | Output size | Speedup |
+|---------|-----------|-------------|---------|
+| Naive (CPU decode, two-pass tonemap) | 20.5s | 19.3 MB | 1.0x |
+| + NVDEC hardware decode | 16.8s | 19.3 MB | 1.2x |
+| + Parallel filter threads | 12.3s | 19.2 MB | 1.7x |
+| + Single-pass zscale | **9.3s** | **19.2 MB** | **2.2x** |
+
+### Optimization details
+
+Three techniques stack to achieve a 2.2x speedup over the naive approach, with no change to output codec, quality, or file size:
+
+**1. NVDEC hardware-accelerated decoding** (`-hwaccel auto`)
+
+Offloads HEVC 10-bit decoding to the GPU, freeing CPU cores for tonemapping and encoding.
+
+**2. Single-pass zscale tonemapping**
+
+The standard HDR→SDR filter chain uses an expensive intermediate 32-bit float RGB conversion:
+
+```
+zscale=t=linear:npl=100 → format=gbrpf32le → zscale=p=bt709:t=bt709:m=bt709 → format=yuv420p
+```
+
+Specifying both input and output color parameters in a single zscale invocation lets zscale handle the conversion internally, avoiding the float32 intermediate entirely:
+
+```
+zscale=tin=arib-std-b67:t=bt709:min=bt2020nc:m=bt709:pin=bt2020:p=bt709:r=tv:npl=100 → format=yuv420p
+```
+
+This cut tonemapping time roughly in half.
+
+**3. Tuned thread allocation** (`-filter_threads` + SVT-AV1 `lp`)
+
+The zscale filter and libsvtav1 encoder both compete for CPU cores. Allocating ~20% of cores to filter threads and ~80% to the encoder (via SVT-AV1's `lp` parameter) minimizes contention. The script auto-tunes this based on `os.cpu_count()`.
+
+### Approaches that did not help
+
+| Approach | Result | Why |
+|----------|--------|-----|
+| Parallel segment encoding | 2x slower | Per-segment ffmpeg startup + seek overhead dominates for a 60s video |
+| Pipe architecture (two ffmpeg processes) | ~Same speed | Intermediate codec overhead + pipe bandwidth bottleneck |
+| CPU pinning with taskset | ~Same speed | OS scheduler already handles this reasonably |
+| SVT-AV1 2.3.0 + AVX-512 | ~Same speed | At preset 12 with GOP=2, the encoder is pipeline-bound not compute-bound |
+| av1_nvenc GPU encoding | 2x faster but 2.5x larger files | NVENC can't match libsvtav1's compression efficiency at GOP=2 |
+
+## Requirements
+
+- ffmpeg with libsvtav1 and libzimg (zscale filter)
+- NVIDIA GPU + drivers for NVDEC hardware decoding (optional, falls back to CPU)
+- Python 3.10+
