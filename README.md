@@ -21,7 +21,8 @@ Output: `<input>_lerobot.mp4` in the same directory, or specify `-o /path/to/out
 --gop N          GOP size (default: 2)
 --preset N       libsvtav1 speed preset (default: 12, fastest)
 --nvenc          Use NVENC hardware encoder (1.9x faster, see below)
---bitrate N      Target bitrate in kbps for NVENC (auto-estimated if not set)
+--gpu-pipeline   Full GPU pipeline: NVDEC→CUDA→NVENC (fastest, see below)
+--bitrate N      Target bitrate in kbps for NVENC/gpu_convert (auto-estimated if not set)
 ```
 
 ## Output format
@@ -61,11 +62,12 @@ Benchmarked on a 60-second 1080p/30fps iPhone 16 Pro video (HEVC 10-bit HDR, 51 
 | + Parallel filter threads | 12.3s | 19.2 MB | 1.7x |
 | + Single-pass zscale | 9.3s | 19.2 MB | 2.2x |
 | + SVT-AV1 AVX-512 | 8.5s | 19.2 MB | 2.4x |
-| + NVENC VBR (`--nvenc`) | **4.5s** | **19.3 MB** | **4.6x** |
+| + NVENC VBR (`--nvenc`) | 4.5s | 19.3 MB | 4.6x |
+| + Full GPU pipeline (`gpu_convert`) | **2.8s** | **19.3 MB** | **7.3x** |
 
 ### Optimization details
 
-Five techniques stack to achieve a 4.6x speedup over the naive approach, with no change to output codec, quality, or file size:
+Six techniques stack to achieve a 7.3x speedup over the naive approach, with no change to output codec, quality, or file size:
 
 **1. NVDEC hardware-accelerated decoding** (`-hwaccel auto`)
 
@@ -111,6 +113,20 @@ NVENC uses VBR (variable bitrate) mode targeting the same bitrate that libsvtav1
 python3 convert_video.py /path/to/video.mov --nvenc
 ```
 
+**6. Full GPU pipeline** (`gpu_convert`)
+
+Custom C/CUDA program that keeps frames on the GPU throughout: NVDEC decode → CUDA tonemap kernel → NVENC encode. Eliminates the CPU zscale bottleneck entirely (zscale was ~4.3s of the 4.5s total).
+
+The CUDA kernel performs the full HDR→SDR conversion: P010 (10-bit BT.2020/HLG) → NV12 (8-bit BT.709), matching zscale's color science (HLG inverse OETF → luma-weighted OOTF → BT.2020→BT.709 gamut mapping → BT.1886 inverse EOTF). Quality: **SSIM 0.984** vs libsvtav1 reference at matched file size.
+
+```bash
+# Build
+nvcc -O3 -o gpu_convert gpu_convert.cu \
+  $(pkg-config --cflags --libs libavformat libavcodec libavutil) -lcuda
+# Run
+./gpu_convert input.mov output.mp4 [bitrate_kbps]
+```
+
 ### Approaches that did not help
 
 | Approach | Result | Why |
@@ -132,7 +148,6 @@ python3 convert_video.py /path/to/video.mov --nvenc
 
 | Idea | Expected gain | Description |
 |------|--------------|-------------|
-| Full GPU pipeline (NVDEC→CUDA→NVENC) | ~2-3s | Keep frames on GPU from decode through encode. Custom C/CUDA program using NVIDIA Video Codec SDK — eliminates CPU zscale entirely. The 4.5s bottleneck is currently zscale at ~4.3s. |
 | Fix Vulkan for libplacebo | ~1s | Build vulkan-loader from source to fix version mismatch, enabling GPU-accelerated tonemapping as an ffmpeg filter. |
 | SVT-AV1 GOP=2 fast path | Unknown | Patch SVT-AV1 to skip unnecessary analysis stages (temporal prediction, lookahead) for keyframes, which are half of all frames at GOP=2. |
 

@@ -83,6 +83,15 @@ def check_nvenc_available() -> bool:
         return False
 
 
+def find_gpu_convert() -> str | None:
+    """Find the gpu_convert binary (in same directory as this script)."""
+    script_dir = Path(__file__).resolve().parent
+    binary = script_dir / "gpu_convert"
+    if binary.is_file() and os.access(binary, os.X_OK):
+        return str(binary)
+    return None
+
+
 def estimate_bitrate(width: int, height: int, fps_str: str, crf: int) -> int:
     """Estimate the bitrate (kbps) that libsvtav1 would produce at a given CRF.
 
@@ -236,6 +245,29 @@ def build_ffmpeg_cmd_nvenc(
     return cmd
 
 
+def run_gpu_pipeline(
+    input_path: str,
+    output_path: str,
+    bitrate: int,
+    gpu_convert_bin: str,
+) -> bool:
+    """Run the full GPU pipeline (NVDEC→CUDA tonemap→NVENC).
+
+    Returns True on success, False on failure (caller should fall back).
+    """
+    cmd = [gpu_convert_bin, input_path, output_path, str(bitrate)]
+    print(f"\n  $ {' '.join(cmd)}\n")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"gpu_convert stderr:\n{result.stderr}", file=sys.stderr)
+        return False
+    if result.stderr:
+        # gpu_convert prints progress to stderr
+        for line in result.stderr.strip().split("\n"):
+            print(f"  {line}")
+    return True
+
+
 def convert_video(
     input_path: str,
     output_path: str | None = None,
@@ -245,6 +277,7 @@ def convert_video(
     preset: int = 12,
     nvenc: bool = False,
     bitrate: int | None = None,
+    gpu_pipeline: bool = False,
 ) -> str:
     """Convert a video to LeRobotDataset v3.0 format."""
     input_path = str(Path(input_path).resolve())
@@ -275,25 +308,46 @@ def convert_video(
             print("  NVDEC: not available, using CPU decode")
             use_gpu = False
 
-    # Check NVENC availability if requested
-    use_nvenc = nvenc
+    # Full GPU pipeline (NVDEC → CUDA tonemap → NVENC)
+    use_gpu_pipeline = gpu_pipeline
+    gpu_convert_bin = None
+    if use_gpu_pipeline:
+        gpu_convert_bin = find_gpu_convert()
+        if gpu_convert_bin is None:
+            print("  gpu_convert: binary not found, falling back to ffmpeg")
+            print("    Build with: nvcc -O3 -o gpu_convert gpu_convert.cu \\")
+            print("      $(pkg-config --cflags --libs libavformat libavcodec libavutil) -lcuda")
+            use_gpu_pipeline = False
+
+    # Check NVENC availability if requested (and not using full GPU pipeline)
+    use_nvenc = nvenc and not use_gpu_pipeline
     if use_nvenc and not check_nvenc_available():
         print("  av1_nvenc: not available, falling back to libsvtav1")
         use_nvenc = False
 
-    if use_nvenc:
-        enc_bitrate = bitrate or estimate_bitrate(
-            video_stream.get("width", 1920),
-            video_stream.get("height", 1080),
-            fps, quality,
-        )
+    enc_bitrate = bitrate or estimate_bitrate(
+        video_stream.get("width", 1920),
+        video_stream.get("height", 1080),
+        fps, quality,
+    )
+
+    if use_gpu_pipeline:
+        print(f"  Output: gpu_convert (NVDEC→CUDA→NVENC) AV1 VBR={enc_bitrate}k GOP=2")
+    elif use_nvenc:
         print(f"  Output: av1_nvenc yuv420p VBR={enc_bitrate}k GOP={gop}")
     else:
         print(f"  Output: libsvtav1 yuv420p CRF={quality} GOP={gop}")
 
     start = time.perf_counter()
 
-    if use_nvenc:
+    if use_gpu_pipeline:
+        success = run_gpu_pipeline(input_path, output_path, enc_bitrate, gpu_convert_bin)
+        if not success:
+            print("\ngpu_convert failed, falling back to --nvenc...")
+            return convert_video(input_path, output_path, use_gpu=use_gpu,
+                                 quality=quality, gop=gop, preset=preset,
+                                 nvenc=True, bitrate=bitrate)
+    elif use_nvenc:
         cmd = build_ffmpeg_cmd_nvenc(
             input_path, output_path,
             use_gpu=use_gpu, hdr_input=hdr,
@@ -362,8 +416,10 @@ def main():
     parser.add_argument("--preset", type=int, default=12, help="libsvtav1 preset (default: 12)")
     parser.add_argument("--nvenc", action="store_true",
                         help="Use NVENC hardware encoder (faster, same quality at matched bitrate)")
+    parser.add_argument("--gpu-pipeline", action="store_true",
+                        help="Full GPU pipeline: NVDEC→CUDA tonemap→NVENC (fastest, requires gpu_convert binary)")
     parser.add_argument("--bitrate", type=int, default=None,
-                        help="Target bitrate in kbps for NVENC (auto-estimated if not set)")
+                        help="Target bitrate in kbps for NVENC/gpu_convert (auto-estimated if not set)")
     args = parser.parse_args()
 
     convert_video(
@@ -375,6 +431,7 @@ def main():
         preset=args.preset,
         nvenc=args.nvenc,
         bitrate=args.bitrate,
+        gpu_pipeline=args.gpu_pipeline,
     )
 
 
