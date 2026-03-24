@@ -123,7 +123,9 @@ The CUDA kernel performs the full HDR→SDR conversion: P010 (10-bit BT.2020/HLG
 # Build
 nvcc -O3 -o gpu_convert gpu_convert.cu \
   $(pkg-config --cflags --libs libavformat libavcodec libavutil) -lcuda
-# Run
+# Run via convert_video.py (auto-fallback if binary missing)
+python3 convert_video.py /path/to/video.mov --gpu-pipeline
+# Or run directly
 ./gpu_convert input.mov output.mp4 [bitrate_kbps]
 ```
 
