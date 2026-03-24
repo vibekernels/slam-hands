@@ -20,6 +20,8 @@ Output: `<input>_lerobot.mp4` in the same directory, or specify `-o /path/to/out
 --quality N      CRF value (default: 30, lower = better quality)
 --gop N          GOP size (default: 2)
 --preset N       libsvtav1 speed preset (default: 12, fastest)
+--nvenc          Use NVENC hardware encoder (1.9x faster, see below)
+--bitrate N      Target bitrate in kbps for NVENC (auto-estimated if not set)
 ```
 
 ## Output format
@@ -58,11 +60,12 @@ Benchmarked on a 60-second 1080p/30fps iPhone 16 Pro video (HEVC 10-bit HDR, 51 
 | + NVDEC hardware decode | 16.8s | 19.3 MB | 1.2x |
 | + Parallel filter threads | 12.3s | 19.2 MB | 1.7x |
 | + Single-pass zscale | 9.3s | 19.2 MB | 2.2x |
-| + SVT-AV1 AVX-512 | **8.5s** | **19.2 MB** | **2.4x** |
+| + SVT-AV1 AVX-512 | 8.5s | 19.2 MB | 2.4x |
+| + NVENC VBR (`--nvenc`) | **4.5s** | **19.3 MB** | **4.6x** |
 
 ### Optimization details
 
-Four techniques stack to achieve a 2.4x speedup over the naive approach, with no change to output codec, quality, or file size:
+Five techniques stack to achieve a 4.6x speedup over the naive approach, with no change to output codec, quality, or file size:
 
 **1. NVDEC hardware-accelerated decoding** (`-hwaccel auto`)
 
@@ -98,6 +101,16 @@ sudo bash setup.sh
 
 Note: SVT-AV1 at preset 12 with GOP=2 is pipeline-bound, not compute-bound — it peaks at ~16 cores and actually gets slower with more. The AVX-512 gain comes from wider SIMD on the critical path, not from using more cores.
 
+**5. NVENC hardware encoding** (`--nvenc`)
+
+Replaces the CPU-based libsvtav1 encoder with NVIDIA's AV1 hardware encoder (av1_nvenc). Since NVENC runs on the GPU's dedicated encoding ASIC, all CPU cores are freed for zscale tonemapping (which becomes the bottleneck at ~4.3s with 16 threads).
+
+NVENC uses VBR (variable bitrate) mode targeting the same bitrate that libsvtav1 would produce at the given CRF. Quality comparison at matched bitrate: **PSNR 49 dB / SSIM 0.998** vs libsvtav1 — visually identical.
+
+```bash
+python3 convert_video.py /path/to/video.mov --nvenc
+```
+
 ### Approaches that did not help
 
 | Approach | Result | Why |
@@ -106,22 +119,22 @@ Note: SVT-AV1 at preset 12 with GOP=2 is pipeline-bound, not compute-bound — i
 | Pipe architecture (two ffmpeg processes) | ~Same speed | Intermediate codec overhead + pipe bandwidth bottleneck |
 | CPU pinning with taskset | ~Same speed | OS scheduler already handles this reasonably |
 | SVT-AV1 2.3.0 (version upgrade) | ~Same speed | ABI break (different SONAME), API changes, no measurable gain at preset 12 |
-| av1_nvenc GPU encoding | 2x faster but 2.5x larger files | NVENC can't match libsvtav1's compression efficiency at GOP=2 |
+| av1_nvenc constqp (CRF-like) | 2x faster but 2.5x larger files | NVENC's constqp mode can't match libsvtav1's compression at GOP=2 (solved by using VBR with bitrate targeting instead) |
 | GPU tonemapping (libplacebo/Vulkan) | Failed to initialize | Vulkan loader 1.3.275 too old for NVIDIA driver 580 |
-| OpenCL tonemapping | Failed to initialize | No OpenCL ICD installed on the system |
-| PyTorch CUDA tonemapping | ~Same speed | CPU↔GPU transfer overhead negated compute gains |
+| OpenCL tonemapping (tonemap_opencl) | Slower, wrong colors | 30s, 2x larger output — kernel not optimized for HLG transfer function |
+| PyTorch CUDA tonemapping | 4x slower | 35s at 52 fps — per-frame Python/tensor overhead dominates vs zscale's 420 fps |
+| Custom CUDA tonemapping kernel | Slower via pipes | GPU compute is instant but pipe I/O for 17GB of raw frames (11GB in + 6GB out) takes 3s — comparable to zscale in-process |
 | Reduced SVT-AV1 lookahead | ~Same speed | No measurable difference at preset 12 with GOP=2 |
+| GOP-level parallel encoding | Slower | SVT-AV1 instances contend heavily on shared resources; 2×16 cores = 8.8s vs single 26 cores = 7.7s. Loses ffmpeg's internal pipeline overlap. |
+| PGO-optimized SVT-AV1 | ~Same speed | Built with -fprofile-generate/-fprofile-use, no measurable improvement at preset 12 |
 
 ### Ideas not yet tried
 
 | Idea | Expected gain | Description |
 |------|--------------|-------------|
-| GOP-level parallel encoding | 3-4s | With GOP=2, each 2-frame group is independent. Decode once, distribute frame pairs round-robin to N SVT-AV1 instances, concatenate bitstreams. Avoids the seek overhead that killed segment-based parallelism. Two instances × 16 cores could nearly halve encode time. |
-| CUDA tonemapping kernel | ~1s | Custom CUDA kernel for BT.2020/HLG → BT.709. Keep frames on GPU from NVDEC decode, tonemap in CUDA, hwdownload to CPU for encoding. Eliminates CPU zscale and frees cores for the encoder. |
-| PGO-optimized SVT-AV1 | 0.5-1s | Build SVT-AV1 with `-fprofile-generate`, encode representative video, rebuild with `-fprofile-use`. PGO typically gives 5-15% on compute-heavy C code. |
-| Fix Vulkan for libplacebo | ~1s | Build vulkan-loader from source to fix version mismatch with NVIDIA 580 driver, enabling GPU-accelerated tonemapping via libplacebo. |
+| Full GPU pipeline (NVDEC→CUDA→NVENC) | ~2-3s | Keep frames on GPU from decode through encode. Custom C/CUDA program using NVIDIA Video Codec SDK — eliminates CPU zscale entirely. The 4.5s bottleneck is currently zscale at ~4.3s. |
+| Fix Vulkan for libplacebo | ~1s | Build vulkan-loader from source to fix version mismatch, enabling GPU-accelerated tonemapping as an ffmpeg filter. |
 | SVT-AV1 GOP=2 fast path | Unknown | Patch SVT-AV1 to skip unnecessary analysis stages (temporal prediction, lookahead) for keyframes, which are half of all frames at GOP=2. |
-| NVENC with strict bitrate target | 4-5s | NVENC in 2-pass VBR mode targeting ~2.5 Mbps (matching libsvtav1 output). Quality may be slightly worse at same bitrate — needs measurement. |
 
 ## Requirements
 

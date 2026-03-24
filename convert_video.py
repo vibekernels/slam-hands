@@ -71,6 +71,43 @@ def check_nvdec_available() -> bool:
         return False
 
 
+def check_nvenc_available() -> bool:
+    """Check if av1_nvenc encoder is available."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "av1_nvenc" in result.stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def estimate_bitrate(width: int, height: int, fps_str: str, crf: int) -> int:
+    """Estimate the bitrate (kbps) that libsvtav1 would produce at a given CRF.
+
+    Based on empirical measurements: 1080p/30fps at CRF 30 ≈ 2550 kbps.
+    Scales linearly with pixel count and fps, exponentially with CRF.
+    """
+    pixels = width * height
+    ref_pixels = 1920 * 1080
+    try:
+        num, den = map(int, fps_str.split("/"))
+        fps = num / den
+    except (ValueError, ZeroDivisionError):
+        fps = 30.0
+    ref_fps = 30.0
+    ref_bitrate = 2550  # kbps at CRF 30 for 1080p/30fps
+    ref_crf = 30
+
+    # Bitrate scales ~linearly with pixels and fps
+    scale = (pixels / ref_pixels) * (fps / ref_fps)
+    # CRF scale: ~6 CRF points ≈ 2x bitrate change
+    crf_scale = 2.0 ** ((ref_crf - crf) / 6.0)
+
+    return int(ref_bitrate * scale * crf_scale)
+
+
 def build_ffmpeg_cmd(
     input_path: str,
     output_path: str,
@@ -137,6 +174,68 @@ def build_ffmpeg_cmd(
     return cmd
 
 
+def build_ffmpeg_cmd_nvenc(
+    input_path: str,
+    output_path: str,
+    *,
+    use_gpu: bool = True,
+    hdr_input: bool = False,
+    quality: int = 30,
+    gop: int = 2,
+    bitrate: int | None = None,
+    width: int = 1920,
+    height: int = 1080,
+    fps: str = "30000/1001",
+) -> list[str]:
+    """Build ffmpeg command using NVENC AV1 hardware encoder.
+
+    Uses VBR mode targeting the same bitrate as libsvtav1 at the given CRF.
+    With NVENC handling encoding, all CPU cores are free for zscale tonemapping.
+    """
+    total_cores = os.cpu_count() or 4
+
+    if bitrate is None:
+        bitrate = estimate_bitrate(width, height, fps, quality)
+
+    cmd = ["ffmpeg", "-y"]
+
+    # With NVENC encoding, all CPU cores go to filter threads
+    if hdr_input:
+        cmd += ["-filter_threads", str(max(1, total_cores // 2))]
+
+    if use_gpu:
+        cmd += ["-hwaccel", "auto"]
+
+    cmd += ["-i", input_path]
+
+    if hdr_input:
+        vf = (
+            "zscale=tin=arib-std-b67:t=bt709"
+            ":min=bt2020nc:m=bt709"
+            ":pin=bt2020:p=bt709"
+            ":r=tv:npl=100"
+            ",format=yuv420p"
+        )
+    else:
+        vf = "format=yuv420p"
+    cmd += ["-vf", vf]
+
+    cmd += [
+        "-c:v", "av1_nvenc",
+        "-pix_fmt", "yuv420p",
+        "-b:v", f"{bitrate}k",
+        "-maxrate", f"{int(bitrate * 1.5)}k",
+        "-bufsize", f"{bitrate * 2}k",
+        "-g", str(gop),
+        "-bf", "0",  # no B-frames (required for GOP=2)
+        "-movflags", "+faststart",
+        "-an",
+        output_path,
+    ]
+
+    return cmd
+
+
 def convert_video(
     input_path: str,
     output_path: str | None = None,
@@ -144,6 +243,8 @@ def convert_video(
     quality: int = 30,
     gop: int = 2,
     preset: int = 12,
+    nvenc: bool = False,
+    bitrate: int | None = None,
 ) -> str:
     """Convert a video to LeRobotDataset v3.0 format."""
     input_path = str(Path(input_path).resolve())
@@ -165,7 +266,6 @@ def convert_video(
     hdr = is_hdr(probe_info)
 
     print(f"  Input: {codec} {width}x{height} {pix_fmt} @ {fps} fps, HDR={hdr}")
-    print(f"  Output: libsvtav1 yuv420p CRF={quality} GOP={gop}")
 
     # Check GPU
     if use_gpu:
@@ -175,25 +275,64 @@ def convert_video(
             print("  NVDEC: not available, using CPU decode")
             use_gpu = False
 
-    cmd = build_ffmpeg_cmd(
-        input_path, output_path,
-        use_gpu=use_gpu, hdr_input=hdr,
-        quality=quality, gop=gop, preset=preset,
-    )
+    # Check NVENC availability if requested
+    use_nvenc = nvenc
+    if use_nvenc and not check_nvenc_available():
+        print("  av1_nvenc: not available, falling back to libsvtav1")
+        use_nvenc = False
 
-    print(f"\n  $ {' '.join(cmd)}\n")
+    if use_nvenc:
+        enc_bitrate = bitrate or estimate_bitrate(
+            video_stream.get("width", 1920),
+            video_stream.get("height", 1080),
+            fps, quality,
+        )
+        print(f"  Output: av1_nvenc yuv420p VBR={enc_bitrate}k GOP={gop}")
+    else:
+        print(f"  Output: libsvtav1 yuv420p CRF={quality} GOP={gop}")
 
     start = time.perf_counter()
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    elapsed = time.perf_counter() - start
 
-    if result.returncode != 0:
-        print(f"ffmpeg stderr:\n{result.stderr}", file=sys.stderr)
-        if use_gpu:
-            print("\nGPU path failed, retrying CPU-only...")
-            return convert_video(input_path, output_path, use_gpu=False,
-                                 quality=quality, gop=gop, preset=preset)
-        sys.exit(1)
+    if use_nvenc:
+        cmd = build_ffmpeg_cmd_nvenc(
+            input_path, output_path,
+            use_gpu=use_gpu, hdr_input=hdr,
+            quality=quality, gop=gop, bitrate=bitrate,
+            width=video_stream.get("width", 1920),
+            height=video_stream.get("height", 1080),
+            fps=fps,
+        )
+
+        print(f"\n  $ {' '.join(cmd)}\n")
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f"ffmpeg stderr:\n{result.stderr}", file=sys.stderr)
+            print("\nNVENC failed, falling back to libsvtav1...")
+            return convert_video(input_path, output_path, use_gpu=use_gpu,
+                                 quality=quality, gop=gop, preset=preset,
+                                 nvenc=False)
+    else:
+        cmd = build_ffmpeg_cmd(
+            input_path, output_path,
+            use_gpu=use_gpu, hdr_input=hdr,
+            quality=quality, gop=gop, preset=preset,
+        )
+
+        print(f"\n  $ {' '.join(cmd)}\n")
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f"ffmpeg stderr:\n{result.stderr}", file=sys.stderr)
+            if use_gpu:
+                print("\nGPU path failed, retrying CPU-only...")
+                return convert_video(input_path, output_path, use_gpu=False,
+                                     quality=quality, gop=gop, preset=preset)
+            sys.exit(1)
+
+    elapsed = time.perf_counter() - start
 
     # Verify output
     out_probe = probe_video(output_path)
@@ -221,6 +360,10 @@ def main():
                         help="CRF quality (default: 30, lower=better)")
     parser.add_argument("--gop", type=int, default=2, help="GOP size (default: 2)")
     parser.add_argument("--preset", type=int, default=12, help="libsvtav1 preset (default: 12)")
+    parser.add_argument("--nvenc", action="store_true",
+                        help="Use NVENC hardware encoder (faster, same quality at matched bitrate)")
+    parser.add_argument("--bitrate", type=int, default=None,
+                        help="Target bitrate in kbps for NVENC (auto-estimated if not set)")
     args = parser.parse_args()
 
     convert_video(
@@ -230,6 +373,8 @@ def main():
         quality=args.quality,
         gop=args.gop,
         preset=args.preset,
+        nvenc=args.nvenc,
+        bitrate=args.bitrate,
     )
 
 
