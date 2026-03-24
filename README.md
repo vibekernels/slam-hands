@@ -25,21 +25,26 @@ Output: `<input>_lerobot.mp4` in the same directory, or specify `-o /path/to/out
 --bitrate N      Target bitrate in kbps for NVENC/gpu_convert (auto-estimated if not set)
 ```
 
-## Output format
+## LeRobotDataset v3.0 compatibility
 
-Matches LeRobotDataset v3.0 defaults (lerobot 0.5.0):
+The following are **required** for LeRobotDataset v3.0 compatibility (lerobot ≥ 0.4.0):
 
-| Parameter    | Value       |
-|-------------|-------------|
-| Codec       | AV1 (libsvtav1) |
-| Container   | MP4         |
-| Pixel format| yuv420p     |
-| CRF         | 30          |
-| GOP size    | 2 (every other frame is a keyframe, for fast random access) |
-| Audio       | Stripped    |
-| movflags    | +faststart  |
+| Requirement     | Value       | Why |
+|----------------|-------------|-----|
+| Container      | MP4         | Required by lerobot's video loading |
+| Pixel format   | yuv420p     | Required (yuv444p auto-downgraded) |
+| GOP size       | 2           | Every other frame is a keyframe, for fast random frame access during training |
+| Audio          | None        | Not needed for robot datasets |
 
-Output is decodable by both PyAV and torchcodec (LeRobotDataset's video backends).
+The following are **configurable** — lerobot supports multiple codecs and quality settings:
+
+| Parameter      | lerobot default | Valid options |
+|----------------|----------------|--------------|
+| Codec          | libsvtav1 (AV1) | h264, hevc, libsvtav1, or hardware variants (h264_nvenc, hevc_nvenc, h264_videotoolbox, etc.) |
+| Quality (CRF)  | 30             | Any CRF value |
+| movflags       | +faststart     | Recommended for streaming |
+
+Output must be decodable by PyAV and/or torchcodec (LeRobotDataset's video backends).
 
 ## iPhone-specific handling
 
