@@ -1,18 +1,17 @@
 /*
- * Full GPU pipeline: NVDEC decode → CUDA tonemap → NVENC encode.
+ * Full GPU pipeline: NVDEC decode → CUDA format convert → NVENC encode.
  *
- * Keeps frames on GPU throughout, eliminating CPU zscale tonemapping.
- * Uses libavformat/libavcodec for container handling and codec init,
- * with a custom CUDA kernel for HDR→SDR tonemapping between decode and encode.
+ * Keeps frames on GPU throughout. Supports H.264 (default, fastest) and AV1.
+ * For HDR input, can optionally tonemap (--tonemap) or just truncate 10→8 bit
+ * (default, preserves HLG's backwards-compatible look).
  *
  * Usage:
- *   ./gpu_convert input.mov output.ivf [bitrate_kbps]
- *   ffmpeg -i output.ivf -c copy -movflags +faststart output.mp4
+ *   ./gpu_convert input.mov output.mp4 [bitrate_kbps] [--av1] [--tonemap]
  *
  * Build:
  *   nvcc -O3 -o gpu_convert gpu_convert.cu \
  *     $(pkg-config --cflags --libs libavformat libavcodec libavutil) \
- *     -lcuda -lnvcuvid -lnvidia-encode
+ *     -lcuda
  */
 
 #include <stdio.h>
@@ -53,16 +52,66 @@ static char av_err_buf[AV_ERROR_MAX_STRING_SIZE];
 #define av_err2str(errnum) av_make_error_string(av_err_buf, AV_ERROR_MAX_STRING_SIZE, errnum)
 
 /*
- * CUDA tonemap kernel: P010/P016 (10-bit, BT.2020/HLG) → NV12 (8-bit, BT.709)
+ * Simple P010 → NV12 bit truncation kernel.
+ * Just shifts 10-bit values to 8-bit. No color space conversion.
+ * HLG signal values displayed as-is look natural on SDR displays
+ * (HLG was designed for backwards compatibility).
  *
- * P010 layout: Y plane (uint16, 10-bit in upper bits), UV interleaved plane (uint16)
- * NV12 layout: Y plane (uint8), UV interleaved plane (uint8)
- *
- * Each thread processes one luma pixel. Chroma is processed by threads
- * at even (x,y) positions.
+ * Each thread processes 4 luma bytes (uint32) for coalesced access.
+ */
+__global__ void p010_to_nv12_y(
+    const uint16_t* __restrict__ src, int src_pitch,
+    uint8_t* __restrict__ dst,        int dst_pitch,
+    int width, int height)
+{
+    /* Each thread handles 4 pixels horizontally */
+    int x4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    int y  = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x4 >= width || y >= height) return;
+
+    int src_row = y * (src_pitch / 2);
+    int dst_row = y * dst_pitch;
+    int remaining = min(4, width - x4);
+
+    /* Read 4 uint16 values, shift >>6 for 10-bit, >>2 for 8-bit */
+    uint8_t out[4];
+    for (int i = 0; i < remaining; i++)
+        out[i] = (uint8_t)(src[src_row + x4 + i] >> 8);
+
+    /* Write (partial writes at edge) */
+    if (remaining == 4 && (x4 & 3) == 0) {
+        *(uint32_t*)&dst[dst_row + x4] = *(uint32_t*)out;
+    } else {
+        for (int i = 0; i < remaining; i++)
+            dst[dst_row + x4 + i] = out[i];
+    }
+}
+
+__global__ void p010_to_nv12_uv(
+    const uint16_t* __restrict__ src, int src_pitch,
+    uint8_t* __restrict__ dst,        int dst_pitch,
+    int width, int height)
+{
+    /* UV plane: width/2 pairs, height/2 rows. Each thread does 2 pairs (4 bytes). */
+    int x2 = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    int y  = blockIdx.y * blockDim.y + threadIdx.y;
+    int uv_w = width;    /* UV plane width in samples (= luma width for NV12 interleaved) */
+    int uv_h = height / 2;
+    if (x2 >= uv_w || y >= uv_h) return;
+
+    int src_row = y * (src_pitch / 2);
+    int dst_row = y * dst_pitch;
+    int remaining = min(2, (uv_w - x2));
+
+    for (int i = 0; i < remaining; i++)
+        dst[dst_row + x2 + i] = (uint8_t)(src[src_row + x2 + i] >> 8);
+}
+
+/*
+ * HDR→SDR tonemap kernel: P010 (BT.2020/HLG) → NV12 (BT.709)
+ * Full color science: HLG EOTF → OOTF → gamut map → BT.1886 inverse EOTF
  */
 
-/* HLG EOTF: electrical signal → linear light */
 __device__ __forceinline__ float hlg_eotf(float x) {
     const float a = 0.17883277f;
     const float b = 0.28466892f;
@@ -73,24 +122,10 @@ __device__ __forceinline__ float hlg_eotf(float x) {
         return (expf((x - c) / a) + b) / 12.0f;
 }
 
-/* BT.1886 inverse EOTF: linear light → electrical signal
- * zscale/zimg uses the pure power law V = L^(1/2.4) for BT.709 output,
- * matching the BT.1886 display standard, rather than the BT.709 OETF
- * which has a linear segment for small values. */
 __device__ __forceinline__ float bt1886_inverse_eotf(float x) {
     return __powf(fmaxf(x, 0.0f), 1.0f / 2.4f);
 }
 
-/*
- * Unified tonemap kernel: one thread per luma pixel.
- * Converts through full RGB pipeline for correct color science:
- *   P010 YCbCr (BT.2020/HLG) → RGB → EOTF → gamut map → OETF → NV12 YCbCr (BT.709)
- *
- * Each thread:
- *   - Reads its Y value and nearest chroma (UV)
- *   - Converts to RGB, tonemaps, converts back
- *   - Writes Y always, writes UV only for top-left of each 2×2 block
- */
 __global__ void tonemap_full(
     const uint16_t* __restrict__ src_y,   int src_pitch_y,
     const uint16_t* __restrict__ src_uv,  int src_pitch_uv,
@@ -102,21 +137,17 @@ __global__ void tonemap_full(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
-    /* Read 10-bit luma (P010: 10-bit value in upper bits of uint16) */
     float Y = (float)(src_y[y * (src_pitch_y / 2) + x] >> 6) / 1023.0f;
 
-    /* Read 10-bit chroma (nearest neighbor, half-res UV plane) */
     int cx = x >> 1, cy = y >> 1;
     int uv_idx = cy * (src_pitch_uv / 2) + cx * 2;
     float Cb = (float)(src_uv[uv_idx] >> 6) / 1023.0f;
     float Cr = (float)(src_uv[uv_idx + 1] >> 6) / 1023.0f;
 
-    /* 10-bit limited range → normalized */
     Y  = (Y  - 64.0f / 1023.0f) * (1023.0f / 876.0f);
     Cb = (Cb - 512.0f / 1023.0f) * (1023.0f / 896.0f);
     Cr = (Cr - 512.0f / 1023.0f) * (1023.0f / 896.0f);
 
-    /* BT.2020 NCL YCbCr → RGB */
     float R = Y + 1.4746f * Cr;
     float G = Y - 0.16455f * Cb - 0.57135f * Cr;
     float B = Y + 1.8814f * Cb;
@@ -124,38 +155,23 @@ __global__ void tonemap_full(
     G = fminf(fmaxf(G, 0.0f), 1.0f);
     B = fminf(fmaxf(B, 0.0f), 1.0f);
 
-    /* HLG inverse OETF: electrical → scene-referred linear light */
     R = hlg_eotf(R); G = hlg_eotf(G); B = hlg_eotf(B);
 
-    /* HLG OOTF + npl scaling: scene linear → display linear
-     * Luma-weighted formula (matches zimg's InverseAribB67OperationC):
-     *   Ys = dot(scene, [0.2627, 0.6780, 0.0593])  (BT.2020 luma)
-     *   display[i] = scene[i] * pow(Ys, 0.2) * (1000 / npl)
-     * For npl=100: display[i] = scene[i] * pow(Ys, 0.2) * 10
-     * Preserves chromaticity (same scale for all channels). */
     float Ys = 0.2627f * R + 0.6780f * G + 0.0593f * B;
     float ootf_scale = (Ys > 0.0f) ? __powf(Ys, 0.2f) * 10.0f : 0.0f;
-    R *= ootf_scale;
-    G *= ootf_scale;
-    B *= ootf_scale;
+    R *= ootf_scale; G *= ootf_scale; B *= ootf_scale;
 
-    /* BT.2020 → BT.709 gamut mapping matrix */
     float R709 = fmaxf( 1.6605f * R - 0.5877f * G - 0.0728f * B, 0.0f);
     float G709 = fmaxf(-0.1246f * R + 1.1329f * G - 0.0083f * B, 0.0f);
     float B709 = fmaxf(-0.0182f * R - 0.1006f * G + 1.1187f * B, 0.0f);
 
-    /* BT.1886 inverse EOTF: linear → electrical (pure power law) */
     R709 = bt1886_inverse_eotf(R709);
     G709 = bt1886_inverse_eotf(G709);
     B709 = bt1886_inverse_eotf(B709);
 
-    /* RGB → BT.709 YCbCr */
-    float Y709  =  0.2126f * R709 + 0.7152f * G709 + 0.0722f * B709;
-
-    /* Write 8-bit luma (limited range) */
+    float Y709 = 0.2126f * R709 + 0.7152f * G709 + 0.0722f * B709;
     dst_y[y * dst_pitch_y + x] = (uint8_t)fminf(fmaxf(Y709 * 219.0f + 16.5f, 0.0f), 255.0f);
 
-    /* Write chroma only for top-left pixel of each 2×2 block */
     if ((x & 1) == 0 && (y & 1) == 0) {
         float Cb709 = (B709 - Y709) / 1.8556f;
         float Cr709 = (R709 - Y709) / 1.5748f;
@@ -166,19 +182,28 @@ __global__ void tonemap_full(
 }
 
 
-/* Find the best CUDA hw device type for decoding */
 static enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_CUDA;
 
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input> <output.mp4> [bitrate_kbps]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input> <output.mp4> [bitrate_kbps] [--av1] [--tonemap]\n", argv[0]);
         return 1;
     }
 
     const char* input_path = argv[1];
     const char* output_path = argv[2];
-    int bitrate_kbps = argc > 3 ? atoi(argv[3]) : 2550;
+    int bitrate_kbps = 2550;
+    int use_av1 = 0;
+    int use_tonemap = 0;
+
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--av1") == 0) use_av1 = 1;
+        else if (strcmp(argv[i], "--tonemap") == 0) use_tonemap = 1;
+        else bitrate_kbps = atoi(argv[i]);
+    }
+
+    const char* enc_name = use_av1 ? "av1_nvenc" : "h264_nvenc";
 
     int ret;
     AVFormatContext* ifmt_ctx = NULL;
@@ -224,16 +249,14 @@ int main(int argc, char* argv[])
     dec_ctx = avcodec_alloc_context3(decoder);
     avcodec_parameters_to_context(dec_ctx, in_stream->codecpar);
     dec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-
-    /* Request CUDA output format */
     dec_ctx->pix_fmt = AV_PIX_FMT_CUDA;
 
     ret = avcodec_open2(dec_ctx, decoder, NULL);
     if (ret < 0) { fprintf(stderr, "Cannot open decoder: %s\n", av_err2str(ret)); return 1; }
 
-    /* Setup NVENC AV1 encoder */
-    const AVCodec* encoder = avcodec_find_encoder_by_name("av1_nvenc");
-    if (!encoder) { fprintf(stderr, "av1_nvenc not found\n"); return 1; }
+    /* Setup NVENC encoder */
+    const AVCodec* encoder = avcodec_find_encoder_by_name(enc_name);
+    if (!encoder) { fprintf(stderr, "%s not found\n", enc_name); return 1; }
 
     enc_ctx = avcodec_alloc_context3(encoder);
     enc_ctx->width = width;
@@ -241,16 +264,25 @@ int main(int argc, char* argv[])
     enc_ctx->pix_fmt = AV_PIX_FMT_CUDA;
     enc_ctx->time_base = in_stream->time_base;
     enc_ctx->framerate = av_guess_frame_rate(ifmt_ctx, in_stream, NULL);
-    enc_ctx->color_range = AVCOL_RANGE_MPEG;  /* limited/TV range */
-    enc_ctx->colorspace = AVCOL_SPC_BT709;
-    enc_ctx->color_trc = AVCOL_TRC_BT709;
-    enc_ctx->color_primaries = AVCOL_PRI_BT709;
+    enc_ctx->color_range = AVCOL_RANGE_MPEG;
     enc_ctx->gop_size = 2;
     enc_ctx->max_b_frames = 0;
     enc_ctx->bit_rate = (int64_t)bitrate_kbps * 1000;
     enc_ctx->rc_max_rate = (int64_t)(bitrate_kbps * 1.5) * 1000;
     enc_ctx->rc_buffer_size = bitrate_kbps * 2000;
     enc_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+
+    if (use_tonemap) {
+        /* Tonemapped output is BT.709 */
+        enc_ctx->colorspace = AVCOL_SPC_BT709;
+        enc_ctx->color_trc = AVCOL_TRC_BT709;
+        enc_ctx->color_primaries = AVCOL_PRI_BT709;
+    } else {
+        /* Preserve input color metadata */
+        enc_ctx->colorspace = in_stream->codecpar->color_space;
+        enc_ctx->color_trc = in_stream->codecpar->color_trc;
+        enc_ctx->color_primaries = in_stream->codecpar->color_primaries;
+    }
 
     /* NVENC speed tuning: fastest preset, low-latency, zero buffering delay */
     av_opt_set(enc_ctx->priv_data, "preset", "p1", 0);
@@ -263,7 +295,7 @@ int main(int argc, char* argv[])
     AVBufferRef* enc_hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
     AVHWFramesContext* enc_hw_frames = (AVHWFramesContext*)enc_hw_frames_ref->data;
     enc_hw_frames->format = AV_PIX_FMT_CUDA;
-    enc_hw_frames->sw_format = AV_PIX_FMT_NV12;  /* 8-bit output after tonemap */
+    enc_hw_frames->sw_format = AV_PIX_FMT_NV12;
     enc_hw_frames->width = width;
     enc_hw_frames->height = height;
     enc_hw_frames->initial_pool_size = NUM_BUFS + 4;
@@ -287,19 +319,15 @@ int main(int argc, char* argv[])
         if (ret < 0) { fprintf(stderr, "Cannot open output file: %s\n", av_err2str(ret)); return 1; }
     }
 
-    /* Write header with faststart-compatible settings */
-    AVDictionary* opts = NULL;
-    av_dict_set(&opts, "movflags", "+faststart", 0);
-    ret = avformat_write_header(ofmt_ctx, &opts);
-    av_dict_free(&opts);
+    /* Write header */
+    ret = avformat_write_header(ofmt_ctx, NULL);
     if (ret < 0) { fprintf(stderr, "Cannot write header: %s\n", av_err2str(ret)); return 1; }
 
     /* Allocate frames and packet */
     pkt = av_packet_alloc();
     hw_frame = av_frame_alloc();
 
-    /* Pool of NV12 frames for pipelining: tonemap into frame N+1
-     * while NVENC is still encoding frame N */
+    /* Pool of NV12 frames for pipelining */
     AVFrame* nv12_frames[NUM_BUFS];
     for (int i = 0; i < NUM_BUFS; i++) {
         nv12_frames[i] = av_frame_alloc();
@@ -312,15 +340,19 @@ int main(int argc, char* argv[])
     }
     int buf_idx = 0;
 
-    /* CUDA stream for tonemap kernel (avoids default-stream serialization) */
-    cudaStream_t tonemap_stream;
-    CHECK_CUDA(cudaStreamCreate(&tonemap_stream));
+    /* CUDA stream for conversion kernel */
+    cudaStream_t conv_stream;
+    CHECK_CUDA(cudaStreamCreate(&conv_stream));
 
-    /* CUDA kernel launch config */
+    /* Kernel launch configs */
     dim3 block(32, 8);
-    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    dim3 grid_y(((width / 4) + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    dim3 grid_uv(((width / 2) + block.x - 1) / block.x, ((height / 2) + block.y - 1) / block.y);
+    dim3 grid_tonemap((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
 
-    fprintf(stderr, "Processing: NVDEC → CUDA tonemap → NVENC AV1 @ %d kbps, GOP=%d, preset=p1\n",
+    fprintf(stderr, "Processing: NVDEC → %s → NVENC %s @ %d kbps, GOP=%d, preset=p1\n",
+            use_tonemap ? "CUDA tonemap" : "P010→NV12",
+            use_av1 ? "AV1" : "H.264",
             bitrate_kbps, enc_ctx->gop_size);
 
     /* Helper: drain encoded packets from encoder */
@@ -336,18 +368,30 @@ int main(int argc, char* argv[])
         }
     };
 
-    /* Helper: tonemap a decoded frame and send to encoder */
-    auto tonemap_and_encode = [&](AVFrame* decoded) {
+    /* Helper: convert a decoded frame and send to encoder */
+    auto convert_and_encode = [&](AVFrame* decoded) {
         AVFrame* out = nv12_frames[buf_idx];
         buf_idx = (buf_idx + 1) % NUM_BUFS;
 
-        tonemap_full<<<grid, block, 0, tonemap_stream>>>(
-            (const uint16_t*)decoded->data[0], decoded->linesize[0],
-            (const uint16_t*)decoded->data[1], decoded->linesize[1],
-            (uint8_t*)out->data[0], out->linesize[0],
-            (uint8_t*)out->data[1], out->linesize[1],
-            width, height);
-        CHECK_CUDA(cudaStreamSynchronize(tonemap_stream));
+        if (use_tonemap) {
+            tonemap_full<<<grid_tonemap, block, 0, conv_stream>>>(
+                (const uint16_t*)decoded->data[0], decoded->linesize[0],
+                (const uint16_t*)decoded->data[1], decoded->linesize[1],
+                (uint8_t*)out->data[0], out->linesize[0],
+                (uint8_t*)out->data[1], out->linesize[1],
+                width, height);
+        } else {
+            /* Simple P010 → NV12 bit truncation */
+            p010_to_nv12_y<<<grid_y, block, 0, conv_stream>>>(
+                (const uint16_t*)decoded->data[0], decoded->linesize[0],
+                (uint8_t*)out->data[0], out->linesize[0],
+                width, height);
+            p010_to_nv12_uv<<<grid_uv, block, 0, conv_stream>>>(
+                (const uint16_t*)decoded->data[1], decoded->linesize[1],
+                (uint8_t*)out->data[1], out->linesize[1],
+                width, height);
+        }
+        CHECK_CUDA(cudaStreamSynchronize(conv_stream));
 
         out->pts = decoded->pts;
         out->pkt_dts = decoded->pkt_dts;
@@ -362,7 +406,7 @@ int main(int argc, char* argv[])
             fprintf(stderr, "  Frame %ld...\n", frame_count);
     };
 
-    /* Main decode-tonemap-encode loop */
+    /* Main decode-convert-encode loop */
     while (av_read_frame(ifmt_ctx, pkt) >= 0) {
         if (pkt->stream_index != video_stream_idx) {
             av_packet_unref(pkt);
@@ -378,7 +422,7 @@ int main(int argc, char* argv[])
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) { fprintf(stderr, "Decode receive error: %s\n", av_err2str(ret)); break; }
 
-            tonemap_and_encode(hw_frame);
+            convert_and_encode(hw_frame);
             av_frame_unref(hw_frame);
         }
     }
@@ -388,7 +432,7 @@ int main(int argc, char* argv[])
     while (1) {
         ret = avcodec_receive_frame(dec_ctx, hw_frame);
         if (ret < 0) break;
-        tonemap_and_encode(hw_frame);
+        convert_and_encode(hw_frame);
         av_frame_unref(hw_frame);
     }
 
@@ -407,7 +451,7 @@ int main(int argc, char* argv[])
     av_frame_free(&hw_frame);
     for (int i = 0; i < NUM_BUFS; i++)
         av_frame_free(&nv12_frames[i]);
-    cudaStreamDestroy(tonemap_stream);
+    cudaStreamDestroy(conv_stream);
     av_buffer_unref(&enc_hw_frames_ref);
     avcodec_free_context(&dec_ctx);
     avcodec_free_context(&enc_ctx);

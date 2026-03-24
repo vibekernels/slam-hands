@@ -7,6 +7,10 @@ Converts iPhone videos (HEVC 10-bit HDR / Dolby Vision) to [LeRobotDataset v3.0]
 ## Quick start
 
 ```bash
+# Fastest (requires NVIDIA GPU with NVDEC + NVENC):
+python3 convert_video.py /path/to/iphone_video.mov --fast
+
+# Default (CPU libsvtav1, works everywhere):
 python3 convert_video.py /path/to/iphone_video.mov
 ```
 
@@ -16,13 +20,14 @@ Output: `<input>_lerobot.mp4` in the same directory, or specify `-o /path/to/out
 
 ```
 -o, --output     Output file path (default: <input>_lerobot.mp4)
+--fast           Fastest: NVDEC→scale_cuda→h264_nvenc, all on GPU (10x speedup)
 --no-gpu         Disable NVDEC hardware-accelerated decoding
 --quality N      CRF value (default: 30, lower = better quality)
 --gop N          GOP size (default: 2)
 --preset N       libsvtav1 speed preset (default: 12, fastest)
---nvenc          Use NVENC hardware encoder (1.9x faster, see below)
---gpu-pipeline   Full GPU pipeline: NVDEC→CUDA→NVENC (fastest, see below)
---bitrate N      Target bitrate in kbps for NVENC/gpu_convert (auto-estimated if not set)
+--nvenc          Use NVENC AV1 hardware encoder with zscale tonemapping
+--gpu-pipeline   NVDEC→CUDA tonemap→NVENC (requires gpu_convert binary)
+--bitrate N      Target bitrate in kbps for NVENC modes (auto-estimated if not set)
 ```
 
 ## LeRobotDataset v3.0 compatibility
@@ -68,11 +73,12 @@ Benchmarked on a 60-second 1080p/30fps iPhone 16 Pro video (HEVC 10-bit HDR, 51 
 | + Single-pass zscale | 9.3s | 19.2 MB | 2.2x |
 | + SVT-AV1 AVX-512 | 8.5s | 19.2 MB | 2.4x |
 | + NVENC VBR (`--nvenc`) | 4.5s | 19.3 MB | 4.6x |
-| + Full GPU pipeline (`gpu_convert`) | **2.5s** | **19.3 MB** | **8.2x** |
+| + Full GPU pipeline (`gpu_convert --tonemap`) | 2.5s | 19.3 MB | 8.2x |
+| + H.264 NVENC, no tonemap (`--fast`) | **2.0s** | **18.8 MB** | **10.2x** |
 
 ### Optimization details
 
-Six techniques stack to achieve an 8.2x speedup over the naive approach, with no change to output codec, quality, or file size:
+Seven techniques stack to achieve a 10.2x speedup over the naive approach:
 
 **1. NVDEC hardware-accelerated decoding** (`-hwaccel auto`)
 
@@ -131,7 +137,17 @@ nvcc -O3 -o gpu_convert gpu_convert.cu \
 # Run via convert_video.py (auto-fallback if binary missing)
 python3 convert_video.py /path/to/video.mov --gpu-pipeline
 # Or run directly
-./gpu_convert input.mov output.mp4 [bitrate_kbps]
+./gpu_convert input.mov output.mp4 [bitrate_kbps] [--tonemap]
+```
+
+**7. H.264 + skip tonemapping** (`--fast`)
+
+Uses ffmpeg's `scale_cuda` filter for GPU-side P010→NV12 format conversion and `h264_nvenc` for encoding. The entire pipeline (NVDEC decode → scale_cuda → h264_nvenc) stays on the GPU with zero CPU involvement.
+
+Tonemapping is skipped: HLG signal values are truncated from 10-bit to 8-bit, which looks natural on SDR displays because HLG was designed for backwards compatibility. H.264 is faster than AV1 on NVENC's encoding ASIC. Combined, this brings the wall time from 2.5s to 2.0s.
+
+```bash
+python3 convert_video.py /path/to/video.mov --fast
 ```
 
 ### Approaches that did not help
