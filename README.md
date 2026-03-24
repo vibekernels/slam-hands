@@ -171,8 +171,7 @@ python3 convert_video.py /path/to/video.mov --fast
 
 | Idea | Expected gain | Description |
 |------|--------------|-------------|
-| Fix Vulkan for libplacebo | ~1s | Build vulkan-loader from source to fix version mismatch, enabling GPU-accelerated tonemapping as an ffmpeg filter. |
-| SVT-AV1 GOP=2 fast path | Unknown | Patch SVT-AV1 to skip unnecessary analysis stages (temporal prediction, lookahead) for keyframes, which are half of all frames at GOP=2. |
+| Parallel batch conversion | ~Nx for N videos | The NVENC ASIC can handle 2-3 concurrent encode sessions. When converting many files, run multiple `--fast` processes in parallel (e.g., `xargs -P3`) to saturate the GPU. Single-video speed is at the hardware floor (2.0s = NVENC throughput limit). |
 
 ## Requirements
 
