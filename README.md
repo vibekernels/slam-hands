@@ -63,11 +63,11 @@ Benchmarked on a 60-second 1080p/30fps iPhone 16 Pro video (HEVC 10-bit HDR, 51 
 | + Single-pass zscale | 9.3s | 19.2 MB | 2.2x |
 | + SVT-AV1 AVX-512 | 8.5s | 19.2 MB | 2.4x |
 | + NVENC VBR (`--nvenc`) | 4.5s | 19.3 MB | 4.6x |
-| + Full GPU pipeline (`gpu_convert`) | **2.8s** | **19.3 MB** | **7.3x** |
+| + Full GPU pipeline (`gpu_convert`) | **2.5s** | **19.3 MB** | **8.2x** |
 
 ### Optimization details
 
-Six techniques stack to achieve a 7.3x speedup over the naive approach, with no change to output codec, quality, or file size:
+Six techniques stack to achieve an 8.2x speedup over the naive approach, with no change to output codec, quality, or file size:
 
 **1. NVDEC hardware-accelerated decoding** (`-hwaccel auto`)
 
@@ -115,7 +115,7 @@ python3 convert_video.py /path/to/video.mov --nvenc
 
 **6. Full GPU pipeline** (`gpu_convert`)
 
-Custom C/CUDA program that keeps frames on the GPU throughout: NVDEC decode → CUDA tonemap kernel → NVENC encode. Eliminates the CPU zscale bottleneck entirely (zscale was ~4.3s of the 4.5s total).
+Custom C/CUDA program that keeps frames on the GPU throughout: NVDEC decode → CUDA tonemap kernel → NVENC encode. Eliminates the CPU zscale bottleneck entirely (zscale was ~4.3s of the 4.5s total). Uses NVENC preset p1 with low-latency tuning and zero-delay buffering, plus a pool of NV12 frames to pipeline tonemap and encode across frames.
 
 The CUDA kernel performs the full HDR→SDR conversion: P010 (10-bit BT.2020/HLG) → NV12 (8-bit BT.709), matching zscale's color science (HLG inverse OETF → luma-weighted OOTF → BT.2020→BT.709 gamut mapping → BT.1886 inverse EOTF). Quality: **SSIM 0.984** vs libsvtav1 reference at matched file size.
 

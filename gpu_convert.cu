@@ -188,7 +188,6 @@ int main(int argc, char* argv[])
     AVBufferRef* hw_device_ctx = NULL;
     AVPacket* pkt = NULL;
     AVFrame* hw_frame = NULL;
-    AVFrame* nv12_frame = NULL;
     int video_stream_idx = -1;
     int64_t frame_count = 0;
 
@@ -253,14 +252,21 @@ int main(int argc, char* argv[])
     enc_ctx->rc_buffer_size = bitrate_kbps * 2000;
     enc_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
 
+    /* NVENC speed tuning: fastest preset, low-latency, zero buffering delay */
+    av_opt_set(enc_ctx->priv_data, "preset", "p1", 0);
+    av_opt_set(enc_ctx->priv_data, "tune", "ll", 0);
+    av_opt_set(enc_ctx->priv_data, "delay", "0", 0);
+    av_opt_set(enc_ctx->priv_data, "zerolatency", "1", 0);
+
     /* Create hardware frames context for encoder input */
+    #define NUM_BUFS 3
     AVBufferRef* enc_hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
     AVHWFramesContext* enc_hw_frames = (AVHWFramesContext*)enc_hw_frames_ref->data;
     enc_hw_frames->format = AV_PIX_FMT_CUDA;
     enc_hw_frames->sw_format = AV_PIX_FMT_NV12;  /* 8-bit output after tonemap */
     enc_hw_frames->width = width;
     enc_hw_frames->height = height;
-    enc_hw_frames->initial_pool_size = 4;
+    enc_hw_frames->initial_pool_size = NUM_BUFS + 4;
     ret = av_hwframe_ctx_init(enc_hw_frames_ref);
     if (ret < 0) { fprintf(stderr, "Cannot init enc hw frames: %s\n", av_err2str(ret)); return 1; }
     enc_ctx->hw_frames_ctx = av_buffer_ref(enc_hw_frames_ref);
@@ -291,83 +297,89 @@ int main(int argc, char* argv[])
     /* Allocate frames and packet */
     pkt = av_packet_alloc();
     hw_frame = av_frame_alloc();
-    nv12_frame = av_frame_alloc();
 
-    /* Allocate NV12 frame on GPU for tonemap output */
-    nv12_frame->format = AV_PIX_FMT_CUDA;
-    nv12_frame->width = width;
-    nv12_frame->height = height;
-    nv12_frame->hw_frames_ctx = av_buffer_ref(enc_hw_frames_ref);
-    ret = av_hwframe_get_buffer(enc_hw_frames_ref, nv12_frame, 0);
-    if (ret < 0) { fprintf(stderr, "Cannot alloc NV12 frame: %s\n", av_err2str(ret)); return 1; }
+    /* Pool of NV12 frames for pipelining: tonemap into frame N+1
+     * while NVENC is still encoding frame N */
+    AVFrame* nv12_frames[NUM_BUFS];
+    for (int i = 0; i < NUM_BUFS; i++) {
+        nv12_frames[i] = av_frame_alloc();
+        nv12_frames[i]->format = AV_PIX_FMT_CUDA;
+        nv12_frames[i]->width = width;
+        nv12_frames[i]->height = height;
+        nv12_frames[i]->hw_frames_ctx = av_buffer_ref(enc_hw_frames_ref);
+        ret = av_hwframe_get_buffer(enc_hw_frames_ref, nv12_frames[i], 0);
+        if (ret < 0) { fprintf(stderr, "Cannot alloc NV12 frame %d: %s\n", i, av_err2str(ret)); return 1; }
+    }
+    int buf_idx = 0;
+
+    /* CUDA stream for tonemap kernel (avoids default-stream serialization) */
+    cudaStream_t tonemap_stream;
+    CHECK_CUDA(cudaStreamCreate(&tonemap_stream));
 
     /* CUDA kernel launch config */
     dim3 block(32, 8);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
 
-    fprintf(stderr, "Processing: NVDEC → CUDA tonemap → NVENC AV1 @ %d kbps, GOP=%d\n",
+    fprintf(stderr, "Processing: NVDEC → CUDA tonemap → NVENC AV1 @ %d kbps, GOP=%d, preset=p1\n",
             bitrate_kbps, enc_ctx->gop_size);
 
-    /* Main decode-tonemap-encode loop */
+    /* Helper: drain encoded packets from encoder */
     AVPacket* enc_pkt = av_packet_alloc();
+    auto drain_encoder = [&]() {
+        while (1) {
+            ret = avcodec_receive_packet(enc_ctx, enc_pkt);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) { fprintf(stderr, "Encode receive error\n"); break; }
+            enc_pkt->stream_index = 0;
+            av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_stream->time_base);
+            av_interleaved_write_frame(ofmt_ctx, enc_pkt);
+        }
+    };
 
+    /* Helper: tonemap a decoded frame and send to encoder */
+    auto tonemap_and_encode = [&](AVFrame* decoded) {
+        AVFrame* out = nv12_frames[buf_idx];
+        buf_idx = (buf_idx + 1) % NUM_BUFS;
+
+        tonemap_full<<<grid, block, 0, tonemap_stream>>>(
+            (const uint16_t*)decoded->data[0], decoded->linesize[0],
+            (const uint16_t*)decoded->data[1], decoded->linesize[1],
+            (uint8_t*)out->data[0], out->linesize[0],
+            (uint8_t*)out->data[1], out->linesize[1],
+            width, height);
+        CHECK_CUDA(cudaStreamSynchronize(tonemap_stream));
+
+        out->pts = decoded->pts;
+        out->pkt_dts = decoded->pkt_dts;
+        out->duration = decoded->duration;
+
+        ret = avcodec_send_frame(enc_ctx, out);
+        if (ret < 0) fprintf(stderr, "Encode send error: %s\n", av_err2str(ret));
+
+        drain_encoder();
+        frame_count++;
+        if (frame_count % 200 == 0)
+            fprintf(stderr, "  Frame %ld...\n", frame_count);
+    };
+
+    /* Main decode-tonemap-encode loop */
     while (av_read_frame(ifmt_ctx, pkt) >= 0) {
         if (pkt->stream_index != video_stream_idx) {
             av_packet_unref(pkt);
             continue;
         }
 
-        /* Send packet to decoder */
         ret = avcodec_send_packet(dec_ctx, pkt);
         av_packet_unref(pkt);
         if (ret < 0) { fprintf(stderr, "Decode send error: %s\n", av_err2str(ret)); continue; }
 
-        /* Receive decoded frames */
-        while (ret >= 0) {
+        while (1) {
             ret = avcodec_receive_frame(dec_ctx, hw_frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) { fprintf(stderr, "Decode receive error: %s\n", av_err2str(ret)); break; }
 
-            /* hw_frame->data[0] = Y plane (CUDA ptr), hw_frame->data[1] = UV plane (CUDA ptr) */
-            /* Format is P010 (10-bit) or NV12 depending on decoder */
-
-            /* Tonemap on GPU: P010/P016 → NV12 */
-            tonemap_full<<<grid, block>>>(
-                (const uint16_t*)hw_frame->data[0], hw_frame->linesize[0],
-                (const uint16_t*)hw_frame->data[1], hw_frame->linesize[1],
-                (uint8_t*)nv12_frame->data[0], nv12_frame->linesize[0],
-                (uint8_t*)nv12_frame->data[1], nv12_frame->linesize[1],
-                width, height);
-
-            CHECK_CUDA(cudaDeviceSynchronize());
-
-            /* Copy timestamps */
-            nv12_frame->pts = hw_frame->pts;
-            nv12_frame->pkt_dts = hw_frame->pkt_dts;
-            nv12_frame->duration = hw_frame->duration;
-
-            /* Send to encoder */
-            ret = avcodec_send_frame(enc_ctx, nv12_frame);
-            if (ret < 0) { fprintf(stderr, "Encode send error: %s\n", av_err2str(ret)); break; }
-
-            /* Receive encoded packets */
-            while (1) {
-                ret = avcodec_receive_packet(enc_ctx, enc_pkt);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                if (ret < 0) { fprintf(stderr, "Encode receive error\n"); break; }
-
-                enc_pkt->stream_index = 0;
-                av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_stream->time_base);
-                ret = av_interleaved_write_frame(ofmt_ctx, enc_pkt);
-                if (ret < 0) { fprintf(stderr, "Write error\n"); }
-            }
-
-            frame_count++;
-            if (frame_count % 200 == 0)
-                fprintf(stderr, "  Frame %ld...\n", frame_count);
-
+            tonemap_and_encode(hw_frame);
             av_frame_unref(hw_frame);
-            ret = 0; /* continue receiving frames */
         }
     }
 
@@ -376,40 +388,13 @@ int main(int argc, char* argv[])
     while (1) {
         ret = avcodec_receive_frame(dec_ctx, hw_frame);
         if (ret < 0) break;
-
-        tonemap_full<<<grid, block>>>(
-            (const uint16_t*)hw_frame->data[0], hw_frame->linesize[0],
-            (const uint16_t*)hw_frame->data[1], hw_frame->linesize[1],
-            (uint8_t*)nv12_frame->data[0], nv12_frame->linesize[0],
-            (uint8_t*)nv12_frame->data[1], nv12_frame->linesize[1],
-            width, height);
-        CHECK_CUDA(cudaDeviceSynchronize());
-
-        nv12_frame->pts = hw_frame->pts;
-        nv12_frame->pkt_dts = hw_frame->pkt_dts;
-        nv12_frame->duration = hw_frame->duration;
-
-        avcodec_send_frame(enc_ctx, nv12_frame);
-        while (1) {
-            ret = avcodec_receive_packet(enc_ctx, enc_pkt);
-            if (ret < 0) break;
-            enc_pkt->stream_index = 0;
-            av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_stream->time_base);
-            av_interleaved_write_frame(ofmt_ctx, enc_pkt);
-        }
-        frame_count++;
+        tonemap_and_encode(hw_frame);
         av_frame_unref(hw_frame);
     }
 
     /* Flush encoder */
     avcodec_send_frame(enc_ctx, NULL);
-    while (1) {
-        ret = avcodec_receive_packet(enc_ctx, enc_pkt);
-        if (ret < 0) break;
-        enc_pkt->stream_index = 0;
-        av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, out_stream->time_base);
-        av_interleaved_write_frame(ofmt_ctx, enc_pkt);
-    }
+    drain_encoder();
 
     /* Write trailer */
     av_write_trailer(ofmt_ctx);
@@ -420,7 +405,9 @@ int main(int argc, char* argv[])
     av_packet_free(&pkt);
     av_packet_free(&enc_pkt);
     av_frame_free(&hw_frame);
-    av_frame_free(&nv12_frame);
+    for (int i = 0; i < NUM_BUFS; i++)
+        av_frame_free(&nv12_frames[i]);
+    cudaStreamDestroy(tonemap_stream);
     av_buffer_unref(&enc_hw_frames_ref);
     avcodec_free_context(&dec_ctx);
     avcodec_free_context(&enc_ctx);
