@@ -88,12 +88,11 @@ def load_dataset(dataset_dir: str) -> dict:
                 # kp2d values are in range ~[-0.5, 0.5], centered at image center
                 kp2d_pixels = []
                 for j in range(0, len(kp2d_flat), 2):
-                    x_norm, y_norm = kp2d_flat[j], kp2d_flat[j + 1]
-                    if math.isnan(x_norm):
+                    px, py = kp2d_flat[j], kp2d_flat[j + 1]
+                    if math.isnan(px):
                         kp2d_pixels.extend([None, None])
                     else:
-                        px = (x_norm + 0.5) * vid_w
-                        py = (y_norm + 0.5) * vid_h
+                        # Already in pixel coordinates (full-frame)
                         kp2d_pixels.extend([round(px, 1), round(py, 1)])
                 frame[f"{side}_kp2d"] = kp2d_pixels
             else:

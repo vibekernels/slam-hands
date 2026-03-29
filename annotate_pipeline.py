@@ -1171,6 +1171,8 @@ def _run_wilor_batch(crop_imgs, crop_meta, model, model_cfg, device,
     rights_np = rights.cpu().numpy()
     has_kp2d = 'pred_keypoints_2d' in out
     kp2d_all = out['pred_keypoints_2d'].detach().cpu().numpy() if has_kp2d else None
+    box_centers_np = box_centers.cpu().numpy()
+    box_sizes_np = box_sizes.cpu().numpy()
 
     for n in range(bs):
         fi = crop_meta[n][0]
@@ -1180,18 +1182,24 @@ def _run_wilor_batch(crop_imgs, crop_meta, model, model_cfg, device,
         cam_t = pred_cam_t_full[n]
         joints_cam = joints + cam_t
 
-        kp_2d = kp2d_all[n] if has_kp2d else None
+        kp_2d = kp2d_all[n][:, :2].copy() if has_kp2d else None
+
+        if kp_2d is not None:
+            # Transform from crop-relative to full-frame pixel coordinates
+            # Flip x for handedness, then scale by box_size and translate by box_center
+            kp_2d[:, 0] *= (2 * is_r - 1)
+            kp_2d = kp_2d * box_sizes_np[n] + box_centers_np[n]
 
         if is_r > 0.5:
             right_kp3d[fi] = joints_cam
             right_detected[fi] = True
             if kp_2d is not None:
-                right_kp2d[fi] = kp_2d[:, :2]
+                right_kp2d[fi] = kp_2d
         else:
             left_kp3d[fi] = joints_cam
             left_detected[fi] = True
             if kp_2d is not None:
-                left_kp2d[fi] = kp_2d[:, :2]
+                left_kp2d[fi] = kp_2d
 
 
 def _interpolate_hand_keypoints(arr, sampled_indices, num_frames):
