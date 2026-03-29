@@ -1,10 +1,208 @@
 # robot-video
 
-Optimized video processing for robot training data generation.
+Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) datasets following the [EgoVerse](https://arxiv.org/abs/2501.14394) format with:
 
-Converts iPhone videos (HEVC 10-bit HDR / Dolby Vision) to [LeRobotDataset v3.0](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) compatible format.
+- **SLAM camera poses** (7-DoF: translation + quaternion) via DROID-SLAM
+- **3D hand poses** (21 MANO keypoints per hand) via WiLoR
+- **Video conversion** (iPhone HEVC HDR to SDR MP4)
 
 ## Quick start
+
+```bash
+# Full pipeline: SLAM + hand pose + video conversion
+python3 annotate_pipeline.py /path/to/video.mov --output-dir /path/to/output
+
+# Faster trajectory (less SLAM backend refinement)
+python3 annotate_pipeline.py /path/to/video.mov -o /path/to/output --fast-traj
+
+# Visualize results
+python3 visualizer.py /path/to/output --port 8888
+# Open http://localhost:8888 in a browser
+```
+
+### Pipeline options
+
+```
+positional arguments:
+  input                    Input video file (e.g., IMG_1443.MOV)
+
+options:
+  -o, --output-dir         Output dataset directory (default: <input>_lerobot/)
+  --skip-video-convert     Skip video format conversion
+  --skip-slam              Skip SLAM camera pose estimation
+  --skip-hands             Skip hand pose estimation
+  --hand-stride N          Process every Nth frame for hands (default: 1)
+  --hand-det-conf F        YOLO hand detection confidence threshold (default: 0.3)
+  --fast-traj              Use fewer SLAM backend steps for faster trajectory
+  --slam-backend-steps N N Backend optimization steps (default: 7 12)
+  --droid-weights PATH     Path to DROID-SLAM checkpoint (default: /workspace/DROID-SLAM/checkpoints/droid.pth)
+  --wilor-dir PATH         Path to WiLoR repo (default: /workspace/WiLoR)
+  --device DEVICE          Torch device (default: cuda)
+```
+
+### Output format
+
+```
+output_dir/
+  meta/
+    info.json                                    # LeRobot v3.0 metadata
+    tasks.parquet
+    episodes/chunk-000/file-000.parquet
+  data/
+    chunk-000/file-000.parquet                   # Per-frame annotations
+  videos/
+    observation.video/chunk-000/file-000.mp4     # Converted video
+```
+
+The parquet contains per-frame columns:
+
+| Column | Shape | Description |
+|--------|-------|-------------|
+| `observation.slam.pose` | 7 | Camera pose [tx, ty, tz, qx, qy, qz, qw] |
+| `observation.hand.{left,right}.keypoints_2d` | 42 | 21 joints x 2 (pixel coords) |
+| `observation.hand.{left,right}.keypoints_3d` | 63 | 21 joints x 3 (camera frame, meters) |
+| `observation.hand.{left,right}.detected` | 1 | Detection flag (0 or 1) |
+
+## Installation
+
+### System requirements
+
+- Linux (tested on Ubuntu 22.04+)
+- NVIDIA GPU with 11+ GB VRAM
+- CUDA 12.1+ with matching drivers
+- Python 3.10+
+- FFmpeg 6.0+ with ffprobe
+
+### System packages
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake nasm git \
+  ffmpeg \
+  libavformat-dev libavcodec-dev libswscale-dev libavutil-dev \
+  libsuitesparse-dev
+```
+
+### Python dependencies
+
+```bash
+pip install --upgrade pip
+
+# PyTorch (match your CUDA version)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# or for CUDA 12.8:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Pipeline dependencies
+pip install pyarrow numpy opencv-python scipy tqdm pybind11
+```
+
+### DROID-SLAM
+
+```bash
+git clone --recursive https://github.com/princeton-vl/DROID-SLAM.git
+cd DROID-SLAM
+
+pip install -r requirements.txt
+
+# Build third-party CUDA extensions
+pip install thirdparty/lietorch
+pip install thirdparty/pytorch_scatter
+
+# Build DROID backend
+python setup.py build_ext --inplace
+# or: pip install -e .
+```
+
+Download the checkpoint:
+```bash
+mkdir -p checkpoints
+# Via the provided script:
+./tools/download_model.sh
+# Or manually (~16 MB):
+gdown 1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh -O checkpoints/droid.pth
+```
+
+### WiLoR
+
+```bash
+git clone https://github.com/rolpotamias/WiLoR.git
+cd WiLoR
+
+pip install -r requirements.txt
+```
+
+Key packages this installs: `ultralytics==8.1.34` (YOLO hand detector), `smplx==0.1.28`, `timm`, `pytorch-lightning`, `scikit-image`.
+
+Download model weights:
+```bash
+mkdir -p pretrained_models
+wget https://huggingface.co/spaces/rolpotamias/WiLoR/resolve/main/pretrained_models/detector.pt -P pretrained_models/
+wget https://huggingface.co/spaces/rolpotamias/WiLoR/resolve/main/pretrained_models/wilor_final.ckpt -P pretrained_models/
+```
+
+Download the MANO hand model (requires registration):
+```bash
+# Register at https://mano.is.tue.mpg.de and download MANO_RIGHT.pkl
+mkdir -p mano_data
+cp /path/to/MANO_RIGHT.pkl mano_data/
+```
+
+### Native video decoder (optional, faster)
+
+Builds a GIL-free C++ video decoder for concurrent frame extraction:
+
+```bash
+cd robot-video/native_decode
+pip install -e .
+```
+
+Requires the FFmpeg dev headers installed above. Falls back to OpenCV if not available.
+
+### Verify installation
+
+```bash
+python3 -c "from droid import Droid; print('DROID-SLAM OK')"
+python3 -c "from wilor.models import load_wilor; print('WiLoR OK')"
+python3 -c "from ultralytics import YOLO; print('YOLO OK')"
+python3 -c "import native_decode; print('native_decode OK')"
+```
+
+## Visualizer
+
+Browser-based tool for inspecting output datasets. Shows the video with 2D hand keypoint overlay and a Three.js 3D scene with camera trajectory and hand skeletons.
+
+```bash
+python3 visualizer.py /path/to/output_dataset --port 8888
+```
+
+Controls:
+- **Space**: play/pause
+- **Arrow keys**: step 1 frame
+- **Shift + arrows**: step 10 frames
+- **Mouse drag** on 3D panel: orbit camera
+- **Scroll** on 3D panel: zoom
+- Checkboxes: toggle left/right hands, bones, 3D hands, camera follow
+
+## Performance
+
+Benchmarked on 1858 frames (62s) of 1920x1080 30fps iPhone video, RTX 5090:
+
+| Phase | Time | Notes |
+|-------|------|-------|
+| SLAM + hands (concurrent) | 23s | Both models share GPU via CUDA streams |
+| Video conversion | 23s | Overlapped with SLAM+hands |
+| Dataset assembly | 1s | Parquet + info.json |
+| **Total** | **~24s** | With `--fast-traj` |
+
+SLAM and hand pose run concurrently on the same GPU. SLAM's CPU-bound phases (sparse BA solves, NMS) free the GPU for WiLoR inference, giving ~1.7x speedup over sequential execution.
+
+---
+
+## Video conversion (standalone)
+
+The video converter can also be used independently:
 
 ```bash
 # Fastest (requires NVIDIA GPU with NVDEC + NVENC):
@@ -16,23 +214,23 @@ python3 convert_video.py /path/to/iphone_video.mov
 
 Output: `<input>_lerobot.mp4` in the same directory, or specify `-o /path/to/output.mp4`.
 
-### Options
+### Video conversion options
 
 ```
 -o, --output     Output file path (default: <input>_lerobot.mp4)
---fast           Fastest: NVDEC→scale_cuda→h264_nvenc, all on GPU (10x speedup)
+--fast           Fastest: NVDEC->scale_cuda->h264_nvenc, all on GPU (10x speedup)
 --no-gpu         Disable NVDEC hardware-accelerated decoding
 --quality N      CRF value (default: 30, lower = better quality)
 --gop N          GOP size (default: 2)
 --preset N       libsvtav1 speed preset (default: 12, fastest)
 --nvenc          Use NVENC AV1 hardware encoder with zscale tonemapping
---gpu-pipeline   NVDEC→CUDA tonemap→NVENC (requires gpu_convert binary)
+--gpu-pipeline   NVDEC->CUDA tonemap->NVENC (requires gpu_convert binary)
 --bitrate N      Target bitrate in kbps for NVENC modes (auto-estimated if not set)
 ```
 
-## LeRobotDataset v3.0 compatibility
+### LeRobotDataset v3.0 video compatibility
 
-The following are **required** for LeRobotDataset v3.0 compatibility (lerobot ≥ 0.4.0):
+The following are **required** for LeRobotDataset v3.0 compatibility (lerobot >= 0.4.0):
 
 | Requirement     | Value       | Why |
 |----------------|-------------|-----|
@@ -41,7 +239,7 @@ The following are **required** for LeRobotDataset v3.0 compatibility (lerobot �
 | GOP size       | 2           | Every other frame is a keyframe, for fast random frame access during training |
 | Audio          | None        | Not needed for robot datasets |
 
-The following are **configurable** — lerobot supports multiple codecs and quality settings:
+The following are **configurable** -- lerobot supports multiple codecs and quality settings:
 
 | Parameter      | lerobot default | Valid options |
 |----------------|----------------|--------------|
@@ -51,17 +249,17 @@ The following are **configurable** — lerobot supports multiple codecs and qual
 
 Output must be decodable by PyAV and/or torchcodec (LeRobotDataset's video backends).
 
-## iPhone-specific handling
+### iPhone-specific handling
 
 iPhone videos are typically HEVC Main 10 with HDR (BT.2020 primaries, HLG transfer, Dolby Vision profile 8). The script performs:
 
-- **HDR to SDR tonemapping** via zscale (BT.2020/HLG → BT.709)
-- **10-bit to 8-bit** conversion (yuv420p10le → yuv420p)
-- **Color space conversion** (BT.2020 → BT.709 primaries, matrix, and transfer)
+- **HDR to SDR tonemapping** via zscale (BT.2020/HLG -> BT.709)
+- **10-bit to 8-bit** conversion (yuv420p10le -> yuv420p)
+- **Color space conversion** (BT.2020 -> BT.709 primaries, matrix, and transfer)
 
 Non-HDR inputs skip tonemapping and just do pixel format conversion.
 
-## Performance
+### Video conversion performance
 
 Benchmarked on a 60-second 1080p/30fps iPhone 16 Pro video (HEVC 10-bit HDR, 51 MB input) with a Ryzen 9 9950X (32 threads) and RTX 5090:
 
@@ -76,108 +274,7 @@ Benchmarked on a 60-second 1080p/30fps iPhone 16 Pro video (HEVC 10-bit HDR, 51 
 | + Full GPU pipeline (`gpu_convert --tonemap`) | 2.5s | 19.3 MB | 8.2x |
 | + H.264 NVENC, no tonemap (`--fast`) | **2.0s** | **18.8 MB** | **10.2x** |
 
-### Optimization details
-
-Seven techniques stack to achieve a 10.2x speedup over the naive approach:
-
-**1. NVDEC hardware-accelerated decoding** (`-hwaccel auto`)
-
-Offloads HEVC 10-bit decoding to the GPU, freeing CPU cores for tonemapping and encoding.
-
-**2. Single-pass zscale tonemapping**
-
-The standard HDR→SDR filter chain uses an expensive intermediate 32-bit float RGB conversion:
-
-```
-zscale=t=linear:npl=100 → format=gbrpf32le → zscale=p=bt709:t=bt709:m=bt709 → format=yuv420p
-```
-
-Specifying both input and output color parameters in a single zscale invocation lets zscale handle the conversion internally, avoiding the float32 intermediate entirely:
-
-```
-zscale=tin=arib-std-b67:t=bt709:min=bt2020nc:m=bt709:pin=bt2020:p=bt709:r=tv:npl=100 → format=yuv420p
-```
-
-This cut tonemapping time roughly in half.
-
-**3. Tuned thread allocation** (`-filter_threads` + SVT-AV1 `lp`)
-
-The zscale filter and libsvtav1 encoder both compete for CPU cores. Allocating ~20% of cores to filter threads and ~80% to the encoder (via SVT-AV1's `lp` parameter) minimizes contention. The script auto-tunes this based on `os.cpu_count()`.
-
-**4. SVT-AV1 with AVX-512** (setup.sh)
-
-The default Ubuntu/Debian `libsvtav1` package is compiled with AVX2 only. Rebuilding SVT-AV1 1.7.0 from source with `-DENABLE_AVX512=ON` enables AVX-512 SIMD paths on supported CPUs (Zen 4/5, Ice Lake+), giving ~10% faster encoding. The included `setup.sh` script automates this — it builds and installs a drop-in replacement library with the same SONAME (`libSvtAv1Enc.so.1`), so no ffmpeg rebuild is needed.
-
-```bash
-sudo bash setup.sh
-```
-
-Note: SVT-AV1 at preset 12 with GOP=2 is pipeline-bound, not compute-bound — it peaks at ~16 cores and actually gets slower with more. The AVX-512 gain comes from wider SIMD on the critical path, not from using more cores.
-
-**5. NVENC hardware encoding** (`--nvenc`)
-
-Replaces the CPU-based libsvtav1 encoder with NVIDIA's AV1 hardware encoder (av1_nvenc). Since NVENC runs on the GPU's dedicated encoding ASIC, all CPU cores are freed for zscale tonemapping (which becomes the bottleneck at ~4.3s with 16 threads).
-
-NVENC uses VBR (variable bitrate) mode targeting the same bitrate that libsvtav1 would produce at the given CRF. Quality comparison at matched bitrate: **PSNR 49 dB / SSIM 0.998** vs libsvtav1 — visually identical.
-
-```bash
-python3 convert_video.py /path/to/video.mov --nvenc
-```
-
-**6. Full GPU pipeline** (`gpu_convert`)
-
-Custom C/CUDA program that keeps frames on the GPU throughout: NVDEC decode → CUDA tonemap kernel → NVENC encode. Eliminates the CPU zscale bottleneck entirely (zscale was ~4.3s of the 4.5s total). Uses NVENC preset p1 with low-latency tuning and zero-delay buffering, plus a pool of NV12 frames to pipeline tonemap and encode across frames.
-
-The CUDA kernel performs the full HDR→SDR conversion: P010 (10-bit BT.2020/HLG) → NV12 (8-bit BT.709), matching zscale's color science (HLG inverse OETF → luma-weighted OOTF → BT.2020→BT.709 gamut mapping → BT.1886 inverse EOTF). Quality: **SSIM 0.984** vs libsvtav1 reference at matched file size.
-
-```bash
-# Build
-nvcc -O3 -o gpu_convert gpu_convert.cu \
-  $(pkg-config --cflags --libs libavformat libavcodec libavutil) -lcuda
-# Run via convert_video.py (auto-fallback if binary missing)
-python3 convert_video.py /path/to/video.mov --gpu-pipeline
-# Or run directly
-./gpu_convert input.mov output.mp4 [bitrate_kbps] [--tonemap]
-```
-
-**7. H.264 + skip tonemapping** (`--fast`)
-
-Uses ffmpeg's `scale_cuda` filter for GPU-side P010→NV12 format conversion and `h264_nvenc` for encoding. The entire pipeline (NVDEC decode → scale_cuda → h264_nvenc) stays on the GPU with zero CPU involvement.
-
-Tonemapping is skipped: HLG signal values are truncated from 10-bit to 8-bit, which looks natural on SDR displays because HLG was designed for backwards compatibility. H.264 is faster than AV1 on NVENC's encoding ASIC. Combined, this brings the wall time from 2.5s to 2.0s.
-
-```bash
-python3 convert_video.py /path/to/video.mov --fast
-```
-
-### Approaches that did not help
-
-| Approach | Result | Why |
-|----------|--------|-----|
-| Parallel segment encoding | 2x slower | Per-segment ffmpeg startup + seek overhead dominates for a 60s video |
-| Pipe architecture (two ffmpeg processes) | ~Same speed | Intermediate codec overhead + pipe bandwidth bottleneck |
-| CPU pinning with taskset | ~Same speed | OS scheduler already handles this reasonably |
-| SVT-AV1 2.3.0 (version upgrade) | ~Same speed | ABI break (different SONAME), API changes, no measurable gain at preset 12 |
-| av1_nvenc constqp (CRF-like) | 2x faster but 2.5x larger files | NVENC's constqp mode can't match libsvtav1's compression at GOP=2 (solved by using VBR with bitrate targeting instead) |
-| GPU tonemapping (libplacebo/Vulkan) | Failed to initialize | Vulkan loader 1.3.275 too old for NVIDIA driver 580 |
-| OpenCL tonemapping (tonemap_opencl) | Slower, wrong colors | 30s, 2x larger output — kernel not optimized for HLG transfer function |
-| PyTorch CUDA tonemapping | 4x slower | 35s at 52 fps — per-frame Python/tensor overhead dominates vs zscale's 420 fps |
-| Custom CUDA tonemapping kernel | Slower via pipes | GPU compute is instant but pipe I/O for 17GB of raw frames (11GB in + 6GB out) takes 3s — comparable to zscale in-process |
-| Reduced SVT-AV1 lookahead | ~Same speed | No measurable difference at preset 12 with GOP=2 |
-| GOP-level parallel encoding | Slower | SVT-AV1 instances contend heavily on shared resources; 2×16 cores = 8.8s vs single 26 cores = 7.7s. Loses ffmpeg's internal pipeline overlap. |
-| PGO-optimized SVT-AV1 | ~Same speed | Built with -fprofile-generate/-fprofile-use, no measurable improvement at preset 12 |
-
-### Ideas not yet tried
-
-| Idea | Expected gain | Description |
-|------|--------------|-------------|
-| Parallel batch conversion | ~Nx for N videos | The NVENC ASIC can handle 2-3 concurrent encode sessions. When converting many files, run multiple `--fast` processes in parallel (e.g., `xargs -P3`) to saturate the GPU. Single-video speed is at the hardware floor (2.0s = NVENC throughput limit). |
-
-## Requirements
-
-- ffmpeg with libsvtav1 and libzimg (zscale filter)
-- NVIDIA GPU + drivers for NVDEC hardware decoding (optional, falls back to CPU)
-- Python 3.10+
+See [OPTIMIZATION.md](OPTIMIZATION.md) for detailed optimization notes.
 
 ### Optional: AVX-512 SVT-AV1
 
