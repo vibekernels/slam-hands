@@ -21,6 +21,7 @@ from pathlib import Path
 from threading import Thread
 from queue import Queue
 
+import cv2
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -551,23 +552,62 @@ def _load_wilor_cpu(wilor_dir):
     return model, model_cfg
 
 
+def _preprocess_hand_crop(img_bgr, center, scale, bbox_shape, img_size, is_right, mean, std):
+    """Fast hand crop preprocessing — replaces ViTDetDataset.__getitem__.
+
+    Uses cv2.GaussianBlur instead of skimage.gaussian (3-5x faster),
+    avoids full image copy when no blur needed, and uses vectorized normalization.
+    Returns (img_tensor [3,H,W] float16, box_center, box_size, img_size_arr, right_val).
+    """
+    from wilor.datasets.utils import expand_to_aspect_ratio, gen_trans_from_patch_cv
+
+    center_x, center_y = center
+    bbox_size = expand_to_aspect_ratio(scale * 200, target_aspect_ratio=bbox_shape).max()
+    patch_width = patch_height = img_size
+
+    flip = is_right == 0
+
+    # Blur to avoid aliasing — use cv2.GaussianBlur (much faster than skimage.gaussian)
+    downsampling_factor = (bbox_size * 1.0) / patch_width / 2.0
+    if downsampling_factor > 1.1:
+        ksize = int(np.ceil((downsampling_factor - 1))) | 1  # ensure odd
+        if ksize < 3:
+            ksize = 3
+        cvimg = cv2.GaussianBlur(img_bgr, (ksize, ksize), (downsampling_factor - 1) / 2)
+    else:
+        cvimg = img_bgr  # no copy needed — warpAffine doesn't modify input
+
+    img_height, img_width = cvimg.shape[:2]
+    cx, cy = center_x, center_y
+    if flip:
+        cvimg = cvimg[:, ::-1, :]
+        cx = img_width - cx - 1
+
+    trans = gen_trans_from_patch_cv(cx, cy, bbox_size, bbox_size,
+                                   patch_width, patch_height, 1.0, 0)
+    img_patch = cv2.warpAffine(cvimg, trans, (int(patch_width), int(patch_height)),
+                               flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    # BGR→RGB, HWC→CHW, normalize — all vectorized
+    img_patch = img_patch[:, :, ::-1].transpose(2, 0, 1).astype(np.float32)
+    img_patch = (img_patch - mean[:, None, None]) / std[:, None, None]
+
+    return img_patch, bbox_size
+
+
 def run_hand_pose_wilor(frames, fps, width, height, wilor_dir, device="cuda",
                         stride=1, det_conf=0.3, preloaded=None):
     """Run WiLoR hand pose estimation on video frames.
 
-    Returns dict with per-frame hand pose data in EgoVerse format:
-    - left_hand_keypoints_3d: [N, 21, 3] — 21 keypoints in camera space (NaN if not detected)
-    - right_hand_keypoints_3d: [N, 21, 3]
-    - left_hand_keypoints_2d: [N, 21, 2] — projected 2D keypoints
-    - right_hand_keypoints_2d: [N, 21, 2]
-    - left_hand_detected: [N] bool
-    - right_hand_detected: [N] bool
-    - left_hand_wrist_pose: [N, 7] — wrist SE(3) as [tx,ty,tz,qx,qy,qz,qw] (NaN if not detected)
-    - right_hand_wrist_pose: [N, 7]
+    Uses two-pass architecture for speed:
+    1. YOLO detection on all frames (batched)
+    2. Cross-frame batched WiLoR inference (bs=48)
+
+    Returns dict with per-frame hand pose data in EgoVerse format.
     """
     sys.path.insert(0, wilor_dir)
     from wilor.utils import recursive_to
-    from wilor.datasets.vitdet_dataset import ViTDetDataset
     from wilor.utils.renderer import cam_crop_to_full
     from ultralytics import YOLO
 
@@ -579,7 +619,6 @@ def run_hand_pose_wilor(frames, fps, width, height, wilor_dir, device="cuda",
         model = model_cpu.to(device).eval().half()
         model.backbone.skip_blocks = True
         detector = YOLO(os.path.join(wilor_dir, 'pretrained_models', 'detector.pt')).to(device)
-        # Cache for future calls
         _wilor_cache[(wilor_dir, device)] = (model, model_cfg, detector)
     else:
         model, model_cfg, detector = _load_wilor(wilor_dir, device)
@@ -601,92 +640,128 @@ def run_hand_pose_wilor(frames, fps, width, height, wilor_dir, device="cuda",
     left_detected = np.zeros(num_frames, dtype=bool)
     right_detected = np.zeros(num_frames, dtype=bool)
 
+    # Precompute config values
+    mean = 255.0 * np.array(model_cfg.MODEL.IMAGE_MEAN, dtype=np.float32)
+    std = 255.0 * np.array(model_cfg.MODEL.IMAGE_STD, dtype=np.float32)
+    bbox_shape = model_cfg.MODEL.get('BBOX_SHAPE', None)
+    img_size_cfg = model_cfg.MODEL.IMAGE_SIZE
+    rescale_factor = 2.0
+
     t_start = time.perf_counter()
+
+    # ── Pass 1: YOLO detection on all frames (batched) ──
+    print("  Pass 1/2: YOLO hand detection...")
+    frame_dets = []
+    total_crops = 0
+    YOLO_BATCH = 16
+
+    for batch_start in range(0, len(sampled_indices), YOLO_BATCH):
+        batch_fis = sampled_indices[batch_start:batch_start + YOLO_BATCH]
+        batch_imgs = [frames[fi][:, :, ::-1].copy() for fi in batch_fis]
+
+        results = detector(batch_imgs, conf=det_conf, verbose=False)
+        for fi, dets in zip(batch_fis, results):
+            bboxes = []
+            is_right_list = []
+            for det in dets:
+                bbox = det.boxes.data.cpu().detach().squeeze().numpy()
+                is_right_list.append(det.boxes.cls.cpu().detach().squeeze().item())
+                bboxes.append(bbox[:4].tolist())
+            if len(bboxes) > 0:
+                boxes = np.stack(bboxes).astype(np.float32)
+                right = np.stack(is_right_list).astype(np.float32)
+                frame_dets.append((fi, boxes, right))
+                total_crops += len(bboxes)
+
+    t_det = time.perf_counter() - t_start
+    print(f"    YOLO: {t_det:.1f}s ({len(sampled_indices)/t_det:.0f} fps), {total_crops} hand crops across {len(frame_dets)} frames")
+
+    if total_crops == 0:
+        print("  No hands detected in any frame")
+        return {
+            "_model": "wilor",
+            "left_hand_keypoints_3d": left_kp3d,
+            "right_hand_keypoints_3d": right_kp3d,
+            "left_hand_keypoints_2d": left_kp2d,
+            "right_hand_keypoints_2d": right_kp2d,
+            "left_hand_detected": left_detected,
+            "right_hand_detected": right_detected,
+        }
+
+    # ── Pass 2: Cross-frame batched WiLoR inference ──
+    # Pipeline: CPU preprocessing in thread pool overlapped with GPU inference
+    print(f"  Pass 2/2: WiLoR inference ({total_crops} crops, batch_size=48)...")
+    t_wilor_start = time.perf_counter()
+    BATCH_SIZE = 48
     n_hands = 0
 
-    for count, fi in enumerate(sampled_indices):
-        img_rgb = frames[fi]
-        img_bgr = img_rgb[:, :, ::-1].copy()
+    # Flatten all crops into a list of (fi, img_bgr, center, scale, is_right, img_wh)
+    all_crop_specs = []
+    for fi, boxes, right_arr in frame_dets:
+        img_bgr = frames[fi][:, :, ::-1]  # RGB→BGR view (no copy)
+        img_h, img_w = img_bgr.shape[:2]
+        centers = (boxes[:, 2:4] + boxes[:, 0:2]) / 2.0
+        scales = rescale_factor * (boxes[:, 2:4] - boxes[:, 0:2]) / 200.0
+        img_wh = np.array([img_w, img_h], dtype=np.float32)
+        for k in range(len(boxes)):
+            all_crop_specs.append((fi, img_bgr, centers[k], scales[k], right_arr[k], img_wh))
 
-        # Detect hands
-        dets = detector(img_bgr, conf=det_conf, verbose=False)[0]
-        bboxes = []
-        is_right_list = []
-        for det in dets:
-            bbox = det.boxes.data.cpu().detach().squeeze().numpy()
-            is_right_list.append(det.boxes.cls.cpu().detach().squeeze().item())
-            bboxes.append(bbox[:4].tolist())
+    def _preprocess_one(spec):
+        fi, img_bgr, center, scale, is_right, img_wh = spec
+        img_tensor, bbox_size = _preprocess_hand_crop(
+            img_bgr, center, scale, bbox_shape, img_size_cfg, is_right, mean, std
+        )
+        return (
+            torch.from_numpy(img_tensor).half(),
+            (fi, center.copy(), bbox_size, img_wh, is_right),
+        )
 
-        if len(bboxes) == 0:
-            if count > 0 and count % 96 == 0:
-                elapsed = time.perf_counter() - t_start
-                fps_rate = (count + 1) / elapsed
-                eta = (len(sampled_indices) - count - 1) / fps_rate
-                print(f"    {count+1}/{len(sampled_indices)} frames ({fps_rate:.1f} fps, ETA {eta:.0f}s)")
-            continue
+    # Use thread pool for CPU preprocessing, overlap with GPU batches
+    from concurrent.futures import ThreadPoolExecutor as TPE
+    with TPE(max_workers=4) as prep_pool:
+        # Submit all preprocessing jobs
+        futures = [prep_pool.submit(_preprocess_one, spec) for spec in all_crop_specs]
 
-        boxes = np.stack(bboxes)
-        right = np.stack(is_right_list)
-        dataset = ViTDetDataset(model_cfg, img_bgr, boxes, right, rescale_factor=2.0, fp16=True)
-        dl = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=False, num_workers=0)
+        crop_buf_imgs = []
+        crop_buf_meta = []
+        for fut in futures:
+            img_t, meta = fut.result()
+            crop_buf_imgs.append(img_t)
+            crop_buf_meta.append(meta)
 
-        for batch in dl:
-            batch = recursive_to(batch, device)
-            with torch.no_grad():
-                out = model(batch)
+            if len(crop_buf_imgs) >= BATCH_SIZE:
+                _run_wilor_batch(
+                    crop_buf_imgs[:BATCH_SIZE], crop_buf_meta[:BATCH_SIZE],
+                    model, model_cfg, device,
+                    left_kp3d, right_kp3d, left_kp2d, right_kp2d,
+                    left_detected, right_detected,
+                )
+                n_hands += BATCH_SIZE
+                crop_buf_imgs = crop_buf_imgs[BATCH_SIZE:]
+                crop_buf_meta = crop_buf_meta[BATCH_SIZE:]
 
-            multiplier = (2 * batch['right'] - 1)
-            pred_cam = out['pred_cam']
-            pred_cam[:, 1] = multiplier * pred_cam[:, 1]
-            box_center = batch['box_center'].float()
-            box_size = batch['box_size'].float()
-            img_size = batch['img_size'].float()
-            scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-            pred_cam_t_full = cam_crop_to_full(
-                pred_cam, box_center, box_size, img_size, scaled_focal_length
-            ).detach().cpu().numpy()
+    # Flush remaining crops
+    if crop_buf_imgs:
+        _run_wilor_batch(
+            crop_buf_imgs, crop_buf_meta,
+            model, model_cfg, device,
+            left_kp3d, right_kp3d, left_kp2d, right_kp2d,
+            left_detected, right_detected,
+        )
+        n_hands += len(crop_buf_imgs)
 
-            bs = batch['img'].shape[0]
-            for n in range(bs):
-                joints_3d = out['pred_keypoints_3d'][n].detach().cpu().numpy()  # [21, 3]
-                is_r = batch['right'][n].cpu().numpy()
-                joints_3d[:, 0] = (2 * is_r - 1) * joints_3d[:, 0]
-                cam_t = pred_cam_t_full[n]
-                joints_cam = joints_3d + cam_t  # 3D keypoints in camera space
-
-                # 2D projection
-                kp_2d = out['pred_keypoints_2d'][n].detach().cpu().numpy() if 'pred_keypoints_2d' in out else None
-
-                if is_r > 0.5:
-                    right_kp3d[fi] = joints_cam
-                    right_detected[fi] = True
-                    if kp_2d is not None:
-                        right_kp2d[fi] = kp_2d[:, :2]
-                else:
-                    left_kp3d[fi] = joints_cam
-                    left_detected[fi] = True
-                    if kp_2d is not None:
-                        left_kp2d[fi] = kp_2d[:, :2]
-                n_hands += 1
-
-        if count > 0 and count % 96 == 0:
-            elapsed = time.perf_counter() - t_start
-            fps_rate = (count + 1) / elapsed
-            eta = (len(sampled_indices) - count - 1) / fps_rate
-            print(f"    {count+1}/{len(sampled_indices)} frames ({fps_rate:.1f} fps, ETA {eta:.0f}s)")
-
+    t_wilor = time.perf_counter() - t_wilor_start
     elapsed = time.perf_counter() - t_start
-    print(f"  WiLoR inference: {elapsed:.1f}s ({len(sampled_indices)/elapsed:.1f} fps), {n_hands} hands detected")
+    print(f"    WiLoR: {t_wilor:.1f}s ({n_hands/max(t_wilor,0.001):.0f} hands/s)")
+    print(f"  Total hand pose: {elapsed:.1f}s ({len(sampled_indices)/elapsed:.1f} fps), {n_hands} hands detected")
 
     # Interpolate strided frames
     if stride > 1:
         for arr in [left_kp3d, right_kp3d, left_kp2d, right_kp2d]:
             _interpolate_hand_keypoints(arr, sampled_indices, num_frames)
-        # For boolean detection, use nearest-neighbor
         for det_arr in [left_detected, right_detected]:
             full = np.zeros(num_frames, dtype=bool)
             full[sampled_indices] = det_arr[sampled_indices]
-            # Fill gaps with nearest sampled value
             for i in range(len(sampled_indices) - 1):
                 a, b = sampled_indices[i], sampled_indices[i + 1]
                 mid = (a + b) // 2
@@ -707,6 +782,68 @@ def run_hand_pose_wilor(frames, fps, width, height, wilor_dir, device="cuda",
         "left_hand_detected": left_detected,
         "right_hand_detected": right_detected,
     }
+
+
+def _run_wilor_batch(crop_imgs, crop_meta, model, model_cfg, device,
+                     left_kp3d, right_kp3d, left_kp2d, right_kp2d,
+                     left_detected, right_detected):
+    """Run WiLoR on a batch of preprocessed hand crops and write results into output arrays."""
+    from wilor.utils.renderer import cam_crop_to_full
+
+    bs = len(crop_imgs)
+    img_batch = torch.stack(crop_imgs).to(device)
+
+    # Build batch dict matching what WiLoR expects
+    box_centers = torch.tensor(np.array([m[1] for m in crop_meta]), dtype=torch.float32, device=device)
+    box_sizes = torch.tensor(np.array([m[2] for m in crop_meta]), dtype=torch.float32, device=device)
+    img_sizes = torch.tensor(np.array([m[3] for m in crop_meta]), dtype=torch.float32, device=device)
+    rights = torch.tensor(np.array([m[4] for m in crop_meta]), dtype=torch.float32, device=device)
+
+    batch = {
+        'img': img_batch,
+        'box_center': box_centers,
+        'box_size': box_sizes,
+        'img_size': img_sizes,
+        'right': rights,
+        'personid': torch.zeros(bs, dtype=torch.int32, device=device),
+    }
+
+    with torch.no_grad():
+        out = model(batch)
+
+    multiplier = (2 * rights - 1)
+    pred_cam = out['pred_cam']
+    pred_cam[:, 1] = multiplier * pred_cam[:, 1]
+    scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_sizes.max()
+    pred_cam_t_full = cam_crop_to_full(
+        pred_cam, box_centers, box_sizes, img_sizes, scaled_focal_length
+    ).detach().cpu().numpy()
+
+    joints_3d_all = out['pred_keypoints_3d'].detach().cpu().numpy()  # [B, 21, 3]
+    rights_np = rights.cpu().numpy()
+    has_kp2d = 'pred_keypoints_2d' in out
+    kp2d_all = out['pred_keypoints_2d'].detach().cpu().numpy() if has_kp2d else None
+
+    for n in range(bs):
+        fi = crop_meta[n][0]
+        is_r = rights_np[n]
+        joints = joints_3d_all[n].copy()
+        joints[:, 0] = (2 * is_r - 1) * joints[:, 0]
+        cam_t = pred_cam_t_full[n]
+        joints_cam = joints + cam_t
+
+        kp_2d = kp2d_all[n] if has_kp2d else None
+
+        if is_r > 0.5:
+            right_kp3d[fi] = joints_cam
+            right_detected[fi] = True
+            if kp_2d is not None:
+                right_kp2d[fi] = kp_2d[:, :2]
+        else:
+            left_kp3d[fi] = joints_cam
+            left_detected[fi] = True
+            if kp_2d is not None:
+                left_kp2d[fi] = kp_2d[:, :2]
 
 
 def _interpolate_hand_keypoints(arr, sampled_indices, num_frames):
