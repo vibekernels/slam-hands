@@ -1243,6 +1243,27 @@ def run_body_pose_sam3d(frames, fps, width, height, sam3d_dir, checkpoint_dir,
 # LeRobot v3.0 dataset writer
 # ---------------------------------------------------------------------------
 
+def _get_video_info(video_path: str, fps: float) -> dict:
+    """Probe video file for codec, resolution, pixel format."""
+    import subprocess
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_streams", "-select_streams", "v:0", video_path],
+        capture_output=True, text=True,
+    )
+    info = json.loads(result.stdout)["streams"][0]
+    return {
+        "video.fps": fps,
+        "video.height": int(info["height"]),
+        "video.width": int(info["width"]),
+        "video.channels": 3,
+        "video.codec": info.get("codec_name", "h264"),
+        "video.pix_fmt": info.get("pix_fmt", "yuv420p"),
+        "video.is_depth_map": False,
+        "has_audio": False,
+    }
+
+
 def write_lerobot_dataset(
     output_dir: str,
     video_path: str,
@@ -1254,7 +1275,8 @@ def write_lerobot_dataset(
     """Assemble annotations into a LeRobot v3.0 dataset."""
     output_dir = Path(output_dir)
 
-    video_dir = output_dir / "videos" / "observation.video" / "chunk-000"
+    VIDEO_KEY = "observation.video"
+    video_dir = output_dir / "videos" / VIDEO_KEY / "chunk-000"
     data_dir = output_dir / "data" / "chunk-000"
     meta_dir = output_dir / "meta"
     episodes_dir = meta_dir / "episodes" / "chunk-000"
@@ -1267,43 +1289,53 @@ def write_lerobot_dataset(
     shutil.copy2(video_path, video_dest)
     print(f"  Video: {video_dest}")
 
-    # 2. Build per-frame data
+    # Probe video for info.json
+    vinfo = _get_video_info(str(video_dest), fps)
+
+    # 2. Build per-frame data — all required LeRobot v3.0 columns
     frame_indices = np.arange(num_frames, dtype=np.int64)
-    timestamps = frame_indices / fps
+    timestamps = (frame_indices / fps).astype(np.float32)
     episode_indices = np.zeros(num_frames, dtype=np.int64)
 
     data = {
+        "index": frame_indices.copy(),            # global unique ID
         "frame_index": frame_indices,
         "episode_index": episode_indices,
         "timestamp": timestamps,
+        "task_index": np.zeros(num_frames, dtype=np.int64),
     }
 
-    # SLAM columns
+    # SLAM columns — store as list columns (not split scalars)
     if slam_result is not None:
-        poses = slam_result["poses"]  # [N, 7]
+        poses = slam_result["poses"]  # [N, 7]: tx,ty,tz,qx,qy,qz,qw
         if len(poses) >= num_frames:
             poses = poses[:num_frames]
         else:
             pad = np.tile(poses[-1:], (num_frames - len(poses), 1))
             poses = np.vstack([poses, pad])
+        poses = poses.astype(np.float32)
 
-        for i, name in enumerate(["tx", "ty", "tz", "qx", "qy", "qz", "qw"]):
-            data[f"slam.pose.{name}"] = poses[:, i].astype(np.float32)
+        data["observation.slam.pose"] = [poses[i].tolist() for i in range(num_frames)]
 
-        intrinsics = slam_result["intrinsics"]
-        for i, name in enumerate(["fx", "fy", "cx", "cy"]):
-            data[f"slam.intrinsics.{name}"] = np.full(num_frames, intrinsics[i], dtype=np.float32)
+        intrinsics = slam_result["intrinsics"].astype(np.float32)  # [4]: fx,fy,cx,cy
+        data["observation.slam.intrinsics"] = [intrinsics.tolist()] * num_frames
 
-    # Hand pose columns (EgoVerse format: 21 keypoints per hand)
+    # Hand pose columns — flat list columns matching EgoVerse convention
     if hand_result is not None:
         for side in ["left", "right"]:
             kp3d = hand_result[f"{side}_hand_keypoints_3d"]  # [N, 21, 3]
-            data[f"hand.{side}.keypoints_3d"] = [kp3d[i].flatten().tolist() for i in range(num_frames)]
+            data[f"observation.hand.{side}.keypoints_3d"] = [
+                kp3d[i].flatten().astype(np.float32).tolist() for i in range(num_frames)
+            ]
 
             kp2d = hand_result[f"{side}_hand_keypoints_2d"]  # [N, 21, 2]
-            data[f"hand.{side}.keypoints_2d"] = [kp2d[i].flatten().tolist() for i in range(num_frames)]
+            data[f"observation.hand.{side}.keypoints_2d"] = [
+                kp2d[i].flatten().astype(np.float32).tolist() for i in range(num_frames)
+            ]
 
-            data[f"hand.{side}.detected"] = hand_result[f"{side}_hand_detected"].astype(np.float32)
+            data[f"observation.hand.{side}.detected"] = hand_result[
+                f"{side}_hand_detected"
+            ].astype(np.float32)
 
     # 3. Write Parquet
     table = pa.table(data)
@@ -1322,39 +1354,65 @@ def write_lerobot_dataset(
     # 5. Write tasks
     pq.write_table(pa.table({"task_index": [0], "task": ["default"]}), meta_dir / "tasks.parquet")
 
-    # 6. Write info.json
+    # 6. Write info.json (full LeRobot v3.0 schema)
     features = {
-        "frame_index": {"dtype": "int64", "shape": [1]},
-        "episode_index": {"dtype": "int64", "shape": [1]},
-        "timestamp": {"dtype": "float64", "shape": [1]},
-        "observation.video": {
+        "index": {"dtype": "int64", "shape": [1], "names": None},
+        "frame_index": {"dtype": "int64", "shape": [1], "names": None},
+        "episode_index": {"dtype": "int64", "shape": [1], "names": None},
+        "timestamp": {"dtype": "float32", "shape": [1], "names": None},
+        "task_index": {"dtype": "int64", "shape": [1], "names": None},
+        VIDEO_KEY: {
             "dtype": "video",
-            "shape": [],
-            "video_info": {
-                "video.fps": fps,
-                "video.codec": "av1",
-                "video.pix_fmt": "yuv420p",
-            },
+            "shape": [vinfo["video.height"], vinfo["video.width"], 3],
+            "names": ["height", "width", "channels"],
+            "info": vinfo,
         },
     }
 
     if slam_result is not None:
-        features["slam.pose"] = {"dtype": "float32", "shape": [7]}
-        features["slam.intrinsics"] = {"dtype": "float32", "shape": [4]}
+        features["observation.slam.pose"] = {
+            "dtype": "float32",
+            "shape": [7],
+            "names": ["tx", "ty", "tz", "qx", "qy", "qz", "qw"],
+        }
+        features["observation.slam.intrinsics"] = {
+            "dtype": "float32",
+            "shape": [4],
+            "names": ["fx", "fy", "cx", "cy"],
+        }
 
     if hand_result is not None:
         for side in ["left", "right"]:
-            features[f"hand.{side}.keypoints_3d"] = {"dtype": "float32", "shape": [21, 3]}
-            features[f"hand.{side}.keypoints_2d"] = {"dtype": "float32", "shape": [21, 2]}
-            features[f"hand.{side}.detected"] = {"dtype": "float32", "shape": [1]}
+            features[f"observation.hand.{side}.keypoints_3d"] = {
+                "dtype": "float32",
+                "shape": [21, 3],
+                "names": None,
+            }
+            features[f"observation.hand.{side}.keypoints_2d"] = {
+                "dtype": "float32",
+                "shape": [21, 2],
+                "names": None,
+            }
+            features[f"observation.hand.{side}.detected"] = {
+                "dtype": "float32",
+                "shape": [1],
+                "names": None,
+            }
 
     info = {
         "codebase_version": "v3.0",
         "robot_type": "unknown",
         "total_episodes": 1,
         "total_frames": num_frames,
-        "fps": fps,
+        "total_tasks": 1,
+        "chunks_size": 1000,
+        "fps": int(fps) if fps == int(fps) else fps,
+        "splits": {"train": "0:1"},
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": features,
+        "data_files_size_in_mb": 100,
+        "video_files_size_in_mb": 500,
     }
 
     info_path = meta_dir / "info.json"
@@ -1533,6 +1591,10 @@ def main():
     dataset_path = write_lerobot_dataset(
         args.output_dir, video_output, slam_result, hand_result, fps, num_frames,
     )
+
+    # Clean up temp converted video (now copied into videos/ dir)
+    if os.path.exists(video_output) and "converted.mp4" in video_output:
+        os.remove(video_output)
 
     phase4_time = time.perf_counter() - phase4_start
     total_time = time.perf_counter() - total_start
