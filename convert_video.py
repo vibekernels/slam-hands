@@ -246,13 +246,20 @@ def build_ffmpeg_cmd_nvenc(
 
 
 def check_scale_cuda_available() -> bool:
-    """Check if ffmpeg's scale_cuda filter is available."""
+    """Check if ffmpeg's scale_cuda filter actually works (not just listed).
+
+    Tests a minimal encode to catch CUDA_ERROR_NO_DEVICE errors that occur
+    when the encoder is listed but CUDA isn't accessible to ffmpeg.
+    """
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-filters"],
-            capture_output=True, text=True, timeout=10,
+            ["ffmpeg", "-hide_banner", "-y",
+             "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.04:r=1",
+             "-vf", "scale_cuda=format=nv12",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=5,
         )
-        return "scale_cuda" in result.stdout
+        return result.returncode == 0
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
@@ -289,6 +296,53 @@ def build_ffmpeg_cmd_fast(
     ]
 
 
+def build_ffmpeg_cmd_x264_fast(
+    input_path: str,
+    output_path: str,
+    *,
+    hdr_input: bool = False,
+    quality: int = 23,
+    gop: int = 2,
+) -> list[str]:
+    """Build fast CPU encode command: libx264 ultrafast (~7s for 62s 1080p video).
+
+    5x faster than svtav1 with slightly larger file size. Good fallback when
+    NVENC is unavailable. Skips -hwaccel since we're on this path because GPU
+    isn't available to ffmpeg.
+    """
+    total_cores = os.cpu_count() or 4
+    filter_threads = max(1, total_cores // 5)
+
+    cmd = ["ffmpeg", "-y"]
+    if hdr_input:
+        cmd += ["-filter_threads", str(filter_threads)]
+    cmd += ["-i", input_path]
+
+    if hdr_input:
+        vf = (
+            "zscale=tin=arib-std-b67:t=bt709"
+            ":min=bt2020nc:m=bt709"
+            ":pin=bt2020:p=bt709"
+            ":r=tv:npl=100"
+            ",format=yuv420p"
+        )
+    else:
+        vf = "format=yuv420p"
+    cmd += ["-vf", vf]
+
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", str(quality),
+        "-g", str(gop),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-an",
+        output_path,
+    ]
+    return cmd
+
+
 def run_gpu_pipeline(
     input_path: str,
     output_path: str,
@@ -323,6 +377,7 @@ def convert_video(
     bitrate: int | None = None,
     gpu_pipeline: bool = False,
     fast: bool = False,
+    fast_cpu: bool = False,
 ) -> str:
     """Convert a video to LeRobotDataset v3.0 format."""
     input_path = str(Path(input_path).resolve())
@@ -352,11 +407,12 @@ def convert_video(
     )
 
     # --fast: full GPU pipeline via ffmpeg (NVDEC → scale_cuda → h264_nvenc)
-    use_fast = fast
+    use_fast = fast and not fast_cpu
     if use_fast:
         if not (check_nvdec_available() and check_nvenc_available()
                 and check_scale_cuda_available()):
-            print("  --fast requires NVDEC + scale_cuda + h264_nvenc, falling back")
+            print("  --fast requires NVDEC + scale_cuda + h264_nvenc, trying libx264 ultrafast")
+            fast_cpu = True
             use_fast = False
 
     if use_fast:
@@ -369,7 +425,23 @@ def convert_video(
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"ffmpeg stderr:\n{result.stderr}", file=sys.stderr)
-            print("\n--fast failed, falling back to default...")
+            print("\n--fast NVENC failed, trying libx264 ultrafast...")
+            return convert_video(input_path, output_path, use_gpu=use_gpu,
+                                 quality=quality, gop=gop, preset=preset,
+                                 fast_cpu=True)
+    elif fast_cpu:
+        # Fast CPU fallback: libx264 ultrafast (~7s vs ~38s for svtav1)
+        print(f"  Output: libx264 ultrafast yuv420p CRF={quality} GOP={gop}")
+        cmd = build_ffmpeg_cmd_x264_fast(
+            input_path, output_path, hdr_input=hdr,
+            quality=quality, gop=gop,
+        )
+        print(f"\n  $ {' '.join(cmd)}\n")
+        start = time.perf_counter()
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"ffmpeg stderr:\n{result.stderr}", file=sys.stderr)
+            print("\nlibx264 failed, falling back to svtav1...")
             return convert_video(input_path, output_path, use_gpu=use_gpu,
                                  quality=quality, gop=gop, preset=preset)
     else:

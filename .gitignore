@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.so
+*.egg-info/
+build/
+dist/
+.torch_cache/
+models/
+output_test/
+*.mp4
+*.MOV
+*.mov
