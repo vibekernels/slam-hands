@@ -334,9 +334,9 @@ const frustumGroup = new THREE.Group();
 scene.add(frustumGroup);
 
 function buildCameraFrustum() {
-    // Simple wireframe frustum
-    const s = 0.04; // near plane half-size
-    const d = 0.08; // depth
+    // Wireframe frustum sized to contain the hand placement (~0.3m out)
+    const s = 0.08; // near plane half-size
+    const d = 0.22; // far plane half-size
     const ar = 16/9;
     const vertices = new Float32Array([
         // near plane corners
@@ -381,7 +381,7 @@ function buildHandSkeleton(side) {
     const group = handGroups[side];
 
     // 21 joint spheres
-    const sphereGeo = new THREE.SphereGeometry(0.005, 6, 6);
+    const sphereGeo = new THREE.SphereGeometry(0.003, 6, 6);
     const mat = new THREE.MeshBasicMaterial({ color });
     for (let j = 0; j < 21; j++) {
         const mesh = new THREE.Mesh(sphereGeo, mat);
@@ -446,8 +446,8 @@ function updateHand3D(side, kp3d, slamPose) {
             worldPositions.push(null);
             continue;
         }
-        // Relative to wrist, keeping WiLoR's scale (units ~ meters)
-        const rel = raw[j].clone().sub(wrist);
+        // Relative to wrist, scaled down for visual clarity (0.4x real size)
+        const rel = raw[j].clone().sub(wrist).multiplyScalar(0.4);
         // Rotate relative position into SLAM world frame
         rel.applyQuaternion(camQuat);
         const world = handOrigin.clone().add(rel);
