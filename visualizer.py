@@ -413,25 +413,47 @@ function updateHand3D(side, kp3d, slamPose) {
         return;
     }
 
-    // Camera pose: [tx, ty, tz, qx, qy, qz, qw]
+    // WiLoR 3D keypoints are in WiLoR's camera frame with z~40m (weak-perspective depth).
+    // We center on the wrist, keep relative joint structure, and place in front of the SLAM camera.
     const camPos = new THREE.Vector3(slamPose[0], slamPose[1], slamPose[2]);
     const camQuat = new THREE.Quaternion(slamPose[3], slamPose[4], slamPose[5], slamPose[6]);
 
-    // Transform each joint from camera frame to world frame
-    const worldPositions = [];
+    // Read all joints, find wrist (joint 0) as origin
+    const raw = [];
     for (let j = 0; j < 21; j++) {
         const x = kp3d[j * 3], y = kp3d[j * 3 + 1], z = kp3d[j * 3 + 2];
-        if (x == null || isNaN(x)) {
+        if (x == null || isNaN(x)) { raw.push(null); continue; }
+        raw.push(new THREE.Vector3(x, y, z));
+    }
+    if (!raw[0]) {
+        joints.forEach(m => m.visible = false);
+        boneLine.visible = false;
+        return;
+    }
+
+    const wrist = raw[0].clone();
+
+    // Place hand 0.3m in front of camera (along camera -Z in SLAM convention)
+    // Offset left/right hands slightly so they don't overlap
+    const offset = new THREE.Vector3(side === 'left' ? -0.06 : 0.06, -0.05, -0.3);
+    offset.applyQuaternion(camQuat);
+    const handOrigin = camPos.clone().add(offset);
+
+    const worldPositions = [];
+    for (let j = 0; j < 21; j++) {
+        if (!raw[j]) {
             joints[j].visible = false;
             worldPositions.push(null);
             continue;
         }
-        const local = new THREE.Vector3(x, y, z);
-        local.applyQuaternion(camQuat);
-        local.add(camPos);
-        joints[j].position.copy(local);
+        // Relative to wrist, keeping WiLoR's scale (units ~ meters)
+        const rel = raw[j].clone().sub(wrist);
+        // Rotate relative position into SLAM world frame
+        rel.applyQuaternion(camQuat);
+        const world = handOrigin.clone().add(rel);
+        joints[j].position.copy(world);
         joints[j].visible = true;
-        worldPositions.push(local);
+        worldPositions.push(world);
     }
 
     // Update bone lines
