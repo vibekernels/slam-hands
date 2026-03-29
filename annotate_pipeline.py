@@ -28,6 +28,8 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 
+_SENTINEL = object()  # End-of-stream marker for concurrent frame queue
+
 # ---------------------------------------------------------------------------
 # Video decode helpers
 # ---------------------------------------------------------------------------
@@ -416,6 +418,352 @@ def run_slam_native_decode(video_path, fps, width, height, weights_path, device=
         return slam_result, num_frames, rgb_frames
     return slam_result, num_frames
 
+
+def _hand_pose_worker_thread(
+    frame_queue, result_dict, wilor_dir, preloaded, num_frames_est,
+    device, det_conf, stride, hand_stream, worker_error, error_info,
+):
+    """Worker thread: runs YOLO + WiLoR hand pose on a dedicated CUDA stream.
+
+    Consumes (frame_idx, rgb_np) tuples from frame_queue until _SENTINEL.
+    Writes final hand pose result into result_dict.
+    """
+    try:
+        torch.cuda.set_device(0)
+        sys.path.insert(0, wilor_dir)
+        from ultralytics import YOLO
+
+        with torch.cuda.stream(hand_stream), torch.no_grad():
+            # Load models to GPU
+            t_load = time.perf_counter()
+            model_cpu, model_cfg = preloaded
+            model = model_cpu.to(device).eval().half()
+            model.backbone.skip_blocks = True
+            detector = YOLO(os.path.join(wilor_dir, 'pretrained_models', 'detector.pt')).to(device)
+            print(f"  [Hand worker] Models on GPU ({time.perf_counter()-t_load:.1f}s)")
+
+            # Config values for crop preprocessing
+            mean = 255.0 * np.array(model_cfg.MODEL.IMAGE_MEAN, dtype=np.float32)
+            std = 255.0 * np.array(model_cfg.MODEL.IMAGE_STD, dtype=np.float32)
+            bbox_shape = model_cfg.MODEL.get('BBOX_SHAPE', None)
+            img_size_cfg = model_cfg.MODEL.IMAGE_SIZE
+            rescale_factor = 2.0
+
+            # ── Pass 1: Consume frames, run YOLO, store frames with detections ──
+            t_yolo_start = time.perf_counter()
+            frame_dets = []       # (fi, boxes [K,4], right [K], img_bgr)
+            total_crops = 0
+            yolo_batch = []       # (fi, img_bgr)
+            sampled_indices = []
+            actual_num_frames = 0
+            YOLO_BATCH = 16
+
+            def _flush_yolo():
+                nonlocal total_crops
+                if not yolo_batch:
+                    return
+                fis = [x[0] for x in yolo_batch]
+                imgs = [x[1] for x in yolo_batch]
+                results = detector(imgs, conf=det_conf, verbose=False)
+                for i, (det_fi, dets) in enumerate(zip(fis, results)):
+                    bboxes, is_right_list = [], []
+                    for det in dets:
+                        bbox = det.boxes.data.cpu().detach().squeeze().numpy()
+                        is_right_list.append(det.boxes.cls.cpu().detach().squeeze().item())
+                        bboxes.append(bbox[:4].tolist())
+                    if bboxes:
+                        frame_dets.append((
+                            det_fi,
+                            np.stack(bboxes).astype(np.float32),
+                            np.stack(is_right_list).astype(np.float32),
+                            imgs[i],  # keep BGR for WiLoR crop extraction
+                        ))
+                        total_crops += len(bboxes)
+
+            while True:
+                item = frame_queue.get()
+                if item is _SENTINEL:
+                    break
+                fi, rgb_np = item
+                actual_num_frames = max(actual_num_frames, fi + 1)
+                if stride > 1 and fi % stride != 0:
+                    continue
+                sampled_indices.append(fi)
+                yolo_batch.append((fi, rgb_np[:, :, ::-1].copy()))
+                if len(yolo_batch) >= YOLO_BATCH:
+                    _flush_yolo()
+                    yolo_batch = []
+
+            _flush_yolo()
+            yolo_batch = []
+
+            t_yolo = time.perf_counter() - t_yolo_start
+            num_frames = actual_num_frames
+            n_sampled = len(sampled_indices)
+            print(f"  [Hand worker] YOLO: {t_yolo:.1f}s ({n_sampled/max(t_yolo,0.001):.0f} fps), "
+                  f"{total_crops} crops in {len(frame_dets)} frames")
+
+            # Output arrays
+            left_kp3d = np.full((num_frames, 21, 3), np.nan, dtype=np.float32)
+            right_kp3d = np.full((num_frames, 21, 3), np.nan, dtype=np.float32)
+            left_kp2d = np.full((num_frames, 21, 2), np.nan, dtype=np.float32)
+            right_kp2d = np.full((num_frames, 21, 2), np.nan, dtype=np.float32)
+            left_detected = np.zeros(num_frames, dtype=bool)
+            right_detected = np.zeros(num_frames, dtype=bool)
+
+            if total_crops == 0:
+                print(f"  [Hand worker] No hands detected")
+                result_dict.update({
+                    "_model": "wilor", "_done": True, "_num_frames": num_frames,
+                    "left_hand_keypoints_3d": left_kp3d, "right_hand_keypoints_3d": right_kp3d,
+                    "left_hand_keypoints_2d": left_kp2d, "right_hand_keypoints_2d": right_kp2d,
+                    "left_hand_detected": left_detected, "right_hand_detected": right_detected,
+                })
+                return
+
+            # ── Pass 2: WiLoR inference (cross-frame batched, threaded preprocessing) ──
+            t_wilor_start = time.perf_counter()
+            BATCH_SIZE = 48
+            n_hands = 0
+
+            all_crop_specs = []
+            for fi, boxes, right_arr, img_bgr in frame_dets:
+                img_h, img_w = img_bgr.shape[:2]
+                centers = (boxes[:, 2:4] + boxes[:, 0:2]) / 2.0
+                scales = rescale_factor * (boxes[:, 2:4] - boxes[:, 0:2]) / 200.0
+                img_wh = np.array([img_w, img_h], dtype=np.float32)
+                for k in range(len(boxes)):
+                    all_crop_specs.append((fi, img_bgr, centers[k], scales[k], right_arr[k], img_wh))
+            frame_dets = []  # free stored images
+
+            def _preprocess_one(spec):
+                fi, img_bgr, center, scale, is_right, img_wh = spec
+                img_tensor, bbox_size = _preprocess_hand_crop(
+                    img_bgr, center, scale, bbox_shape, img_size_cfg, is_right, mean, std
+                )
+                return (
+                    torch.from_numpy(img_tensor).half(),
+                    (fi, center.copy(), bbox_size, img_wh, is_right),
+                )
+
+            from concurrent.futures import ThreadPoolExecutor as TPE
+            with TPE(max_workers=4) as prep_pool:
+                futures = [prep_pool.submit(_preprocess_one, spec) for spec in all_crop_specs]
+                all_crop_specs = []
+
+                crop_buf_imgs = []
+                crop_buf_meta = []
+                for fut in futures:
+                    img_t, meta = fut.result()
+                    crop_buf_imgs.append(img_t)
+                    crop_buf_meta.append(meta)
+                    if len(crop_buf_imgs) >= BATCH_SIZE:
+                        _run_wilor_batch(
+                            crop_buf_imgs[:BATCH_SIZE], crop_buf_meta[:BATCH_SIZE],
+                            model, model_cfg, device,
+                            left_kp3d, right_kp3d, left_kp2d, right_kp2d,
+                            left_detected, right_detected,
+                        )
+                        n_hands += BATCH_SIZE
+                        crop_buf_imgs = crop_buf_imgs[BATCH_SIZE:]
+                        crop_buf_meta = crop_buf_meta[BATCH_SIZE:]
+
+            if crop_buf_imgs:
+                _run_wilor_batch(
+                    crop_buf_imgs, crop_buf_meta, model, model_cfg, device,
+                    left_kp3d, right_kp3d, left_kp2d, right_kp2d,
+                    left_detected, right_detected,
+                )
+                n_hands += len(crop_buf_imgs)
+
+            t_wilor = time.perf_counter() - t_wilor_start
+            print(f"  [Hand worker] WiLoR: {t_wilor:.1f}s ({n_hands/max(t_wilor,0.001):.0f} hands/s)")
+
+            # Interpolate strided frames
+            if stride > 1 and len(sampled_indices) > 1:
+                if sampled_indices[-1] != num_frames - 1:
+                    sampled_indices.append(num_frames - 1)
+                for arr in [left_kp3d, right_kp3d, left_kp2d, right_kp2d]:
+                    _interpolate_hand_keypoints(arr, sampled_indices, num_frames)
+                for det_arr in [left_detected, right_detected]:
+                    full = np.zeros(num_frames, dtype=bool)
+                    full[sampled_indices] = det_arr[sampled_indices]
+                    for i in range(len(sampled_indices) - 1):
+                        a, b = sampled_indices[i], sampled_indices[i + 1]
+                        mid = (a + b) // 2
+                        full[a:mid+1] = det_arr[a]
+                        full[mid+1:b] = det_arr[b]
+                    det_arr[:] = full
+
+            left_rate = left_detected.sum() / num_frames * 100
+            right_rate = right_detected.sum() / num_frames * 100
+            t_total = time.perf_counter() - t_yolo_start
+            print(f"  [Hand worker] Done: {t_total:.1f}s, {n_hands} hands, "
+                  f"left={left_rate:.1f}% right={right_rate:.1f}%")
+
+            result_dict.update({
+                "_model": "wilor", "_done": True, "_num_frames": num_frames,
+                "left_hand_keypoints_3d": left_kp3d, "right_hand_keypoints_3d": right_kp3d,
+                "left_hand_keypoints_2d": left_kp2d, "right_hand_keypoints_2d": right_kp2d,
+                "left_hand_detected": left_detected, "right_hand_detected": right_detected,
+            })
+
+    except Exception as e:
+        import traceback
+        error_info.append(traceback.format_exc())
+        worker_error.set()
+
+
+def run_slam_and_hand_pose_concurrent(
+    video_path, fps, width, height, weights_path, wilor_dir, wilor_preloaded,
+    device="cuda", backend_steps=(7, 12), fast_traj=False,
+    det_conf=0.3, stride=1,
+):
+    """Run DROID-SLAM and WiLoR hand pose concurrently on the same GPU.
+
+    Two threads share the GPU via separate CUDA streams:
+    - Main thread: C++ decode -> SLAM tracking -> backend -> traj fill
+    - Worker thread: YOLO detection -> WiLoR batched inference
+
+    Returns (slam_result, hand_result, num_frames).
+    """
+    import threading
+
+    sys.path.insert(0, os.path.join(os.path.dirname(weights_path), "..", "droid_slam"))
+    from droid import Droid
+
+    nd = _get_native_decode()
+
+    # SLAM resolution
+    h0, w0 = height, width
+    scale = np.sqrt((384 * 512) / (h0 * w0))
+    h1 = int(h0 * scale) // 8 * 8
+    w1 = int(w0 * scale) // 8 * 8
+
+    fx, fy, cx, cy = get_iphone_intrinsics(width, height)
+    intrinsics_scaled = torch.as_tensor([
+        fx * (w1 / w0), fy * (h1 / h0), cx * (w1 / w0), cy * (h1 / h0),
+    ])
+
+    slam_args = argparse.Namespace(
+        weights=weights_path, buffer=512, image_size=[h1, w1],
+        disable_vis=True, stereo=False, beta=0.3, filter_thresh=2.4,
+        warmup=8, keyframe_thresh=4.0,
+        frontend_thresh=16.0, frontend_window=25, frontend_radius=2, frontend_nms=1,
+        backend_thresh=22.0, backend_radius=2, backend_nms=3,
+        upsample=False, frontend_device=device, backend_device=device,
+    )
+
+    # Create CUDA stream for hand pose worker
+    hand_stream = torch.cuda.Stream()
+    frame_queue = Queue(maxsize=64)
+    result_dict = {}
+    worker_error = threading.Event()
+    error_info = []
+
+    # Start hand pose worker thread
+    hand_worker = threading.Thread(
+        target=_hand_pose_worker_thread,
+        args=(frame_queue, result_dict, wilor_dir, wilor_preloaded,
+              2000, device, det_conf, stride, hand_stream, worker_error, error_info),
+        daemon=True,
+    )
+    hand_worker.start()
+
+    # Start C++ async decoder (full-res RGB + SLAM-res)
+    decoder = nd.AsyncVideoDecoder()
+    decoder.start(video_path, w1, h1, slam_only=False, queue_depth=128)
+    droid = Droid(slam_args)
+    print(f"  SLAM resolution: {w1}x{h1} (concurrent mode)")
+
+    # ── SLAM tracking: decode -> put frame for worker -> track ──
+    t_track_start = time.perf_counter()
+    slam_tensors = [] if not fast_traj else None
+    t = 0
+    while True:
+        if worker_error.is_set():
+            raise RuntimeError(f"Hand pose worker failed:\n{''.join(error_info)}")
+        result = decoder.get_next()
+        if result is None:
+            break
+        rgb_np, slam_bgr = result
+        frame_queue.put((t, np.array(rgb_np)))
+        tensor = torch.from_numpy(slam_bgr).permute(2, 0, 1).unsqueeze(0).cuda()
+        if slam_tensors is not None:
+            slam_tensors.append(tensor)
+        droid.track(t, tensor, intrinsics=intrinsics_scaled)
+        t += 1
+    decoder.stop()
+    num_frames = t
+    frame_queue.put(_SENTINEL)
+
+    t_track = time.perf_counter() - t_track_start
+    print(f"  SLAM tracking: {t_track:.1f}s ({num_frames/t_track:.0f} fps)")
+
+    # ── SLAM backend (worker processes WiLoR batches in parallel) ──
+    print(f"  Backend optimization ({backend_steps[0]}+{backend_steps[1]} steps)...")
+    del droid.frontend
+    torch.cuda.empty_cache()
+
+    t_backend_start = time.perf_counter()
+    droid.backend(backend_steps[0])
+    torch.cuda.empty_cache()
+    droid.backend(backend_steps[1])
+    t_backend = time.perf_counter() - t_backend_start
+    print(f"  Backend: {t_backend:.1f}s")
+
+    # ── Trajectory fill ──
+    if fast_traj:
+        torch.cuda.empty_cache()
+        t_traj_start = time.perf_counter()
+        N = droid.video.counter.value
+        kf_tstamps = droid.video.tstamp[:N].cpu().numpy().astype(np.int64)
+        import lietorch
+        kf_poses_se3 = lietorch.SE3(droid.video.poses[:N])
+        kf_poses_raw = kf_poses_se3.inv().data.cpu().numpy()
+        all_poses = _interpolate_poses_simple(kf_tstamps, kf_poses_raw, num_frames)
+        t_traj = time.perf_counter() - t_traj_start
+        print(f"  Trajectory fill: {t_traj:.2f}s ({N} keyframes -> {num_frames} frames)")
+    else:
+        t_traj_start = time.perf_counter()
+        def frame_stream():
+            for i, tensor_item in enumerate(slam_tensors):
+                yield i, tensor_item, intrinsics_scaled
+        traj = droid.traj_filler(frame_stream())
+        all_poses = traj.inv().data.cpu().numpy()
+        del slam_tensors
+        t_traj = time.perf_counter() - t_traj_start
+        print(f"  Trajectory fill: {t_traj:.1f}s")
+
+    slam_result = {
+        "poses": all_poses,
+        "intrinsics": intrinsics_scaled.numpy(),
+        "slam_resolution": (h1, w1),
+    }
+
+    # ── Join hand worker ──
+    t_join_start = time.perf_counter()
+    if hand_worker.is_alive():
+        print(f"  Waiting for hand worker to finish...")
+    hand_worker.join(timeout=120)
+    if hand_worker.is_alive():
+        print(f"  WARNING: hand worker timed out after 120s")
+        hand_worker.join()
+    t_join = time.perf_counter() - t_join_start
+
+    if worker_error.is_set():
+        raise RuntimeError(f"Hand pose worker failed:\n{''.join(error_info)}")
+
+    hand_result = result_dict if result_dict.get("_done") else None
+    if hand_result:
+        hand_result.pop("_done", None)
+        hand_result.pop("_num_frames", None)
+
+    total = time.perf_counter() - t_track_start
+    slam_total = t_track + t_backend + t_traj
+    print(f"  Concurrent total: {total:.1f}s (SLAM {slam_total:.1f}s, join wait {t_join:.1f}s)")
+
+    return slam_result, hand_result, num_frames
 
 def run_slam(frames, fps, width, height, weights_path, device="cuda"):
     """Run DROID-SLAM on pre-decoded video frames (non-streaming fallback).
@@ -1474,68 +1822,18 @@ def main():
         wilor_load_start = time.perf_counter()
         wilor_cpu_future = executor.submit(_load_wilor_cpu, args.wilor_dir)
 
-    # Phase 2: Decode + SLAM (uses CPU decode + GPU tracking)
-    slam_result = None
-    frames = None
-    num_frames = 0
-    phase2_time = 0
-    decode_time = 0
-    if not args.skip_slam:
-        print(f"\n[Phase 2] Decode + SLAM (DROID-SLAM)")
-        phase2_start = time.perf_counter()
-
-        torch.multiprocessing.set_start_method("spawn", force=True)
-        fps, width, height, _ = get_video_metadata(input_path)
-
-        # collect_rgb=True when hand inference needs frames — avoids separate decode pass
-        need_body_frames = not args.skip_hands
-        if need_body_frames:
-            slam_result, num_frames, frames = run_slam_native_decode(
-                input_path, fps, width, height, args.droid_weights, args.device,
-                backend_steps=tuple(args.slam_backend_steps),
-                fast_traj=args.fast_traj,
-                collect_rgb=True,
-            )
-            print(f"  RGB frames collected during SLAM ({len(frames)} frames, no re-decode needed)")
-        else:
-            slam_result, num_frames = run_slam_native_decode(
-                input_path, fps, width, height, args.droid_weights, args.device,
-                backend_steps=tuple(args.slam_backend_steps),
-                fast_traj=args.fast_traj,
-                collect_rgb=False,
-            )
-
-        phase2_time = time.perf_counter() - phase2_start
-        print(f"  Decode+SLAM completed in {phase2_time:.1f}s ({num_frames/phase2_time:.0f} fps)")
-        print(f"  Poses shape: {slam_result['poses'].shape}")
-
-        torch.cuda.empty_cache()
-    else:
-        print(f"\n[Phase 2] SLAM: Skipped")
-
-    # Decode frames for hand inference if not already available
-    if frames is None and not args.skip_hands:
-        print(f"\n[Decode] Reading video frames for hand inference...")
-        decode_start = time.perf_counter()
-        frames, fps, width, height, num_frames = decode_video_frames(input_path)
-        decode_time = time.perf_counter() - decode_start
-        print(f"  Decoded {num_frames} frames ({width}x{height} @ {fps:.1f}fps) in {decode_time:.1f}s")
-    elif frames is None and args.skip_hands:
-        if num_frames == 0:
-            _, _, _, num_frames = get_video_metadata(input_path)
-
     # Collect pre-loaded WiLoR model if background load was started
     wilor_preloaded = None
     if wilor_cpu_future is not None:
         if wilor_cpu_future.done():
-            print(f"  WiLoR CPU load finished (fully overlapped with SLAM)")
+            print(f"  WiLoR CPU load finished (fully overlapped)")
         else:
             print(f"  Waiting for WiLoR CPU load to finish...")
         wilor_preloaded = wilor_cpu_future.result()
         wilor_load_time = time.perf_counter() - wilor_load_start
         print(f"  WiLoR CPU load took {wilor_load_time:.1f}s")
 
-    # Start video conversion in background (CPU-bound ffmpeg overlaps with GPU body inference)
+    # Start video conversion in background (CPU-bound ffmpeg)
     if not args.skip_video_convert:
         from convert_video import convert_video
         print(f"\n[Background] Starting video conversion...")
@@ -1543,13 +1841,64 @@ def main():
         video_convert_future = executor.submit(
             convert_video, input_path, video_output, fast=True)
 
-    # Phase 3: Hand pose (WiLoR — 21 keypoints per hand, EgoVerse format)
+    slam_result = None
     hand_result = None
+    frames = None
+    num_frames = 0
+    phase2_time = 0
     phase3_time = 0
-    if not args.skip_hands:
+    decode_time = 0
+
+    # ── Concurrent path: SLAM + hand pose on same GPU ──
+    if not args.skip_slam and not args.skip_hands:
+        print(f"\n[Concurrent] SLAM + Hand pose (DROID-SLAM + WiLoR)")
+        phase2_start = time.perf_counter()
+        torch.multiprocessing.set_start_method("spawn", force=True)
+        fps, width, height, _ = get_video_metadata(input_path)
+
+        slam_result, hand_result, num_frames = run_slam_and_hand_pose_concurrent(
+            input_path, fps, width, height,
+            args.droid_weights, args.wilor_dir, wilor_preloaded,
+            device=args.device,
+            backend_steps=tuple(args.slam_backend_steps),
+            fast_traj=args.fast_traj,
+            det_conf=args.hand_det_conf,
+            stride=args.hand_stride,
+        )
+
+        phase2_time = time.perf_counter() - phase2_start
+        phase3_time = phase2_time  # combined
+        print(f"  Poses shape: {slam_result['poses'].shape}")
+        torch.cuda.empty_cache()
+
+    # ── SLAM only (no hands) ──
+    elif not args.skip_slam:
+        print(f"\n[Phase 2] Decode + SLAM (DROID-SLAM)")
+        phase2_start = time.perf_counter()
+        torch.multiprocessing.set_start_method("spawn", force=True)
+        fps, width, height, _ = get_video_metadata(input_path)
+
+        slam_result, num_frames = run_slam_native_decode(
+            input_path, fps, width, height, args.droid_weights, args.device,
+            backend_steps=tuple(args.slam_backend_steps),
+            fast_traj=args.fast_traj, collect_rgb=False,
+        )
+        phase2_time = time.perf_counter() - phase2_start
+        print(f"  Decode+SLAM completed in {phase2_time:.1f}s ({num_frames/phase2_time:.0f} fps)")
+        print(f"  Poses shape: {slam_result['poses'].shape}")
+        torch.cuda.empty_cache()
+
+    # ── Hands only (no SLAM) ──
+    elif not args.skip_hands:
+        print(f"\n[Phase 2] SLAM: Skipped")
+        print(f"\n[Decode] Reading video frames for hand inference...")
+        decode_start = time.perf_counter()
+        frames, fps, width, height, num_frames = decode_video_frames(input_path)
+        decode_time = time.perf_counter() - decode_start
+        print(f"  Decoded {num_frames} frames ({width}x{height} @ {fps:.1f}fps) in {decode_time:.1f}s")
+
         print(f"\n[Phase 3] Hand pose (WiLoR)")
         phase3_start = time.perf_counter()
-
         hand_result = run_hand_pose_wilor(
             frames, fps, width, height,
             args.wilor_dir, args.device,
@@ -1557,17 +1906,20 @@ def main():
             det_conf=args.hand_det_conf,
             preloaded=wilor_preloaded,
         )
-
         phase3_time = time.perf_counter() - phase3_start
         effective_fps = num_frames / phase3_time if phase3_time > 0 else 0
         print(f"  Hand pose completed in {phase3_time:.1f}s ({effective_fps:.0f} fps effective)")
-
         torch.cuda.empty_cache()
-    else:
-        print(f"\n[Phase 3] Hand pose: Skipped")
 
-    # Free decoded frames to release ~11GB RAM
-    del frames
+    else:
+        print(f"\n[Phase 2] SLAM: Skipped")
+        print(f"\n[Phase 3] Hand pose: Skipped")
+        if num_frames == 0:
+            _, _, _, num_frames = get_video_metadata(input_path)
+
+    # Free decoded frames to release RAM
+    if frames is not None:
+        del frames
 
     # Collect video conversion result
     if video_convert_future is not None:
@@ -1603,10 +1955,15 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"Pipeline complete!")
     print(f"  Total time: {total_time:.1f}s")
-    print(f"    SLAM:          {phase2_time:.1f}s (native C++ decode overlapped)")
-    if decode_time > 0:
-        print(f"    Hand decode:   {decode_time:.1f}s")
-    print(f"    Hand pose:     {phase3_time:.1f}s (WiLoR, model load overlapped with SLAM)")
+    if not args.skip_slam and not args.skip_hands:
+        print(f"    SLAM+Hands:    {phase2_time:.1f}s (concurrent on same GPU)")
+    else:
+        if phase2_time > 0:
+            print(f"    SLAM:          {phase2_time:.1f}s")
+        if decode_time > 0:
+            print(f"    Hand decode:   {decode_time:.1f}s")
+        if phase3_time > 0:
+            print(f"    Hand pose:     {phase3_time:.1f}s")
     print(f"    Video convert: {phase1_time:.1f}s")
     print(f"    Assembly:      {phase4_time:.1f}s")
     print(f"  Output: {dataset_path}")
