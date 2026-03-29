@@ -402,7 +402,7 @@ function buildHandSkeleton(side) {
 buildHandSkeleton('left');
 buildHandSkeleton('right');
 
-function updateHand3D(side, kp3d, slamPose) {
+function updateHand3D(side, kp3d, kp2d, slamPose) {
     const group = handGroups[side];
     const joints = handJointMeshes[side];
     const boneLine = handBoneLines[side];
@@ -414,7 +414,8 @@ function updateHand3D(side, kp3d, slamPose) {
     }
 
     // WiLoR 3D keypoints are in WiLoR's camera frame with z~40m (weak-perspective depth).
-    // We center on the wrist, keep relative joint structure, and place in front of the SLAM camera.
+    // We center on the wrist, keep relative joint structure, and use the 2D wrist pixel
+    // position to place the hand at the correct location within the camera frustum.
     const camPos = new THREE.Vector3(slamPose[0], slamPose[1], slamPose[2]);
     const camQuat = new THREE.Quaternion(slamPose[3], slamPose[4], slamPose[5], slamPose[6]);
 
@@ -433,9 +434,20 @@ function updateHand3D(side, kp3d, slamPose) {
 
     const wrist = raw[0].clone();
 
-    // Place hand 0.3m in front of camera (along camera -Z in SLAM convention)
-    // Offset left/right hands slightly so they don't overlap
-    const offset = new THREE.Vector3(side === 'left' ? -0.06 : 0.06, -0.05, -0.3);
+    // Use 2D wrist pixel position to place hand within the frustum.
+    // Map pixel coords to normalized [-1, 1] range, then to a position
+    // on the frustum's far plane (0.3m in front of camera).
+    const depth = 0.3;
+    let nx = 0, ny = 0;
+    if (kp2d && kp2d[0] != null && DATA) {
+        // Wrist is joint 0: kp2d[0]=x, kp2d[1]=y in pixels
+        nx = (kp2d[0] / DATA.video_width - 0.5) * 2;   // [-1, 1] left to right
+        ny = -(kp2d[1] / DATA.video_height - 0.5) * 2;  // [-1, 1] bottom to top
+    }
+    // Spread factor: how wide the frustum is at this depth (rough FOV estimate)
+    const spread = depth * 0.6;
+    const ar = DATA ? DATA.video_width / DATA.video_height : 16/9;
+    const offset = new THREE.Vector3(nx * spread * ar, ny * spread, -depth);
     offset.applyQuaternion(camQuat);
     const handOrigin = camPos.clone().add(offset);
 
@@ -583,8 +595,8 @@ function drawFrame(idx) {
     // 3D scene updates
     updateFrustum(frame.slam);
     updateTrajectoryHighlight(idx);
-    updateHand3D('left', frame.left_kp3d || null, frame.slam);
-    updateHand3D('right', frame.right_kp3d || null, frame.slam);
+    updateHand3D('left', frame.left_kp3d || null, frame.left_kp2d || null, frame.slam);
+    updateHand3D('right', frame.right_kp3d || null, frame.right_kp2d || null, frame.slam);
 
     // Follow camera mode
     if (followCam.checked && frame.slam) {
