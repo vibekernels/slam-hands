@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Annotate video with SLAM camera poses and body pose estimation.
+"""Annotate video with SLAM camera poses and hand pose estimation.
 
-Produces a LeRobot v3.0 compatible dataset with:
+Produces a LeRobot v3.0 compatible dataset following the EgoVerse format:
   - Video converted to LeRobot format (via convert_video.py)
-  - SLAM camera poses per frame (DROID-SLAM)
-  - 3D body pose per frame (SAM-3D-Body or Multi-HMR)
+  - SLAM camera poses per frame (DROID-SLAM) — 6-DoF head/camera motion
+  - 3D hand pose per frame (WiLoR) — 21 keypoints per hand, left + right
 
 Usage:
     python3 annotate_pipeline.py /workspace/IMG_1443.MOV --output-dir /workspace/output_dataset
-    python3 annotate_pipeline.py /workspace/IMG_1443.MOV --body-model sam3d
 """
 
 import argparse
@@ -499,6 +498,238 @@ def _gpu_preprocess_body(rgb_tensor, img_size, mean, std):
     return x
 
 
+# ---------------------------------------------------------------------------
+# Hand pose estimation (WiLoR) — EgoVerse format: 21 keypoints per hand
+# ---------------------------------------------------------------------------
+
+_wilor_cache = {}
+
+def _load_wilor(wilor_dir, device="cuda", fast=True):
+    """Load WiLoR model and YOLO hand detector. Cached after first call."""
+    cache_key = (wilor_dir, device)
+    if cache_key in _wilor_cache:
+        return _wilor_cache[cache_key]
+
+    sys.path.insert(0, wilor_dir)
+    from wilor.models import load_wilor
+    from ultralytics import YOLO
+
+    orig_cwd = os.getcwd()
+    os.chdir(wilor_dir)
+    try:
+        model, model_cfg = load_wilor(
+            checkpoint_path=os.path.join(wilor_dir, 'pretrained_models', 'wilor_final.ckpt'),
+            cfg_path=os.path.join(wilor_dir, 'pretrained_models', 'model_config.yaml'),
+        )
+    finally:
+        os.chdir(orig_cwd)
+    model = model.to(device).eval()
+    if fast:
+        model = model.half()
+        model.backbone.skip_blocks = True
+
+    detector = YOLO(os.path.join(wilor_dir, 'pretrained_models', 'detector.pt')).to(device)
+
+    _wilor_cache[cache_key] = (model, model_cfg, detector)
+    return model, model_cfg, detector
+
+
+def _load_wilor_cpu(wilor_dir):
+    """Load WiLoR model on CPU in background thread (for overlap with SLAM)."""
+    sys.path.insert(0, wilor_dir)
+    # WiLoR config uses relative paths (./mano_data/...), so chdir temporarily
+    orig_cwd = os.getcwd()
+    os.chdir(wilor_dir)
+    try:
+        from wilor.models import load_wilor
+        model, model_cfg = load_wilor(
+            checkpoint_path=os.path.join(wilor_dir, 'pretrained_models', 'wilor_final.ckpt'),
+            cfg_path=os.path.join(wilor_dir, 'pretrained_models', 'model_config.yaml'),
+        )
+    finally:
+        os.chdir(orig_cwd)
+    return model, model_cfg
+
+
+def run_hand_pose_wilor(frames, fps, width, height, wilor_dir, device="cuda",
+                        stride=1, det_conf=0.3, preloaded=None):
+    """Run WiLoR hand pose estimation on video frames.
+
+    Returns dict with per-frame hand pose data in EgoVerse format:
+    - left_hand_keypoints_3d: [N, 21, 3] — 21 keypoints in camera space (NaN if not detected)
+    - right_hand_keypoints_3d: [N, 21, 3]
+    - left_hand_keypoints_2d: [N, 21, 2] — projected 2D keypoints
+    - right_hand_keypoints_2d: [N, 21, 2]
+    - left_hand_detected: [N] bool
+    - right_hand_detected: [N] bool
+    - left_hand_wrist_pose: [N, 7] — wrist SE(3) as [tx,ty,tz,qx,qy,qz,qw] (NaN if not detected)
+    - right_hand_wrist_pose: [N, 7]
+    """
+    sys.path.insert(0, wilor_dir)
+    from wilor.utils import recursive_to
+    from wilor.datasets.vitdet_dataset import ViTDetDataset
+    from wilor.utils.renderer import cam_crop_to_full
+    from ultralytics import YOLO
+
+    num_frames = len(frames)
+
+    # Load model
+    if preloaded is not None:
+        model_cpu, model_cfg = preloaded
+        model = model_cpu.to(device).eval().half()
+        model.backbone.skip_blocks = True
+        detector = YOLO(os.path.join(wilor_dir, 'pretrained_models', 'detector.pt')).to(device)
+        # Cache for future calls
+        _wilor_cache[(wilor_dir, device)] = (model, model_cfg, detector)
+    else:
+        model, model_cfg, detector = _load_wilor(wilor_dir, device)
+
+    # Stride: process every Nth frame, interpolate rest
+    if stride > 1:
+        sampled_indices = list(range(0, num_frames, stride))
+        if sampled_indices[-1] != num_frames - 1:
+            sampled_indices.append(num_frames - 1)
+        print(f"  Stride={stride}: processing {len(sampled_indices)}/{num_frames} frames, interpolating rest")
+    else:
+        sampled_indices = list(range(num_frames))
+
+    # Output arrays
+    left_kp3d = np.full((num_frames, 21, 3), np.nan, dtype=np.float32)
+    right_kp3d = np.full((num_frames, 21, 3), np.nan, dtype=np.float32)
+    left_kp2d = np.full((num_frames, 21, 2), np.nan, dtype=np.float32)
+    right_kp2d = np.full((num_frames, 21, 2), np.nan, dtype=np.float32)
+    left_detected = np.zeros(num_frames, dtype=bool)
+    right_detected = np.zeros(num_frames, dtype=bool)
+
+    t_start = time.perf_counter()
+    n_hands = 0
+
+    for count, fi in enumerate(sampled_indices):
+        img_rgb = frames[fi]
+        img_bgr = img_rgb[:, :, ::-1].copy()
+
+        # Detect hands
+        dets = detector(img_bgr, conf=det_conf, verbose=False)[0]
+        bboxes = []
+        is_right_list = []
+        for det in dets:
+            bbox = det.boxes.data.cpu().detach().squeeze().numpy()
+            is_right_list.append(det.boxes.cls.cpu().detach().squeeze().item())
+            bboxes.append(bbox[:4].tolist())
+
+        if len(bboxes) == 0:
+            if count > 0 and count % 96 == 0:
+                elapsed = time.perf_counter() - t_start
+                fps_rate = (count + 1) / elapsed
+                eta = (len(sampled_indices) - count - 1) / fps_rate
+                print(f"    {count+1}/{len(sampled_indices)} frames ({fps_rate:.1f} fps, ETA {eta:.0f}s)")
+            continue
+
+        boxes = np.stack(bboxes)
+        right = np.stack(is_right_list)
+        dataset = ViTDetDataset(model_cfg, img_bgr, boxes, right, rescale_factor=2.0, fp16=True)
+        dl = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=False, num_workers=0)
+
+        for batch in dl:
+            batch = recursive_to(batch, device)
+            with torch.no_grad():
+                out = model(batch)
+
+            multiplier = (2 * batch['right'] - 1)
+            pred_cam = out['pred_cam']
+            pred_cam[:, 1] = multiplier * pred_cam[:, 1]
+            box_center = batch['box_center'].float()
+            box_size = batch['box_size'].float()
+            img_size = batch['img_size'].float()
+            scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
+            pred_cam_t_full = cam_crop_to_full(
+                pred_cam, box_center, box_size, img_size, scaled_focal_length
+            ).detach().cpu().numpy()
+
+            bs = batch['img'].shape[0]
+            for n in range(bs):
+                joints_3d = out['pred_keypoints_3d'][n].detach().cpu().numpy()  # [21, 3]
+                is_r = batch['right'][n].cpu().numpy()
+                joints_3d[:, 0] = (2 * is_r - 1) * joints_3d[:, 0]
+                cam_t = pred_cam_t_full[n]
+                joints_cam = joints_3d + cam_t  # 3D keypoints in camera space
+
+                # 2D projection
+                kp_2d = out['pred_keypoints_2d'][n].detach().cpu().numpy() if 'pred_keypoints_2d' in out else None
+
+                if is_r > 0.5:
+                    right_kp3d[fi] = joints_cam
+                    right_detected[fi] = True
+                    if kp_2d is not None:
+                        right_kp2d[fi] = kp_2d[:, :2]
+                else:
+                    left_kp3d[fi] = joints_cam
+                    left_detected[fi] = True
+                    if kp_2d is not None:
+                        left_kp2d[fi] = kp_2d[:, :2]
+                n_hands += 1
+
+        if count > 0 and count % 96 == 0:
+            elapsed = time.perf_counter() - t_start
+            fps_rate = (count + 1) / elapsed
+            eta = (len(sampled_indices) - count - 1) / fps_rate
+            print(f"    {count+1}/{len(sampled_indices)} frames ({fps_rate:.1f} fps, ETA {eta:.0f}s)")
+
+    elapsed = time.perf_counter() - t_start
+    print(f"  WiLoR inference: {elapsed:.1f}s ({len(sampled_indices)/elapsed:.1f} fps), {n_hands} hands detected")
+
+    # Interpolate strided frames
+    if stride > 1:
+        for arr in [left_kp3d, right_kp3d, left_kp2d, right_kp2d]:
+            _interpolate_hand_keypoints(arr, sampled_indices, num_frames)
+        # For boolean detection, use nearest-neighbor
+        for det_arr in [left_detected, right_detected]:
+            full = np.zeros(num_frames, dtype=bool)
+            full[sampled_indices] = det_arr[sampled_indices]
+            # Fill gaps with nearest sampled value
+            for i in range(len(sampled_indices) - 1):
+                a, b = sampled_indices[i], sampled_indices[i + 1]
+                mid = (a + b) // 2
+                full[a:mid+1] = det_arr[a]
+                full[mid+1:b] = det_arr[b]
+            det_arr[:] = full
+
+    left_rate = left_detected.sum() / num_frames * 100
+    right_rate = right_detected.sum() / num_frames * 100
+    print(f"  Detection rate: left={left_rate:.1f}%, right={right_rate:.1f}%")
+
+    return {
+        "_model": "wilor",
+        "left_hand_keypoints_3d": left_kp3d,
+        "right_hand_keypoints_3d": right_kp3d,
+        "left_hand_keypoints_2d": left_kp2d,
+        "right_hand_keypoints_2d": right_kp2d,
+        "left_hand_detected": left_detected,
+        "right_hand_detected": right_detected,
+    }
+
+
+def _interpolate_hand_keypoints(arr, sampled_indices, num_frames):
+    """Linearly interpolate [N, K, D] keypoint array between sampled frames."""
+    for i in range(len(sampled_indices) - 1):
+        a, b = sampled_indices[i], sampled_indices[i + 1]
+        if b - a <= 1:
+            continue
+        va, vb = arr[a], arr[b]
+        # If either endpoint is NaN, just copy the non-NaN one (or leave NaN)
+        a_valid = not np.any(np.isnan(va))
+        b_valid = not np.any(np.isnan(vb))
+        if a_valid and b_valid:
+            for j in range(a + 1, b):
+                alpha = (j - a) / (b - a)
+                arr[j] = va * (1 - alpha) + vb * alpha
+        elif a_valid:
+            arr[a+1:b] = va
+        elif b_valid:
+            arr[a+1:b] = vb
+        # else: both NaN, leave as NaN
+
+
 def run_body_pose(frames, fps, width, height, multi_hmr_dir, device="cuda"):
     """Run Multi-HMR body pose estimation on video frames."""
     os.environ["PYOPENGL_PLATFORM"] = "egl"
@@ -879,7 +1110,7 @@ def write_lerobot_dataset(
     output_dir: str,
     video_path: str,
     slam_result: dict,
-    body_result: dict,
+    hand_result: dict,
     fps: float,
     num_frames: int,
 ):
@@ -926,35 +1157,16 @@ def write_lerobot_dataset(
         for i, name in enumerate(["fx", "fy", "cx", "cy"]):
             data[f"slam.intrinsics.{name}"] = np.full(num_frames, intrinsics[i], dtype=np.float32)
 
-    # Body pose columns
-    if body_result is not None:
-        is_sam3d = body_result.get("_model") == "sam3d"
-        data["body.detection_score"] = body_result["scores"]
-        data["body.num_persons"] = body_result["num_persons"]
+    # Hand pose columns (EgoVerse format: 21 keypoints per hand)
+    if hand_result is not None:
+        for side in ["left", "right"]:
+            kp3d = hand_result[f"{side}_hand_keypoints_3d"]  # [N, 21, 3]
+            data[f"hand.{side}.keypoints_3d"] = [kp3d[i].flatten().tolist() for i in range(num_frames)]
 
-        j3d = body_result["j3d"]
-        data["body.j3d"] = [j3d[i].flatten().tolist() for i in range(num_frames)]
+            kp2d = hand_result[f"{side}_hand_keypoints_2d"]  # [N, 21, 2]
+            data[f"hand.{side}.keypoints_2d"] = [kp2d[i].flatten().tolist() for i in range(num_frames)]
 
-        j2d = body_result["j2d"]
-        data["body.j2d"] = [j2d[i].flatten().tolist() for i in range(num_frames)]
-
-        rotvec = body_result["rotvec"]
-        data["body.pose_params"] = [rotvec[i].flatten().tolist() for i in range(num_frames)]
-
-        shape = body_result["shape"]
-        data["body.shape_params"] = [shape[i].tolist() for i in range(num_frames)]
-
-        transl = body_result["transl"]
-        for i, name in enumerate(["tx", "ty", "tz"]):
-            data[f"body.transl.{name}"] = transl[:, i].astype(np.float32)
-
-        if is_sam3d:
-            hand = body_result["hand_pose_params"]
-            data["body.hand_pose_params"] = [hand[i].tolist() for i in range(num_frames)]
-            scale = body_result["scale_params"]
-            data["body.scale_params"] = [scale[i].tolist() for i in range(num_frames)]
-            expr = body_result["expr_params"]
-            data["body.expr_params"] = [expr[i].tolist() for i in range(num_frames)]
+            data[f"hand.{side}.detected"] = hand_result[f"{side}_hand_detected"].astype(np.float32)
 
     # 3. Write Parquet
     table = pa.table(data)
@@ -993,24 +1205,11 @@ def write_lerobot_dataset(
         features["slam.pose"] = {"dtype": "float32", "shape": [7]}
         features["slam.intrinsics"] = {"dtype": "float32", "shape": [4]}
 
-    if body_result is not None:
-        is_sam3d = body_result.get("_model") == "sam3d"
-        n_kp = 70 if is_sam3d else 127
-        pose_dim = body_result["rotvec"].shape[1] if body_result["rotvec"].ndim == 2 else body_result["rotvec"].shape[1:]
-        shape_dim = body_result["shape"].shape[1]
-
-        features["body.detection_score"] = {"dtype": "float32", "shape": [1]}
-        features["body.j3d"] = {"dtype": "float32", "shape": [n_kp, 3]}
-        features["body.j2d"] = {"dtype": "float32", "shape": [n_kp, 2]}
-        features["body.pose_params"] = {"dtype": "float32", "shape": list(pose_dim) if isinstance(pose_dim, tuple) else [pose_dim]}
-        features["body.shape_params"] = {"dtype": "float32", "shape": [shape_dim]}
-        features["body.transl"] = {"dtype": "float32", "shape": [3]}
-        features["body.model"] = {"dtype": "string", "shape": [1], "value": "sam3d" if is_sam3d else "multihmr"}
-
-        if is_sam3d:
-            features["body.hand_pose_params"] = {"dtype": "float32", "shape": [body_result["hand_pose_params"].shape[1]]}
-            features["body.scale_params"] = {"dtype": "float32", "shape": [body_result["scale_params"].shape[1]]}
-            features["body.expr_params"] = {"dtype": "float32", "shape": [body_result["expr_params"].shape[1]]}
+    if hand_result is not None:
+        for side in ["left", "right"]:
+            features[f"hand.{side}.keypoints_3d"] = {"dtype": "float32", "shape": [21, 3]}
+            features[f"hand.{side}.keypoints_2d"] = {"dtype": "float32", "shape": [21, 2]}
+            features[f"hand.{side}.detected"] = {"dtype": "float32", "shape": [1]}
 
     info = {
         "codebase_version": "v3.0",
@@ -1039,27 +1238,17 @@ def main():
     parser.add_argument("--output-dir", "-o", default=None, help="Output dataset directory")
     parser.add_argument("--skip-video-convert", action="store_true", help="Skip video format conversion")
     parser.add_argument("--skip-slam", action="store_true", help="Skip SLAM annotation")
-    parser.add_argument("--skip-body", action="store_true", help="Skip body pose annotation")
-    parser.add_argument("--body-model", choices=["sam3d", "multihmr"], default="sam3d",
-                        help="Body pose model: sam3d (SAM-3D-Body) or multihmr (Multi-HMR)")
-    parser.add_argument("--body-inference-type", choices=["body", "full"], default="body",
-                        help="SAM-3D-Body inference: body (68ms, no hands) or full (289ms, body+hands)")
-    parser.add_argument("--body-stride", type=int, default=1,
-                        help="Process every Nth frame for body pose, interpolate rest (1=all, 2=2x faster, 3=3x)")
-    parser.add_argument("--body-batch-size", type=int, default=32,
-                        help="Frames per GPU batch for SAM-3D-Body body-only mode (higher=faster, more VRAM)")
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile for ~30%% faster inference (adds ~40s warmup, best for long videos)")
-    parser.add_argument("--decoder-layers", type=int, default=None,
-                        help="Override number of decoder layers (default: all 6; 4 saves ~5%% with <2mm quality loss)")
+    parser.add_argument("--skip-hands", action="store_true", help="Skip hand pose annotation")
+    parser.add_argument("--hand-stride", type=int, default=1,
+                        help="Process every Nth frame for hand pose, interpolate rest (1=all, 2=2x faster, 3=3x)")
+    parser.add_argument("--hand-det-conf", type=float, default=0.3,
+                        help="YOLO hand detection confidence threshold")
     parser.add_argument("--fast-traj", action="store_true",
                         help="Use fast linear/slerp trajectory interpolation instead of NN refinement (saves ~3s)")
     parser.add_argument("--slam-backend-steps", type=int, nargs=2, default=[7, 12],
                         help="Backend optimization steps (default: 7 12)")
     parser.add_argument("--droid-weights", default="/workspace/DROID-SLAM/checkpoints/droid.pth")
-    parser.add_argument("--multi-hmr-dir", default="/workspace/multi-hmr")
-    parser.add_argument("--sam3d-dir", default="/workspace/sam-3d-body")
-    parser.add_argument("--sam3d-checkpoints", default="/workspace/sam-3d-body-checkpoints")
+    parser.add_argument("--wilor-dir", default="/workspace/WiLoR")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -1071,10 +1260,8 @@ def main():
     print(f"Annotation Pipeline")
     print(f"  Input: {input_path}")
     print(f"  Output: {args.output_dir}")
-    if args.body_model == "sam3d":
-        print(f"  Body: SAM-3D-Body ({args.body_inference_type}, stride={args.body_stride}, bs={args.body_batch_size})")
-    else:
-        print(f"  Body: Multi-HMR")
+    if not args.skip_hands:
+        print(f"  Hands: WiLoR (stride={args.hand_stride}, conf={args.hand_det_conf})")
     print(f"=" * 60)
 
     total_start = time.perf_counter()
@@ -1085,15 +1272,12 @@ def main():
     phase1_time = 0
     video_convert_future = None
 
-    # Start SAM-3D-Body CPU loading in background (overlaps with SLAM + body decode)
-    sam3d_cpu_future = None
-    if not args.skip_body and args.body_model == "sam3d":
-        os.environ["XFORMERS_DISABLED"] = "1"
-        print(f"\n[Background] Starting SAM-3D-Body CPU load...")
-        sam3d_load_start = time.perf_counter()
-        sam3d_cpu_future = executor.submit(
-            _load_sam3d_cpu, args.sam3d_dir, args.sam3d_checkpoints,
-        )
+    # Start WiLoR CPU loading in background (overlaps with SLAM)
+    wilor_cpu_future = None
+    if not args.skip_hands:
+        print(f"\n[Background] Starting WiLoR CPU load...")
+        wilor_load_start = time.perf_counter()
+        wilor_cpu_future = executor.submit(_load_wilor_cpu, args.wilor_dir)
 
     # Phase 2: Decode + SLAM (uses CPU decode + GPU tracking)
     slam_result = None
@@ -1108,8 +1292,8 @@ def main():
         torch.multiprocessing.set_start_method("spawn", force=True)
         fps, width, height, _ = get_video_metadata(input_path)
 
-        # collect_rgb=True when body inference needs frames — avoids separate decode pass
-        need_body_frames = not args.skip_body
+        # collect_rgb=True when hand inference needs frames — avoids separate decode pass
+        need_body_frames = not args.skip_hands
         if need_body_frames:
             slam_result, num_frames, frames = run_slam_native_decode(
                 input_path, fps, width, height, args.droid_weights, args.device,
@@ -1134,27 +1318,27 @@ def main():
     else:
         print(f"\n[Phase 2] SLAM: Skipped")
 
-    # Decode frames for body inference if not already available
-    if frames is None and not args.skip_body:
-        print(f"\n[Decode] Reading video frames for body inference...")
+    # Decode frames for hand inference if not already available
+    if frames is None and not args.skip_hands:
+        print(f"\n[Decode] Reading video frames for hand inference...")
         decode_start = time.perf_counter()
         frames, fps, width, height, num_frames = decode_video_frames(input_path)
         decode_time = time.perf_counter() - decode_start
         print(f"  Decoded {num_frames} frames ({width}x{height} @ {fps:.1f}fps) in {decode_time:.1f}s")
-    elif frames is None and args.skip_body:
+    elif frames is None and args.skip_hands:
         if num_frames == 0:
             _, _, _, num_frames = get_video_metadata(input_path)
 
-    # Collect pre-loaded model if background load was started
-    sam3d_preloaded = None
-    if sam3d_cpu_future is not None:
-        if sam3d_cpu_future.done():
-            print(f"  SAM-3D-Body CPU load finished (fully overlapped with SLAM)")
+    # Collect pre-loaded WiLoR model if background load was started
+    wilor_preloaded = None
+    if wilor_cpu_future is not None:
+        if wilor_cpu_future.done():
+            print(f"  WiLoR CPU load finished (fully overlapped with SLAM)")
         else:
-            print(f"  Waiting for SAM-3D-Body CPU load to finish...")
-        sam3d_preloaded = sam3d_cpu_future.result()  # raises if loading failed
-        sam3d_load_time = time.perf_counter() - sam3d_load_start
-        print(f"  SAM-3D-Body CPU load took {sam3d_load_time:.1f}s")
+            print(f"  Waiting for WiLoR CPU load to finish...")
+        wilor_preloaded = wilor_cpu_future.result()
+        wilor_load_time = time.perf_counter() - wilor_load_start
+        print(f"  WiLoR CPU load took {wilor_load_time:.1f}s")
 
     # Start video conversion in background (CPU-bound ffmpeg overlaps with GPU body inference)
     if not args.skip_video_convert:
@@ -1164,40 +1348,28 @@ def main():
         video_convert_future = executor.submit(
             convert_video, input_path, video_output, fast=True)
 
-    # Phase 3: Body pose (CPU model load was overlapped; only GPU transfer + inference remain)
-    body_result = None
+    # Phase 3: Hand pose (WiLoR — 21 keypoints per hand, EgoVerse format)
+    hand_result = None
     phase3_time = 0
-    if not args.skip_body:
-        print(f"\n[Phase 3] Body pose ({args.body_model})")
+    if not args.skip_hands:
+        print(f"\n[Phase 3] Hand pose (WiLoR)")
         phase3_start = time.perf_counter()
 
-        if args.body_model == "sam3d":
-            # Pre-populate the cache with the background-loaded model
-            if sam3d_preloaded is not None:
-                _load_sam3d_cached(
-                    args.sam3d_dir, args.sam3d_checkpoints, args.device,
-                    compile_model=args.compile, decoder_layers=args.decoder_layers,
-                    _preloaded=sam3d_preloaded,
-                )
-            body_result = run_body_pose_sam3d(
-                frames, fps, width, height,
-                args.sam3d_dir, args.sam3d_checkpoints, args.device,
-                inference_type=args.body_inference_type,
-                stride=args.body_stride,
-                batch_size=args.body_batch_size,
-                compile_model=args.compile,
-                decoder_layers=args.decoder_layers,
-            )
-        else:
-            body_result = run_body_pose(frames, fps, width, height, args.multi_hmr_dir, args.device)
+        hand_result = run_hand_pose_wilor(
+            frames, fps, width, height,
+            args.wilor_dir, args.device,
+            stride=args.hand_stride,
+            det_conf=args.hand_det_conf,
+            preloaded=wilor_preloaded,
+        )
 
         phase3_time = time.perf_counter() - phase3_start
         effective_fps = num_frames / phase3_time if phase3_time > 0 else 0
-        print(f"  Body pose completed in {phase3_time:.1f}s ({effective_fps:.0f} fps effective)")
+        print(f"  Hand pose completed in {phase3_time:.1f}s ({effective_fps:.0f} fps effective)")
 
         torch.cuda.empty_cache()
     else:
-        print(f"\n[Phase 3] Body pose: Skipped")
+        print(f"\n[Phase 3] Hand pose: Skipped")
 
     # Free decoded frames to release ~11GB RAM
     del frames
@@ -1222,7 +1394,7 @@ def main():
     phase4_start = time.perf_counter()
 
     dataset_path = write_lerobot_dataset(
-        args.output_dir, video_output, slam_result, body_result, fps, num_frames,
+        args.output_dir, video_output, slam_result, hand_result, fps, num_frames,
     )
 
     phase4_time = time.perf_counter() - phase4_start
@@ -1234,8 +1406,8 @@ def main():
     print(f"  Total time: {total_time:.1f}s")
     print(f"    SLAM:          {phase2_time:.1f}s (native C++ decode overlapped)")
     if decode_time > 0:
-        print(f"    Body decode:   {decode_time:.1f}s")
-    print(f"    Body pose:     {phase3_time:.1f}s (model load overlapped with SLAM)")
+        print(f"    Hand decode:   {decode_time:.1f}s")
+    print(f"    Hand pose:     {phase3_time:.1f}s (WiLoR, model load overlapped with SLAM)")
     print(f"    Video convert: {phase1_time:.1f}s")
     print(f"    Assembly:      {phase4_time:.1f}s")
     print(f"  Output: {dataset_path}")
