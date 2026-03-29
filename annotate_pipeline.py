@@ -22,7 +22,6 @@ from pathlib import Path
 from threading import Thread
 from queue import Queue
 
-import av
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -33,41 +32,47 @@ import torch.nn.functional as F
 # Video decode helpers
 # ---------------------------------------------------------------------------
 
+def _get_native_decode():
+    """Import the native C++ async decoder module."""
+    native_decode_path = os.path.join(os.path.dirname(__file__), "native_decode")
+    if native_decode_path not in sys.path:
+        sys.path.insert(0, native_decode_path)
+    import native_decode
+    return native_decode
+
+
 def decode_video_frames(video_path: str, device: str = "cuda"):
-    """Decode all video frames using PyAV, return metadata and a generator-friendly list.
+    """Decode all video frames using native C++ decoder.
 
     Returns (frames_rgb_numpy, fps, width, height, num_frames).
     frames_rgb_numpy is a list of numpy arrays [H, W, 3] uint8 RGB.
     """
-    container = av.open(video_path)
-    stream = container.streams.video[0]
-    stream.thread_type = "AUTO"
+    nd = _get_native_decode()
+    fps, width, height, num_frames_hint = nd.AsyncVideoDecoder.get_metadata(video_path)
 
-    fps_r = stream.average_rate
-    fps = float(fps_r) if fps_r else 30.0
-    width = stream.width
-    height = stream.height
+    decoder = nd.AsyncVideoDecoder()
+    # slam_w/slam_h don't matter — we only use the RGB output
+    # Use a small SLAM size to minimize wasted work
+    decoder.start(video_path, 64, 64, slam_only=False, queue_depth=128)
 
     frames = []
-    for frame in container.decode(video=0):
-        rgb = frame.to_rgb().to_ndarray()  # [H, W, 3] uint8
-        frames.append(rgb)
+    while True:
+        result = decoder.get_next()
+        if result is None:
+            break
+        rgb_np, _ = result
+        if rgb_np is not None:
+            frames.append(np.array(rgb_np))
+    decoder.stop()
 
-    container.close()
     return frames, fps, width, height, len(frames)
 
 
 def get_video_metadata(video_path: str):
     """Get video metadata without decoding frames."""
-    container = av.open(video_path)
-    stream = container.streams.video[0]
-    fps_r = stream.average_rate
-    fps = float(fps_r) if fps_r else 30.0
-    width = stream.width
-    height = stream.height
-    num_frames = stream.frames or 0
-    container.close()
-    return fps, width, height, num_frames
+    nd = _get_native_decode()
+    fps, width, height, num_frames = nd.AsyncVideoDecoder.get_metadata(video_path)
+    return fps, width, height, int(num_frames)
 
 
 def get_iphone_intrinsics(width: int, height: int):
@@ -201,13 +206,20 @@ def run_slam_with_decode(video_path, fps, width, height, weights_path, device="c
 
     # --- Decode all frames ---
     t_decode_start = time.perf_counter()
-    container = av.open(video_path)
-    stream = container.streams.video[0]
-    stream.thread_type = "AUTO"
+    nd = _get_native_decode()
+    decoder = nd.AsyncVideoDecoder()
+    decoder.start(video_path, w1, h1, slam_only=False, queue_depth=128)
     frames = []
-    for frame in container.decode(video=0):
-        frames.append(frame.to_rgb().to_ndarray())
-    container.close()
+    slam_bgrs = []
+    while True:
+        result = decoder.get_next()
+        if result is None:
+            break
+        rgb_np, slam_bgr = result
+        if rgb_np is not None:
+            frames.append(np.array(rgb_np))
+        slam_bgrs.append(slam_bgr)
+    decoder.stop()
     num_frames = len(frames)
     t_decode = time.perf_counter() - t_decode_start
     print(f"  Decoded {num_frames} frames in {t_decode:.1f}s ({num_frames/t_decode:.0f} fps)")
@@ -216,41 +228,20 @@ def run_slam_with_decode(video_path, fps, width, height, weights_path, device="c
     droid = Droid(slam_args)
     print(f"  SLAM resolution: {w1}x{h1}")
 
-    # Pipelined: multi-threaded prep runs ahead of GPU tracking
-    # Prep batches of 64 frames with 8 threads while main thread tracks
-    import cv2
+    # SLAM BGR frames already decoded at correct resolution by native decoder
     t_track_start = time.perf_counter()
-    PREP_BATCH = 64
-    prep_q = Queue(maxsize=4)
     slam_tensors = []
 
-    def _prep_batches():
-        def _resize_one(rgb):
-            small = cv2.resize(rgb[:, :, ::-1], (w1, h1), interpolation=cv2.INTER_LINEAR)
-            return torch.from_numpy(small).permute(2, 0, 1).unsqueeze(0).cuda()
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for start in range(0, num_frames, PREP_BATCH):
-                batch = frames[start:start + PREP_BATCH]
-                batch_tensors = list(pool.map(_resize_one, batch))
-                prep_q.put(batch_tensors)
-        prep_q.put(None)
-
-    prep_thread = Thread(target=_prep_batches, daemon=True)
-    prep_thread.start()
-
     t = 0
-    while True:
-        batch_tensors = prep_q.get()
-        if batch_tensors is None:
-            break
-        for tensor in batch_tensors:
-            slam_tensors.append(tensor)
-            droid.track(t, tensor, intrinsics=intrinsics_scaled)
-            t += 1
+    for slam_bgr in slam_bgrs:
+        tensor = torch.from_numpy(np.array(slam_bgr)).permute(2, 0, 1).unsqueeze(0).cuda()
+        slam_tensors.append(tensor)
+        droid.track(t, tensor, intrinsics=intrinsics_scaled)
+        t += 1
+    del slam_bgrs
 
-    prep_thread.join()
     t_track = time.perf_counter() - t_track_start
-    print(f"  Prep+tracking: {t_track:.1f}s ({num_frames/t_track:.0f} fps)")
+    print(f"  Tracking: {t_track:.1f}s ({num_frames/t_track:.0f} fps)")
 
     # Backend optimization
     print(f"  Backend optimization ({backend_steps[0]}+{backend_steps[1]} steps)...")
@@ -313,7 +304,7 @@ def run_slam_native_decode(video_path, fps, width, height, weights_path, device=
     Args:
         collect_rgb: If True, use slam_only=False to also decode full-res RGB
             frames during SLAM. Eliminates the need for a separate body decode pass.
-            Adds ~7s decode time but saves ~9s of separate PyAV decode.
+            Adds ~7s decode time but saves ~9s of a separate decode pass.
 
     Returns (slam_result, num_frames) if collect_rgb=False.
     Returns (slam_result, num_frames, frames) if collect_rgb=True, where frames
@@ -322,10 +313,7 @@ def run_slam_native_decode(video_path, fps, width, height, weights_path, device=
     sys.path.insert(0, os.path.join(os.path.dirname(weights_path), "..", "droid_slam"))
     from droid import Droid
 
-    # Try to import native decoder
-    native_decode_path = os.path.join(os.path.dirname(__file__), "native_decode")
-    sys.path.insert(0, native_decode_path)
-    import native_decode
+    nd = _get_native_decode()
 
     h0, w0 = height, width
     scale = np.sqrt((384 * 512) / (h0 * w0))
@@ -348,7 +336,7 @@ def run_slam_native_decode(video_path, fps, width, height, weights_path, device=
 
     # Start C++ async decoder (GIL-free)
     # When collect_rgb=True, also produce full-res RGB frames for body inference
-    decoder = native_decode.AsyncVideoDecoder()
+    decoder = nd.AsyncVideoDecoder()
     decoder.start(video_path, w1, h1, slam_only=not collect_rgb, queue_depth=128)
 
     droid = Droid(slam_args)
@@ -1113,7 +1101,6 @@ def main():
     num_frames = 0
     phase2_time = 0
     decode_time = 0
-    use_native_decode = False
     if not args.skip_slam:
         print(f"\n[Phase 2] Decode + SLAM (DROID-SLAM)")
         phase2_start = time.perf_counter()
@@ -1121,41 +1108,23 @@ def main():
         torch.multiprocessing.set_start_method("spawn", force=True)
         fps, width, height, _ = get_video_metadata(input_path)
 
-        # Try native C++ decoder for GIL-free decode↔tracking overlap
-        try:
-            native_decode_path = os.path.join(os.path.dirname(__file__), "native_decode")
-            sys.path.insert(0, native_decode_path)
-            import native_decode as _nd_test  # noqa: F401
-            use_native_decode = True
-            print("  Using native C++ async decoder (GIL-free)")
-        except ImportError:
-            print("  Native decoder not available, using Python decode")
-
-        if use_native_decode:
-            # collect_rgb=True when body inference needs frames — avoids separate decode pass
-            need_body_frames = not args.skip_body
-            if need_body_frames:
-                slam_result, num_frames, frames = run_slam_native_decode(
-                    input_path, fps, width, height, args.droid_weights, args.device,
-                    backend_steps=tuple(args.slam_backend_steps),
-                    fast_traj=args.fast_traj,
-                    collect_rgb=True,
-                )
-                print(f"  RGB frames collected during SLAM ({len(frames)} frames, no re-decode needed)")
-            else:
-                slam_result, num_frames = run_slam_native_decode(
-                    input_path, fps, width, height, args.droid_weights, args.device,
-                    backend_steps=tuple(args.slam_backend_steps),
-                    fast_traj=args.fast_traj,
-                    collect_rgb=False,
-                )
-        else:
-            slam_result, frames = run_slam_with_decode(
+        # collect_rgb=True when body inference needs frames — avoids separate decode pass
+        need_body_frames = not args.skip_body
+        if need_body_frames:
+            slam_result, num_frames, frames = run_slam_native_decode(
                 input_path, fps, width, height, args.droid_weights, args.device,
                 backend_steps=tuple(args.slam_backend_steps),
                 fast_traj=args.fast_traj,
+                collect_rgb=True,
             )
-            num_frames = len(frames)
+            print(f"  RGB frames collected during SLAM ({len(frames)} frames, no re-decode needed)")
+        else:
+            slam_result, num_frames = run_slam_native_decode(
+                input_path, fps, width, height, args.droid_weights, args.device,
+                backend_steps=tuple(args.slam_backend_steps),
+                fast_traj=args.fast_traj,
+                collect_rgb=False,
+            )
 
         phase2_time = time.perf_counter() - phase2_start
         print(f"  Decode+SLAM completed in {phase2_time:.1f}s ({num_frames/phase2_time:.0f} fps)")
