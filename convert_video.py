@@ -140,10 +140,9 @@ def build_ffmpeg_cmd(
 
     cmd = ["ffmpeg", "-y"]
 
-    # Parallelize the filter graph (zscale tonemapping).
-    # ~20% of cores for filters, rest for the encoder — benchmarked on
-    # a 32-core Ryzen 9950X, this balance minimizes total wall-clock time.
-    filter_threads = max(1, total_cores // 5)
+    # Two-pass tonemapping (linearize + gbrpf32le + tonemap) is more CPU-intensive
+    # than single-pass zscale, so allocate ~half the cores for filters.
+    filter_threads = max(1, total_cores // 2)
     encoder_threads = max(1, total_cores - filter_threads)
 
     if hdr_input:
@@ -159,16 +158,14 @@ def build_ffmpeg_cmd(
 
     # Video filters: HDR→SDR conversion
     if hdr_input:
-        # Single-pass zscale with explicit input/output color parameters.
-        # This avoids the expensive intermediate format=gbrpf32le (32-bit float RGB)
-        # conversion that a two-pass linearize→convert approach requires.
-        # zscale handles the transfer function, primaries, and matrix conversion
-        # internally when all parameters are specified together.
+        # Two-pass tonemapping: linearize HLG, tonemap with Hable curve, then
+        # convert to BT.709. Produces accurate, natural colors (the single-pass
+        # zscale approach produces an overly bright/yellow image with HLG input).
         vf = (
-            "zscale=tin=arib-std-b67:t=bt709"
-            ":min=bt2020nc:m=bt709"
-            ":pin=bt2020:p=bt709"
-            ":r=tv:npl=100"
+            "zscale=t=linear:npl=100"
+            ",format=gbrpf32le"
+            ",tonemap=hable:desat=0"
+            ",zscale=t=bt709:m=bt709:p=bt709:r=tv"
             ",format=yuv420p"
         )
     else:
@@ -235,10 +232,10 @@ def build_ffmpeg_cmd_nvenc(
 
     if hdr_input:
         vf = (
-            "zscale=tin=arib-std-b67:t=bt709"
-            ":min=bt2020nc:m=bt709"
-            ":pin=bt2020:p=bt709"
-            ":r=tv:npl=100"
+            "zscale=t=linear:npl=100"
+            ",format=gbrpf32le"
+            ",tonemap=hable:desat=0"
+            ",zscale=t=bt709:m=bt709:p=bt709:r=tv"
             ",format=yuv420p"
         )
     else:
@@ -335,7 +332,9 @@ def build_ffmpeg_cmd_x264_fast(
                 total_cores = min(total_cores, int(int(parts[0]) / int(parts[1])))
     except (FileNotFoundError, ValueError, IndexError):
         pass
-    filter_threads = max(1, total_cores // 5)
+    # Use ~half the cores for filters (two-pass tonemap is more expensive than
+    # single-pass zscale, but produces correct colors). Rest for the encoder.
+    filter_threads = max(1, total_cores // 2)
 
     cmd = ["ffmpeg", "-y"]
     if hdr_input:
@@ -343,11 +342,13 @@ def build_ffmpeg_cmd_x264_fast(
     cmd += ["-i", input_path]
 
     if hdr_input:
+        # Two-pass tonemapping: linearize HLG, tonemap with Hable curve, then
+        # convert to BT.709. Produces accurate, natural colors.
         vf = (
-            "zscale=tin=arib-std-b67:t=bt709"
-            ":min=bt2020nc:m=bt709"
-            ":pin=bt2020:p=bt709"
-            ":r=tv:npl=100"
+            "zscale=t=linear:npl=100"
+            ",format=gbrpf32le"
+            ",tonemap=hable:desat=0"
+            ",zscale=t=bt709:m=bt709:p=bt709:r=tv"
             ",format=yuv420p"
         )
     else:
