@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Annotate video with SLAM camera poses and hand pose estimation.
+"""Annotate video with SLAM camera poses, hand pose estimation, and audio transcription.
 
 Produces a LeRobot v3.0 compatible dataset following the EgoVerse format:
   - Video converted to LeRobot format (via convert_video.py)
   - SLAM camera poses per frame (DROID-SLAM) — 6-DoF head/camera motion
   - 3D hand pose per frame (WiLoR) — 21 keypoints per hand, left + right
+  - Audio transcription per frame (NVIDIA Parakeet) — word-level timestamps
 
 Usage:
     python3 annotate_pipeline.py /workspace/IMG_1443.MOV --output-dir /workspace/output_dataset
@@ -72,9 +73,33 @@ def decode_video_frames(video_path: str, device: str = "cuda"):
 
 def get_video_metadata(video_path: str):
     """Get video metadata without decoding frames."""
-    nd = _get_native_decode()
-    fps, width, height, num_frames = nd.AsyncVideoDecoder.get_metadata(video_path)
-    return fps, width, height, int(num_frames)
+    try:
+        nd = _get_native_decode()
+        fps, width, height, num_frames = nd.AsyncVideoDecoder.get_metadata(video_path)
+        return fps, width, height, int(num_frames)
+    except (ImportError, AttributeError):
+        # Fallback to ffprobe
+        import subprocess
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
+             video_path],
+            capture_output=True, text=True,
+        )
+        info = json.loads(result.stdout)["streams"][0]
+        w, h = int(info["width"]), int(info["height"])
+        # Parse fps from r_frame_rate "30000/1001" or "30/1"
+        num, den = info["r_frame_rate"].split("/")
+        fps = float(num) / float(den)
+        # nb_frames may be "N/A" for some containers
+        nb = info.get("nb_frames", "N/A")
+        if nb != "N/A":
+            nf = int(nb)
+        else:
+            dur = float(info.get("duration", "0"))
+            nf = int(dur * fps)
+        return fps, w, h, nf
 
 
 def get_iphone_intrinsics(width: int, height: int):
@@ -1596,6 +1621,111 @@ def run_body_pose_sam3d(frames, fps, width, height, sam3d_dir, checkpoint_dir,
 
 
 # ---------------------------------------------------------------------------
+# Audio transcription (NVIDIA Parakeet via NeMo)
+# ---------------------------------------------------------------------------
+
+def _extract_audio(video_path: str, output_wav: str) -> bool:
+    """Extract audio from video as 16 kHz mono WAV. Returns False if no audio stream."""
+    import subprocess
+    # Check for audio stream
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_name", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True,
+    )
+    if not probe.stdout.strip():
+        return False
+    # Extract as 16 kHz mono PCM (NeMo requirement)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vn",
+         "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", output_wav],
+        capture_output=True, check=True,
+    )
+    return True
+
+
+def run_audio_transcription(
+    video_path: str,
+    fps: float,
+    num_frames: int,
+    model_name: str = "parakeet-tdt_ctc-110m",
+    device: str = "cuda",
+) -> dict | None:
+    """Transcribe audio and produce per-frame transcript annotations.
+
+    Returns dict with:
+        "transcript": str — full transcript text
+        "segments": list[dict] — segment-level with start/end times and text
+        "words": list[dict] — word-level with start/end times and text
+        "frame_text": list[str] — per-frame transcript (active segment at each frame)
+    Returns None if video has no audio.
+    """
+    import tempfile
+
+    # Extract audio
+    wav_path = tempfile.mktemp(suffix=".wav")
+    try:
+        has_audio = _extract_audio(video_path, wav_path)
+        if not has_audio:
+            print("  No audio stream found, skipping transcription")
+            return None
+
+        # Load model and transcribe
+        import nemo.collections.asr as nemo_asr
+        print(f"  Loading ASR model: {model_name}")
+        model = nemo_asr.models.ASRModel.from_pretrained(model_name)
+        model.eval()
+        model = model.to(device)
+
+        print(f"  Transcribing audio...")
+        t0 = time.perf_counter()
+        hypotheses = model.transcribe([wav_path], timestamps=True)
+        elapsed = time.perf_counter() - t0
+
+        hyp = hypotheses[0]
+        transcript = hyp.text
+        ts = hyp.timestamp
+
+        segments = ts.get("segment", [])
+        words = ts.get("word", [])
+        print(f"  Transcription: {len(words)} words, {len(segments)} segments in {elapsed:.1f}s")
+        if transcript:
+            preview = transcript[:120] + ("..." if len(transcript) > 120 else "")
+            print(f"  Text: \"{preview}\"")
+
+        # Build per-frame text: each frame gets the segment text active at that timestamp
+        frame_text = [""] * num_frames
+        for seg in segments:
+            start_t = seg["start"]
+            end_t = seg["end"]
+            text = seg["segment"]
+            start_frame = int(start_t * fps)
+            end_frame = min(int(end_t * fps) + 1, num_frames)
+            for fi in range(max(0, start_frame), end_frame):
+                frame_text[fi] = text
+
+        # Free GPU memory
+        del model
+        torch.cuda.empty_cache()
+
+        return {
+            "transcript": transcript,
+            "segments": [
+                {"text": s["segment"], "start": s["start"], "end": s["end"]}
+                for s in segments
+            ],
+            "words": [
+                {"text": w["word"], "start": w["start"], "end": w["end"]}
+                for w in words
+            ],
+            "frame_text": frame_text,
+        }
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+
+
+# ---------------------------------------------------------------------------
 # LeRobot v3.0 dataset writer
 # ---------------------------------------------------------------------------
 
@@ -1627,6 +1757,8 @@ def write_lerobot_dataset(
     hand_result: dict,
     fps: float,
     num_frames: int,
+    audio_result: dict = None,
+    input_video_path: str = None,
 ):
     """Assemble annotations into a LeRobot v3.0 dataset."""
     output_dir = Path(output_dir)
@@ -1640,13 +1772,20 @@ def write_lerobot_dataset(
     for d in [video_dir, data_dir, meta_dir, episodes_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # 1. Copy video
+    # 1. Copy video (if it exists — may be skipped)
     video_dest = video_dir / "file-000.mp4"
-    shutil.copy2(video_path, video_dest)
-    print(f"  Video: {video_dest}")
+    if video_path and os.path.exists(video_path):
+        shutil.copy2(video_path, video_dest)
+        print(f"  Video: {video_dest}")
 
     # Probe video for info.json
-    vinfo = _get_video_info(str(video_dest), fps)
+    if video_dest.exists():
+        video_probe_path = str(video_dest)
+    elif input_video_path and os.path.exists(input_video_path):
+        video_probe_path = input_video_path
+    else:
+        video_probe_path = video_path
+    vinfo = _get_video_info(video_probe_path, fps)
 
     # 2. Build per-frame data — all required LeRobot v3.0 columns
     frame_indices = np.arange(num_frames, dtype=np.int64)
@@ -1692,6 +1831,10 @@ def write_lerobot_dataset(
             data[f"observation.hand.{side}.detected"] = hand_result[
                 f"{side}_hand_detected"
             ].astype(np.float32)
+
+    # Audio transcription columns
+    if audio_result is not None:
+        data["observation.audio.transcript"] = audio_result["frame_text"]
 
     # 3. Write Parquet
     table = pa.table(data)
@@ -1755,6 +1898,23 @@ def write_lerobot_dataset(
                 "names": None,
             }
 
+    if audio_result is not None:
+        features["observation.audio.transcript"] = {
+            "dtype": "string",
+            "shape": [1],
+            "names": None,
+        }
+        # Save full transcript + word/segment timestamps as separate JSON
+        audio_meta = {
+            "transcript": audio_result["transcript"],
+            "segments": audio_result["segments"],
+            "words": audio_result["words"],
+        }
+        audio_meta_path = meta_dir / "audio.json"
+        with open(audio_meta_path, "w") as f:
+            json.dump(audio_meta, f, indent=2)
+        print(f"  Audio: {audio_meta_path}")
+
     info = {
         "codebase_version": "v3.0",
         "robot_type": "unknown",
@@ -1790,6 +1950,9 @@ def main():
     parser.add_argument("--skip-video-convert", action="store_true", help="Skip video format conversion")
     parser.add_argument("--skip-slam", action="store_true", help="Skip SLAM annotation")
     parser.add_argument("--skip-hands", action="store_true", help="Skip hand pose annotation")
+    parser.add_argument("--skip-audio", action="store_true", help="Skip audio transcription")
+    parser.add_argument("--asr-model", default="parakeet-tdt_ctc-110m",
+                        help="NeMo ASR model name (default: parakeet-tdt_ctc-110m)")
     parser.add_argument("--hand-stride", type=int, default=1,
                         help="Process every Nth frame for hand pose, interpolate rest (1=all, 2=2x faster, 3=3x)")
     parser.add_argument("--hand-det-conf", type=float, default=0.3,
@@ -1852,6 +2015,7 @@ def main():
     slam_result = None
     hand_result = None
     frames = None
+    fps = 0
     num_frames = 0
     phase2_time = 0
     phase3_time = 0
@@ -1923,11 +2087,31 @@ def main():
         print(f"\n[Phase 2] SLAM: Skipped")
         print(f"\n[Phase 3] Hand pose: Skipped")
         if num_frames == 0:
-            _, _, _, num_frames = get_video_metadata(input_path)
+            fps, _, _, num_frames = get_video_metadata(input_path)
 
     # Free decoded frames to release RAM
     if frames is not None:
         del frames
+
+    # Audio transcription (runs after SLAM/hands to avoid GPU contention)
+    audio_result = None
+    audio_time = 0
+    if not args.skip_audio:
+        # Need num_frames and fps — get from metadata if we skipped everything
+        if num_frames == 0:
+            fps, _, _, num_frames = get_video_metadata(input_path)
+        print(f"\n[Audio] Transcription (Parakeet)")
+        audio_start = time.perf_counter()
+        audio_result = run_audio_transcription(
+            input_path, fps, num_frames,
+            model_name=args.asr_model, device=args.device,
+        )
+        audio_time = time.perf_counter() - audio_start
+        if audio_result is not None:
+            print(f"  Audio transcription completed in {audio_time:.1f}s")
+        else:
+            print(f"  Audio: no audio stream, skipped")
+            audio_time = 0
 
     # Collect video conversion result
     if video_convert_future is not None:
@@ -1950,6 +2134,7 @@ def main():
 
     dataset_path = write_lerobot_dataset(
         args.output_dir, video_output, slam_result, hand_result, fps, num_frames,
+        audio_result=audio_result, input_video_path=input_path,
     )
 
     # Clean up temp converted video (now copied into videos/ dir)
@@ -1972,6 +2157,8 @@ def main():
             print(f"    Hand decode:   {decode_time:.1f}s")
         if phase3_time > 0:
             print(f"    Hand pose:     {phase3_time:.1f}s")
+    if audio_time > 0:
+        print(f"    Audio:         {audio_time:.1f}s")
     print(f"    Video convert: {phase1_time:.1f}s")
     print(f"    Assembly:      {phase4_time:.1f}s")
     print(f"  Output: {dataset_path}")

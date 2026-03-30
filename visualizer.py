@@ -53,6 +53,7 @@ def load_dataset(dataset_dir: str) -> dict:
     has_slam = "observation.slam.pose" in table.column_names
     has_left = "observation.hand.left.detected" in table.column_names
     has_right = "observation.hand.right.detected" in table.column_names
+    has_audio = "observation.audio.transcript" in table.column_names
 
     frames = []
     for i in range(num_frames):
@@ -96,6 +97,11 @@ def load_dataset(dataset_dir: str) -> dict:
             else:
                 frame[f"{side}_kp2d"] = None
 
+        if has_audio:
+            txt = table.column("observation.audio.transcript")[i].as_py()
+            if txt:
+                frame["transcript"] = txt
+
         frames.append(frame)
 
     return {
@@ -108,6 +114,7 @@ def load_dataset(dataset_dir: str) -> dict:
         "has_slam": has_slam,
         "has_left_hand": has_left,
         "has_right_hand": has_right,
+        "has_audio": has_audio,
         "frames": frames,
     }
 
@@ -152,6 +159,13 @@ canvas#overlay {
 
 .controls .time { font-size: 13px; font-variant-numeric: tabular-nums; min-width: 100px; }
 
+.transcript-bar {
+    background: rgba(0,0,0,0.85); color: #fff; padding: 6px 16px;
+    font-size: 14px; text-align: center; min-height: 30px;
+    line-height: 1.4; display: none;
+}
+.transcript-bar.active { display: block; }
+
 .side-panel {
     width: 420px; background: #16213e; display: flex; flex-direction: column;
     border-left: 1px solid #0f3460;
@@ -193,6 +207,7 @@ canvas#overlay {
             <video id="video" preload="auto"></video>
             <canvas id="overlay"></canvas>
         </div>
+        <div class="transcript-bar" id="transcript-bar"></div>
         <div class="controls">
             <button id="playBtn">Play</button>
             <input type="range" id="scrubber" min="0" max="1000" value="0">
@@ -254,6 +269,7 @@ const playBtn = document.getElementById('playBtn');
 const timeDisplay = document.getElementById('timeDisplay');
 const frameDisplay = document.getElementById('frameDisplay');
 const infoPanel = document.getElementById('info-panel');
+const transcriptBar = document.getElementById('transcript-bar');
 const showLeft = document.getElementById('showLeft');
 const showRight = document.getElementById('showRight');
 const showBones = document.getElementById('showBones');
@@ -615,7 +631,18 @@ function drawFrame(idx) {
     }
     html += `<span class="label">Left:</span> ${frame.left_kp2d ? '<span class="detected">detected</span>' : '<span class="not-detected">-</span>'} &nbsp; `;
     html += `<span class="label">Right:</span> ${frame.right_kp2d ? '<span class="detected">detected</span>' : '<span class="not-detected">-</span>'}`;
+    if (frame.transcript) {
+        html += `<br><span class="label">Audio:</span> <span class="val">${frame.transcript}</span>`;
+    }
     infoPanel.innerHTML = html;
+
+    // Transcript subtitle bar
+    if (frame.transcript) {
+        transcriptBar.textContent = frame.transcript;
+        transcriptBar.classList.add('active');
+    } else {
+        transcriptBar.classList.remove('active');
+    }
 
     // Controls display
     const dur = DATA.num_frames / DATA.fps;

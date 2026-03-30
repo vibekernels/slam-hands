@@ -4,6 +4,7 @@ Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0
 
 - **SLAM camera poses** (7-DoF: translation + quaternion) via DROID-SLAM
 - **3D hand poses** (21 MANO keypoints per hand) via WiLoR
+- **Audio transcription** (word-level timestamps) via NVIDIA Parakeet
 - **Video conversion** (iPhone HEVC HDR to SDR MP4)
 
 ## Quick start
@@ -31,6 +32,8 @@ options:
   --skip-video-convert     Skip video format conversion
   --skip-slam              Skip SLAM camera pose estimation
   --skip-hands             Skip hand pose estimation
+  --skip-audio             Skip audio transcription
+  --asr-model MODEL        NeMo ASR model name (default: parakeet-tdt_ctc-110m)
   --hand-stride N          Process every Nth frame for hands (default: 1)
   --hand-det-conf F        YOLO hand detection confidence threshold (default: 0.3)
   --fast-traj              Use fewer SLAM backend steps for faster trajectory
@@ -46,6 +49,7 @@ options:
 output_dir/
   meta/
     info.json                                    # LeRobot v3.0 metadata
+    audio.json                                   # Full transcript + word/segment timestamps
     tasks.parquet
     episodes/chunk-000/file-000.parquet
   data/
@@ -62,6 +66,7 @@ The parquet contains per-frame columns:
 | `observation.hand.{left,right}.keypoints_2d` | 42 | 21 joints x 2 (pixel coords) |
 | `observation.hand.{left,right}.keypoints_3d` | 63 | 21 joints x 3 (camera frame, meters) |
 | `observation.hand.{left,right}.detected` | 1 | Detection flag (0 or 1) |
+| `observation.audio.transcript` | 1 | Active transcript segment (string) |
 
 ## Installation
 
@@ -149,6 +154,14 @@ mkdir -p mano_data
 cp /path/to/MANO_RIGHT.pkl mano_data/
 ```
 
+### NeMo (Parakeet ASR)
+
+```bash
+pip install "nemo_toolkit[asr]"
+```
+
+The Parakeet model (`parakeet-tdt_ctc-110m`) is downloaded automatically on first use (~110M parameters, ~440 MB). No audio stream in the video? Transcription is skipped automatically.
+
 ### Native video decoder (optional, faster)
 
 Builds a GIL-free C++ video decoder for concurrent frame extraction:
@@ -166,6 +179,7 @@ Requires the FFmpeg dev headers installed above. Falls back to OpenCV if not ava
 python3 -c "from droid import Droid; print('DROID-SLAM OK')"
 python3 -c "from wilor.models import load_wilor; print('WiLoR OK')"
 python3 -c "from ultralytics import YOLO; print('YOLO OK')"
+python3 -c "import nemo.collections.asr; print('NeMo ASR OK')"
 python3 -c "import native_decode; print('native_decode OK')"
 ```
 
