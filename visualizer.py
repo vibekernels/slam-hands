@@ -160,9 +160,10 @@ canvas#overlay {
 .controls .time { font-size: 13px; font-variant-numeric: tabular-nums; min-width: 100px; }
 
 .transcript-bar {
-    background: rgba(0,0,0,0.85); color: #fff; padding: 6px 16px;
-    font-size: 14px; text-align: center; min-height: 30px;
-    line-height: 1.4; display: none;
+    position: absolute; bottom: 0; left: 0; right: 0;
+    background: rgba(0,0,0,0.75); color: #fff; padding: 6px 16px;
+    font-size: 14px; text-align: center;
+    line-height: 1.4; display: none; pointer-events: none; z-index: 2;
 }
 .transcript-bar.active { display: block; }
 
@@ -206,8 +207,8 @@ canvas#overlay {
         <div class="video-wrapper" id="video-wrapper">
             <video id="video" preload="auto"></video>
             <canvas id="overlay"></canvas>
+            <div class="transcript-bar" id="transcript-bar"></div>
         </div>
-        <div class="transcript-bar" id="transcript-bar"></div>
         <div class="controls">
             <button id="playBtn">Play</button>
             <input type="range" id="scrubber" min="0" max="1000" value="0">
