@@ -448,40 +448,136 @@ def _hand_pose_worker_thread(
     frame_queue, result_dict, wilor_dir, preloaded, num_frames_est,
     device, det_conf, stride, hand_stream, worker_error, error_info,
 ):
-    """Worker thread: runs YOLO + WiLoR hand pose on a dedicated CUDA stream.
+    """Worker thread: runs YOLO + WiLoR hand pose on separate CUDA streams.
 
     Consumes (frame_idx, rgb_np) tuples from frame_queue until _SENTINEL.
     Writes final hand pose result into result_dict.
+
+    Architecture: YOLO detection runs on hand_stream while WiLoR inference
+    runs on a separate wilor_stream.  Preprocessed crops flow from YOLO to
+    WiLoR via a queue, allowing the GPU to overlap both workloads.  This
+    eliminates the serial WiLoR tail (previously ~13 s after YOLO finished).
     """
     try:
         torch.cuda.set_device(0)
         sys.path.insert(0, wilor_dir)
         from ultralytics import YOLO
+        from concurrent.futures import ThreadPoolExecutor as TPE
 
-        with torch.cuda.stream(hand_stream), torch.no_grad():
-            # Load models to GPU
-            t_load = time.perf_counter()
-            model_cpu, model_cfg = preloaded
-            model = model_cpu.to(device).eval().half()
-            model.backbone.skip_blocks = True
-            detector = YOLO(os.path.join(wilor_dir, 'pretrained_models', 'detector.pt')).to(device)
-            print(f"  [Hand worker] Models on GPU ({time.perf_counter()-t_load:.1f}s)")
-
-            # Config values for crop preprocessing
-            mean = 255.0 * np.array(model_cfg.MODEL.IMAGE_MEAN, dtype=np.float32)
-            std = 255.0 * np.array(model_cfg.MODEL.IMAGE_STD, dtype=np.float32)
-            bbox_shape = model_cfg.MODEL.get('BBOX_SHAPE', None)
-            img_size_cfg = model_cfg.MODEL.IMAGE_SIZE
+        with torch.no_grad():
+            # ── Load config for crop preprocessing (fast, ~0.1 s) ──
+            orig_cwd = os.getcwd()
+            os.chdir(wilor_dir)
+            try:
+                from wilor.configs import get_config as _get_wilor_cfg
+                _cfg = _get_wilor_cfg(
+                    os.path.join(wilor_dir, 'pretrained_models', 'model_config.yaml'),
+                    update_cachedir=True,
+                )
+            finally:
+                os.chdir(orig_cwd)
+            mean = 255.0 * np.array(_cfg.MODEL.IMAGE_MEAN, dtype=np.float32)
+            std = 255.0 * np.array(_cfg.MODEL.IMAGE_STD, dtype=np.float32)
+            bbox_shape = _cfg.MODEL.get('BBOX_SHAPE', [192, 256])
+            img_size_cfg = _cfg.MODEL.IMAGE_SIZE
             rescale_factor = 2.0
+            BATCH_SIZE = 48
 
-            # ── Pass 1: Consume frames, run YOLO, store frames with detections ──
+            # ── Load YOLO detector on hand_stream ──
+            t_load = time.perf_counter()
+            with torch.cuda.stream(hand_stream):
+                detector = YOLO(os.path.join(wilor_dir, 'pretrained_models', 'detector.pt')).to(device)
+            print(f"  [Hand worker] YOLO on GPU ({time.perf_counter()-t_load:.1f}s)")
+
+            # ── Pre-allocate output arrays (sized for estimate, trimmed later) ──
+            max_frames = max(num_frames_est + 100, 4000)
+            left_kp3d = np.full((max_frames, 21, 3), np.nan, dtype=np.float32)
+            right_kp3d = np.full((max_frames, 21, 3), np.nan, dtype=np.float32)
+            left_kp2d = np.full((max_frames, 21, 2), np.nan, dtype=np.float32)
+            right_kp2d = np.full((max_frames, 21, 2), np.nan, dtype=np.float32)
+            left_detected = np.zeros(max_frames, dtype=bool)
+            right_detected = np.zeros(max_frames, dtype=bool)
+
+            # ── WiLoR inference sub-thread (separate CUDA stream) ──
+            crop_queue = Queue(maxsize=256)
+            wilor_stream = torch.cuda.Stream()
+            n_hands_done = [0]
+            wilor_error = []
+
+            def _wilor_inference_thread():
+                """Consume preprocessed crops and run WiLoR on wilor_stream."""
+                try:
+                    torch.cuda.set_device(0)
+                    if preloaded is None:
+                        while crop_queue.get() is not _SENTINEL:
+                            pass
+                        return
+                    model_cpu, model_cfg = preloaded
+
+                    with torch.cuda.stream(wilor_stream), torch.no_grad():
+                        model = model_cpu.to(device).eval().half()
+                        model.backbone.skip_blocks = True
+                        del model_cpu
+
+                        crop_buf_imgs = []
+                        crop_buf_meta = []
+
+                        while True:
+                            item = crop_queue.get()
+                            if item is _SENTINEL:
+                                break
+                            img_t, meta = item
+                            crop_buf_imgs.append(img_t)
+                            crop_buf_meta.append(meta)
+                            if len(crop_buf_imgs) >= BATCH_SIZE:
+                                _run_wilor_batch(
+                                    crop_buf_imgs[:BATCH_SIZE],
+                                    crop_buf_meta[:BATCH_SIZE],
+                                    model, model_cfg, device,
+                                    left_kp3d, right_kp3d,
+                                    left_kp2d, right_kp2d,
+                                    left_detected, right_detected,
+                                )
+                                n_hands_done[0] += BATCH_SIZE
+                                crop_buf_imgs = crop_buf_imgs[BATCH_SIZE:]
+                                crop_buf_meta = crop_buf_meta[BATCH_SIZE:]
+
+                        if crop_buf_imgs:
+                            _run_wilor_batch(
+                                crop_buf_imgs, crop_buf_meta,
+                                model, model_cfg, device,
+                                left_kp3d, right_kp3d,
+                                left_kp2d, right_kp2d,
+                                left_detected, right_detected,
+                            )
+                            n_hands_done[0] += len(crop_buf_imgs)
+                except Exception:
+                    import traceback
+                    wilor_error.append(traceback.format_exc())
+
+            wilor_thread = Thread(target=_wilor_inference_thread, daemon=True)
+            wilor_thread.start()
+
+            # ── YOLO detection loop + crop preprocessing → crop_queue ──
             t_yolo_start = time.perf_counter()
-            frame_dets = []       # (fi, boxes [K,4], right [K], img_bgr)
             total_crops = 0
             yolo_batch = []       # (fi, img_bgr)
             sampled_indices = []
             actual_num_frames = 0
             YOLO_BATCH = 16
+
+            # Small thread pool for CPU crop preprocessing
+            prep_pool = TPE(max_workers=4)
+
+            def _preprocess_and_enqueue(fi, img_bgr, center, scale, is_right, img_wh):
+                """CPU: preprocess one crop and put result on crop_queue."""
+                img_tensor, bbox_size = _preprocess_hand_crop(
+                    img_bgr, center, scale, bbox_shape, img_size_cfg, is_right, mean, std
+                )
+                crop_queue.put((
+                    torch.from_numpy(img_tensor).half(),
+                    (fi, center.copy(), bbox_size, img_wh, is_right),
+                ))
 
             def _flush_yolo():
                 nonlocal total_crops
@@ -489,7 +585,8 @@ def _hand_pose_worker_thread(
                     return
                 fis = [x[0] for x in yolo_batch]
                 imgs = [x[1] for x in yolo_batch]
-                results = detector(imgs, conf=det_conf, verbose=False)
+                with torch.cuda.stream(hand_stream):
+                    results = detector(imgs, conf=det_conf, verbose=False)
                 for i, (det_fi, dets) in enumerate(zip(fis, results)):
                     bboxes, is_right_list = [], []
                     for det in dets:
@@ -497,12 +594,19 @@ def _hand_pose_worker_thread(
                         is_right_list.append(det.boxes.cls.cpu().detach().squeeze().item())
                         bboxes.append(bbox[:4].tolist())
                     if bboxes:
-                        frame_dets.append((
-                            det_fi,
-                            np.stack(bboxes).astype(np.float32),
-                            np.stack(is_right_list).astype(np.float32),
-                            imgs[i],  # keep BGR for WiLoR crop extraction
-                        ))
+                        boxes = np.stack(bboxes).astype(np.float32)
+                        right_arr = np.stack(is_right_list).astype(np.float32)
+                        img_bgr = imgs[i]
+                        img_h, img_w = img_bgr.shape[:2]
+                        centers = (boxes[:, 2:4] + boxes[:, 0:2]) / 2.0
+                        scales = rescale_factor * (boxes[:, 2:4] - boxes[:, 0:2]) / 200.0
+                        img_wh = np.array([img_w, img_h], dtype=np.float32)
+                        for k in range(len(boxes)):
+                            prep_pool.submit(
+                                _preprocess_and_enqueue,
+                                det_fi, img_bgr, centers[k], scales[k],
+                                right_arr[k], img_wh,
+                            )
                         total_crops += len(bboxes)
 
             while True:
@@ -522,87 +626,35 @@ def _hand_pose_worker_thread(
             _flush_yolo()
             yolo_batch = []
 
+            # Wait for all preprocessing tasks to finish, then signal WiLoR done
+            prep_pool.shutdown(wait=True)
+            crop_queue.put(_SENTINEL)
+
             t_yolo = time.perf_counter() - t_yolo_start
             num_frames = actual_num_frames
             n_sampled = len(sampled_indices)
             print(f"  [Hand worker] YOLO: {t_yolo:.1f}s ({n_sampled/max(t_yolo,0.001):.0f} fps), "
-                  f"{total_crops} crops in {len(frame_dets)} frames")
+                  f"{total_crops} crops")
 
-            # Output arrays
-            left_kp3d = np.full((num_frames, 21, 3), np.nan, dtype=np.float32)
-            right_kp3d = np.full((num_frames, 21, 3), np.nan, dtype=np.float32)
-            left_kp2d = np.full((num_frames, 21, 2), np.nan, dtype=np.float32)
-            right_kp2d = np.full((num_frames, 21, 2), np.nan, dtype=np.float32)
-            left_detected = np.zeros(num_frames, dtype=bool)
-            right_detected = np.zeros(num_frames, dtype=bool)
+            # Wait for WiLoR thread to finish
+            wilor_thread.join()
+            if wilor_error:
+                raise RuntimeError(f"WiLoR inference failed:\n{wilor_error[0]}")
+
+            n_hands = n_hands_done[0]
+            t_total = time.perf_counter() - t_yolo_start
+            print(f"  [Hand worker] WiLoR: {n_hands} hands in {t_total:.1f}s total")
+
+            # Trim output arrays to actual frame count
+            left_kp3d = left_kp3d[:num_frames]
+            right_kp3d = right_kp3d[:num_frames]
+            left_kp2d = left_kp2d[:num_frames]
+            right_kp2d = right_kp2d[:num_frames]
+            left_detected = left_detected[:num_frames]
+            right_detected = right_detected[:num_frames]
 
             if total_crops == 0:
                 print(f"  [Hand worker] No hands detected")
-                result_dict.update({
-                    "_model": "wilor", "_done": True, "_num_frames": num_frames,
-                    "left_hand_keypoints_3d": left_kp3d, "right_hand_keypoints_3d": right_kp3d,
-                    "left_hand_keypoints_2d": left_kp2d, "right_hand_keypoints_2d": right_kp2d,
-                    "left_hand_detected": left_detected, "right_hand_detected": right_detected,
-                })
-                return
-
-            # ── Pass 2: WiLoR inference (cross-frame batched, threaded preprocessing) ──
-            t_wilor_start = time.perf_counter()
-            BATCH_SIZE = 48
-            n_hands = 0
-
-            all_crop_specs = []
-            for fi, boxes, right_arr, img_bgr in frame_dets:
-                img_h, img_w = img_bgr.shape[:2]
-                centers = (boxes[:, 2:4] + boxes[:, 0:2]) / 2.0
-                scales = rescale_factor * (boxes[:, 2:4] - boxes[:, 0:2]) / 200.0
-                img_wh = np.array([img_w, img_h], dtype=np.float32)
-                for k in range(len(boxes)):
-                    all_crop_specs.append((fi, img_bgr, centers[k], scales[k], right_arr[k], img_wh))
-            frame_dets = []  # free stored images
-
-            def _preprocess_one(spec):
-                fi, img_bgr, center, scale, is_right, img_wh = spec
-                img_tensor, bbox_size = _preprocess_hand_crop(
-                    img_bgr, center, scale, bbox_shape, img_size_cfg, is_right, mean, std
-                )
-                return (
-                    torch.from_numpy(img_tensor).half(),
-                    (fi, center.copy(), bbox_size, img_wh, is_right),
-                )
-
-            from concurrent.futures import ThreadPoolExecutor as TPE
-            with TPE(max_workers=4) as prep_pool:
-                futures = [prep_pool.submit(_preprocess_one, spec) for spec in all_crop_specs]
-                all_crop_specs = []
-
-                crop_buf_imgs = []
-                crop_buf_meta = []
-                for fut in futures:
-                    img_t, meta = fut.result()
-                    crop_buf_imgs.append(img_t)
-                    crop_buf_meta.append(meta)
-                    if len(crop_buf_imgs) >= BATCH_SIZE:
-                        _run_wilor_batch(
-                            crop_buf_imgs[:BATCH_SIZE], crop_buf_meta[:BATCH_SIZE],
-                            model, model_cfg, device,
-                            left_kp3d, right_kp3d, left_kp2d, right_kp2d,
-                            left_detected, right_detected,
-                        )
-                        n_hands += BATCH_SIZE
-                        crop_buf_imgs = crop_buf_imgs[BATCH_SIZE:]
-                        crop_buf_meta = crop_buf_meta[BATCH_SIZE:]
-
-            if crop_buf_imgs:
-                _run_wilor_batch(
-                    crop_buf_imgs, crop_buf_meta, model, model_cfg, device,
-                    left_kp3d, right_kp3d, left_kp2d, right_kp2d,
-                    left_detected, right_detected,
-                )
-                n_hands += len(crop_buf_imgs)
-
-            t_wilor = time.perf_counter() - t_wilor_start
-            print(f"  [Hand worker] WiLoR: {t_wilor:.1f}s ({n_hands/max(t_wilor,0.001):.0f} hands/s)")
 
             # Interpolate strided frames
             if stride > 1 and len(sampled_indices) > 1:
@@ -622,7 +674,6 @@ def _hand_pose_worker_thread(
 
             left_rate = left_detected.sum() / num_frames * 100
             right_rate = right_detected.sum() / num_frames * 100
-            t_total = time.perf_counter() - t_yolo_start
             print(f"  [Hand worker] Done: {t_total:.1f}s, {n_hands} hands, "
                   f"left={left_rate:.1f}% right={right_rate:.1f}%")
 
@@ -646,9 +697,13 @@ def run_slam_and_hand_pose_concurrent(
 ):
     """Run DROID-SLAM and WiLoR hand pose concurrently on the same GPU.
 
-    Two threads share the GPU via separate CUDA streams:
-    - Main thread: C++ decode -> SLAM tracking -> backend -> traj fill
-    - Worker thread: YOLO detection -> WiLoR batched inference
+    Three CUDA streams share the GPU:
+    - Main thread (default stream): C++ decode -> SLAM tracking -> backend
+    - Hand worker (hand_stream): YOLO detection
+    - WiLoR sub-thread (wilor_stream): WiLoR batched inference
+
+    YOLO and WiLoR run on separate streams so the GPU can overlap both
+    workloads, eliminating the serial WiLoR tail after YOLO finishes.
 
     Returns (slam_result, hand_result, num_frames).
     """
@@ -679,6 +734,12 @@ def run_slam_and_hand_pose_concurrent(
         upsample=False, frontend_device=device, backend_device=device,
     )
 
+    # Estimate frame count from metadata (for pre-allocating arrays)
+    try:
+        _, _, _, num_frames_est = get_video_metadata(video_path)
+    except Exception:
+        num_frames_est = 2000
+
     # Create CUDA stream for hand pose worker
     hand_stream = torch.cuda.Stream()
     frame_queue = Queue(maxsize=64)
@@ -690,7 +751,8 @@ def run_slam_and_hand_pose_concurrent(
     hand_worker = threading.Thread(
         target=_hand_pose_worker_thread,
         args=(frame_queue, result_dict, wilor_dir, wilor_preloaded,
-              2000, device, det_conf, stride, hand_stream, worker_error, error_info),
+              num_frames_est, device, det_conf, stride, hand_stream,
+              worker_error, error_info),
         daemon=True,
     )
     hand_worker.start()
@@ -909,17 +971,42 @@ def _load_wilor(wilor_dir, device="cuda", fast=True):
 
 
 def _load_wilor_cpu(wilor_dir):
-    """Load WiLoR model on CPU in background thread (for overlap with SLAM)."""
+    """Load WiLoR model on CPU in background thread (for overlap with SLAM).
+
+    Uses mmap + assign=True to avoid copying 2.5 GB of weights, reducing
+    load_state_dict from ~15 s to ~0.3 s and minimizing GIL contention so
+    SLAM + YOLO can run concurrently on the GPU without slowdown.
+    """
     sys.path.insert(0, wilor_dir)
-    # WiLoR config uses relative paths (./mano_data/...), so chdir temporarily
     orig_cwd = os.getcwd()
     os.chdir(wilor_dir)
     try:
-        from wilor.models import load_wilor
-        model, model_cfg = load_wilor(
-            checkpoint_path=os.path.join(wilor_dir, 'pretrained_models', 'wilor_final.ckpt'),
-            cfg_path=os.path.join(wilor_dir, 'pretrained_models', 'model_config.yaml'),
+        from wilor.configs import get_config
+        from wilor.models.wilor import WiLoR
+
+        model_cfg = get_config(
+            os.path.join(wilor_dir, 'pretrained_models', 'model_config.yaml'),
+            update_cachedir=True,
         )
+        model_cfg.defrost()
+        if model_cfg.MODEL.IMAGE_SIZE == 256:
+            model_cfg.MODEL.BBOX_SHAPE = [192, 256]
+        model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS', None)
+        model_cfg.MANO.DATA_DIR = './mano_data/'
+        model_cfg.MANO.MODEL_PATH = './mano_data/'
+        model_cfg.MANO.MEAN_PARAMS = './mano_data/mano_mean_params.npz'
+        model_cfg.freeze()
+
+        model = WiLoR(cfg=model_cfg, init_renderer=False)
+
+        # Fast mmap load: tensors stay as memory-mapped views (no copy)
+        sd_path = os.path.join(wilor_dir, 'pretrained_models', 'wilor_final_statedict.pt')
+        ckpt_path = os.path.join(wilor_dir, 'pretrained_models', 'wilor_final.ckpt')
+        if os.path.exists(sd_path):
+            sd = torch.load(sd_path, map_location='cpu', mmap=True, weights_only=True)
+        else:
+            sd = torch.load(ckpt_path, map_location='cpu', mmap=True, weights_only=False)['state_dict']
+        model.load_state_dict(sd, strict=False, assign=True)
     finally:
         os.chdir(orig_cwd)
     return model, model_cfg
@@ -2014,40 +2101,43 @@ def main():
     phase1_time = 0
     video_convert_future = None
 
-    # Start WiLoR CPU loading in background (overlaps with SLAM)
-    wilor_cpu_future = None
-    if not args.skip_hands:
-        print(f"\n[Background] Starting WiLoR CPU load...")
-        wilor_load_start = time.perf_counter()
-        wilor_cpu_future = executor.submit(_load_wilor_cpu, args.wilor_dir)
-
-    # Start audio prep in background (extract WAV + load ASR model on CPU)
-    audio_prep_future = None
+    # Pre-import NeMo to warm up pytorch_lightning (used by WiLoR too)
     if not args.skip_audio:
-        # Import NeMo in main thread first to avoid import race conditions
         import nemo.collections.asr  # noqa: F401
-        print(f"[Background] Starting audio extraction + ASR model load...")
-        audio_prep_future = executor.submit(
-            _prepare_audio, input_path, args.asr_model)
 
-    # Collect pre-loaded WiLoR model if background load was started
-    wilor_preloaded = None
-    if wilor_cpu_future is not None:
-        if wilor_cpu_future.done():
-            print(f"  WiLoR CPU load finished (fully overlapped)")
-        else:
-            print(f"  Waiting for WiLoR CPU load to finish...")
-        wilor_preloaded = wilor_cpu_future.result()
-        wilor_load_time = time.perf_counter() - wilor_load_start
-        print(f"  WiLoR CPU load took {wilor_load_time:.1f}s")
-
-    # Start video conversion in background (CPU-bound ffmpeg)
+    # Start video conversion in background (CPU-bound ffmpeg, overlaps with model load)
     if not args.skip_video_convert:
         from convert_video import convert_video
-        print(f"\n[Background] Starting video conversion...")
+        print(f"[Background] Starting video conversion...")
         phase1_start = time.perf_counter()
         video_convert_future = executor.submit(
             convert_video, input_path, video_output, fast=True)
+
+    # Load WiLoR model serially (fast path: mmap + assign avoids 15 s copy).
+    # Must complete before background Python-heavy tasks to avoid GIL contention.
+    wilor_preloaded = None
+    if not args.skip_hands:
+        wilor_load_start = time.perf_counter()
+        wilor_preloaded = _load_wilor_cpu(args.wilor_dir)
+        wilor_load_time = time.perf_counter() - wilor_load_start
+        print(f"  WiLoR model loaded in {wilor_load_time:.1f}s (mmap + assign)")
+
+    # Start full audio pipeline in background AFTER WiLoR load (avoids GIL contention).
+    # Runs on CPU so it doesn't compete with SLAM/hands for GPU.
+    audio_future = None
+    if not args.skip_audio:
+        _audio_fps, _, _, _audio_nframes = get_video_metadata(input_path)
+        print(f"[Background] Starting audio pipeline (extract + transcribe on CPU)...")
+        def _audio_full_pipeline():
+            wav_path, model = _prepare_audio(input_path, args.asr_model)
+            if wav_path is None:
+                return None
+            return run_audio_transcription(
+                input_path, _audio_fps, _audio_nframes,
+                model_name=args.asr_model, device="cpu",
+                preloaded=(wav_path, model),
+            )
+        audio_future = executor.submit(_audio_full_pipeline)
 
     slam_result = None
     hand_result = None
@@ -2130,30 +2220,27 @@ def main():
     if frames is not None:
         del frames
 
-    # Audio transcription — collect background prep, then run GPU inference
+    # Collect background audio pipeline result
     audio_result = None
     audio_time = 0
-    if not args.skip_audio:
-        if num_frames == 0:
-            fps, _, _, num_frames = get_video_metadata(input_path)
+    if not args.skip_audio and audio_future is not None:
         print(f"\n[Audio] Transcription (Parakeet)")
         audio_start = time.perf_counter()
-        # Collect background audio prep (WAV extraction + model load on CPU)
-        audio_preloaded = None
-        if audio_prep_future is not None:
-            if audio_prep_future.done():
-                print(f"  Audio prep finished (overlapped with SLAM/hands)")
-            else:
-                print(f"  Waiting for audio prep to finish...")
-            audio_preloaded = audio_prep_future.result()
-        audio_result = run_audio_transcription(
-            input_path, fps, num_frames,
-            model_name=args.asr_model, device=args.device,
-            preloaded=audio_preloaded,
-        )
+        if audio_future.done():
+            print(f"  Audio pipeline finished (fully overlapped)")
+        else:
+            print(f"  Waiting for audio pipeline to finish...")
+        audio_result = audio_future.result()
         audio_time = time.perf_counter() - audio_start
         if audio_result is not None:
-            print(f"  Audio transcription completed in {audio_time:.1f}s")
+            # Update num_frames in frame_text if needed (metadata estimate vs actual)
+            ft = audio_result["frame_text"]
+            if num_frames > 0 and len(ft) != num_frames:
+                if len(ft) < num_frames:
+                    ft.extend([""] * (num_frames - len(ft)))
+                else:
+                    audio_result["frame_text"] = ft[:num_frames]
+            print(f"  Audio transcription completed (waited {audio_time:.1f}s)")
         else:
             print(f"  Audio: no audio stream, skipped")
             audio_time = 0

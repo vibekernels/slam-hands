@@ -201,16 +201,22 @@ Controls:
 
 ## Performance
 
-Benchmarked on 1858 frames (62s) of 1920x1080 30fps iPhone video, RTX 5090:
+Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| SLAM + hands (concurrent) | 23s | Both models share GPU via CUDA streams |
-| Video conversion | 23s | Overlapped with SLAM+hands |
+| Model loading | 8s | WiLoR mmap + assign (no checkpoint copy) |
+| SLAM + hands (concurrent) | 35s | Three CUDA streams: SLAM, YOLO, WiLoR |
+| Video conversion | 14s | Overlapped with SLAM+hands |
+| Audio transcription | 14s | Parakeet on CPU, overlapped with SLAM+hands |
 | Dataset assembly | 1s | Parquet + info.json |
-| **Total** | **~24s** | With `--fast-traj` |
+| **Total** | **~57s** | Full pipeline with `--fast-traj` |
 
-SLAM and hand pose run concurrently on the same GPU. SLAM's CPU-bound phases (sparse BA solves, NMS) free the GPU for WiLoR inference, giving ~1.7x speedup over sequential execution.
+Three performance techniques keep total time close to the longest single phase:
+
+1. **Triple CUDA streams** — SLAM runs on the default stream, YOLO detection on a hand stream, and WiLoR inference on a third stream. The GPU overlaps all three workloads, eliminating the serial WiLoR tail that previously added ~13s after YOLO finished.
+2. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s by memory-mapping weights instead of copying 2.5 GB.
+3. **Full overlap** — Video conversion (ffmpeg) and audio transcription (Parakeet on CPU) run entirely in the background, adding zero time to the critical path.
 
 ---
 
