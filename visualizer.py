@@ -283,7 +283,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0d0d1a);
 
 const camera3D = new THREE.PerspectiveCamera(60, 1, 0.01, 100);
-camera3D.position.set(0, 2, 2);
+camera3D.position.set(0, 0.5, 2);
 camera3D.lookAt(0, 0, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -294,7 +294,7 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.1;
 controls.target.set(0, 0, 0);
 
-// Grid
+// Grid (XZ plane — horizontal ground plane)
 const grid = new THREE.GridHelper(10, 20, 0x2a2a4a, 0x1a1a3a);
 scene.add(grid);
 
@@ -344,6 +344,16 @@ function buildTrajectory() {
     const startMarker = new THREE.Mesh(startGeo, startMat);
     startMarker.position.copy(positions[0]);
     scene.add(startMarker);
+
+    // Auto-center view on trajectory
+    const box = new THREE.Box3().setFromPoints(positions);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxSpan = Math.max(size.x, size.y, size.z, 0.5);
+    // View from the side so the downward-pointing frustum is visible
+    camera3D.position.set(center.x + maxSpan * 1.2, center.y + maxSpan * 0.3, center.z + maxSpan * 1.2);
+    controls.target.copy(center);
+    controls.update();
 }
 
 // --- Camera frustum ---
