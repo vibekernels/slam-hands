@@ -128,7 +128,15 @@ def build_ffmpeg_cmd(
     preset: int = 12,
 ) -> list[str]:
     """Build ffmpeg command for LeRobotDataset v3.0 conversion."""
+    # Detect actual CPU limit (Docker cgroups), not host CPU count
     total_cores = os.cpu_count() or 4
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            parts = f.read().strip().split()
+            if parts[0] != "max":
+                total_cores = min(total_cores, int(int(parts[0]) / int(parts[1])))
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
 
     cmd = ["ffmpeg", "-y"]
 
@@ -201,7 +209,15 @@ def build_ffmpeg_cmd_nvenc(
     Uses VBR mode targeting the same bitrate as libsvtav1 at the given CRF.
     With NVENC handling encoding, all CPU cores are free for zscale tonemapping.
     """
+    # Detect actual CPU limit (Docker cgroups), not host CPU count
     total_cores = os.cpu_count() or 4
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            parts = f.read().strip().split()
+            if parts[0] != "max":
+                total_cores = min(total_cores, int(int(parts[0]) / int(parts[1])))
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
 
     if bitrate is None:
         bitrate = estimate_bitrate(width, height, fps, quality)
@@ -310,7 +326,15 @@ def build_ffmpeg_cmd_x264_fast(
     NVENC is unavailable. Skips -hwaccel since we're on this path because GPU
     isn't available to ffmpeg.
     """
+    # Detect actual CPU limit (Docker cgroups), not host CPU count
     total_cores = os.cpu_count() or 4
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            parts = f.read().strip().split()
+            if parts[0] != "max":
+                total_cores = min(total_cores, int(int(parts[0]) / int(parts[1])))
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
     filter_threads = max(1, total_cores // 5)
 
     cmd = ["ffmpeg", "-y"]
@@ -330,9 +354,14 @@ def build_ffmpeg_cmd_x264_fast(
         vf = "format=yuv420p"
     cmd += ["-vf", vf]
 
+    # Limit x264 threads to actual core count (Docker cgroup), not host CPU count.
+    # Without this, x264 creates 1.5 * os.cpu_count() threads (~180 on host with
+    # 120 logical cores), causing massive oversubscription in cgroup-limited containers.
+    encoder_threads = max(2, total_cores - filter_threads)
     cmd += [
         "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-threads", str(encoder_threads),
         "-crf", str(quality),
         "-g", str(gop),
         "-pix_fmt", "yuv420p",
@@ -341,6 +370,23 @@ def build_ffmpeg_cmd_x264_fast(
         output_path,
     ]
     return cmd
+
+
+def build_ffmpeg_cmd(input_path: str, output_path: str, fast: bool = False) -> list[str] | None:
+    """Build the ffmpeg command for video conversion, without running it.
+
+    Probes the input and returns the command list, or None if conversion
+    is not needed. Used to start ffmpeg as a subprocess early in the pipeline.
+    """
+    input_path = str(Path(input_path).resolve())
+    probe_info = probe_video(input_path)
+    video_stream = get_video_stream(probe_info)
+    hdr = is_hdr(probe_info)
+    quality = 30
+    gop = 2
+    return build_ffmpeg_cmd_x264_fast(
+        input_path, output_path, hdr_input=hdr, quality=quality, gop=gop,
+    )
 
 
 def run_gpu_pipeline(

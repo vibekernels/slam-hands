@@ -201,22 +201,24 @@ Controls:
 
 ## Performance
 
-Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
+Benchmarked on 1858 frames (62s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| Model loading | 8s | WiLoR mmap + assign (no checkpoint copy) |
-| SLAM + hands (concurrent) | 35s | Three CUDA streams: SLAM, YOLO, WiLoR |
-| Video conversion | 14s | Overlapped with SLAM+hands |
-| Audio transcription | 14s | Parakeet on CPU, overlapped with SLAM+hands |
-| Dataset assembly | 1s | Parquet + info.json |
-| **Total** | **~57s** | Full pipeline with `--fast-traj` |
+| Module pre-import | 5s | PL, timm, ultralytics, smplx, wilor (inherited by forked child) |
+| SLAM + hands (forked) | 31s | Separate processes, shared-memory frame transfer |
+| Video conversion | 33s | ffmpeg libx264, fully overlapped |
+| Audio transcription | 14s | Parakeet on CPU, fully overlapped |
+| Dataset assembly | 0.5s | Parquet + info.json |
+| **Total** | **~39s** | Full pipeline with `--fast-traj` |
 
-Three performance techniques keep total time close to the longest single phase:
+Five performance techniques keep total time close to the longest single phase:
 
-1. **Triple CUDA streams** — SLAM runs on the default stream, YOLO detection on a hand stream, and WiLoR inference on a third stream. The GPU overlaps all three workloads, eliminating the serial WiLoR tail that previously added ~13s after YOLO finished.
-2. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s by memory-mapping weights instead of copying 2.5 GB.
-3. **Full overlap** — Video conversion (ffmpeg) and audio transcription (Parakeet on CPU) run entirely in the background, adding zero time to the critical path.
+1. **Fork-based multiprocessing** — SLAM and hand pose (YOLO + WiLoR) run in separate processes with separate GILs, connected by a shared-memory ring buffer (256 slots). Eliminates ~20s of GIL contention that serialized the two workloads when threaded.
+2. **Parallel model loading** — The forked child loads YOLO to GPU on the main thread while constructing the WiLoR model on a background CPU thread. This overlaps CUDA init + YOLO load (~1s) with WiLoR construction (~5s), reducing child startup from ~9s to ~5s.
+3. **Triple CUDA streams** — Within the hand worker process, YOLO detection runs on one CUDA stream and WiLoR inference on another, allowing the GPU to overlap both workloads.
+4. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s by memory-mapping weights instead of copying 2.5 GB.
+5. **Full overlap** — Video conversion (ffmpeg subprocess, started before module imports) and audio transcription (Parakeet subprocess on CPU) run entirely in the background, adding zero time to the critical path.
 
 ---
 
