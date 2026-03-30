@@ -1644,14 +1644,37 @@ def _extract_audio(video_path: str, output_wav: str) -> bool:
     return True
 
 
+def _prepare_audio(video_path: str, model_name: str = "parakeet-tdt_ctc-110m"):
+    """Background-friendly: extract audio + load ASR model on CPU.
+
+    Returns (wav_path, model) or (None, None) if no audio stream.
+    """
+    import tempfile
+    wav_path = tempfile.mktemp(suffix=".wav")
+    has_audio = _extract_audio(video_path, wav_path)
+    if not has_audio:
+        os.remove(wav_path)
+        return None, None
+
+    import nemo.collections.asr as nemo_asr
+    model = nemo_asr.models.ASRModel.from_pretrained(model_name)
+    model.eval()
+    return wav_path, model
+
+
 def run_audio_transcription(
     video_path: str,
     fps: float,
     num_frames: int,
     model_name: str = "parakeet-tdt_ctc-110m",
     device: str = "cuda",
+    preloaded: tuple = None,
 ) -> dict | None:
     """Transcribe audio and produce per-frame transcript annotations.
+
+    Args:
+        preloaded: Optional (wav_path, model) from _prepare_audio() for
+            overlapped loading. If None, extracts audio and loads model here.
 
     Returns dict with:
         "transcript": str — full transcript text
@@ -1662,19 +1685,24 @@ def run_audio_transcription(
     """
     import tempfile
 
-    # Extract audio
-    wav_path = tempfile.mktemp(suffix=".wav")
-    try:
-        has_audio = _extract_audio(video_path, wav_path)
-        if not has_audio:
+    if preloaded is not None:
+        wav_path, model = preloaded
+        if wav_path is None:
             print("  No audio stream found, skipping transcription")
             return None
-
-        # Load model and transcribe
+    else:
+        wav_path = tempfile.mktemp(suffix=".wav")
+        has_audio = _extract_audio(video_path, wav_path)
+        if not has_audio:
+            os.remove(wav_path)
+            print("  No audio stream found, skipping transcription")
+            return None
         import nemo.collections.asr as nemo_asr
         print(f"  Loading ASR model: {model_name}")
         model = nemo_asr.models.ASRModel.from_pretrained(model_name)
         model.eval()
+
+    try:
         model = model.to(device)
 
         print(f"  Transcribing audio...")
@@ -1979,7 +2007,7 @@ def main():
     print(f"=" * 60)
 
     total_start = time.perf_counter()
-    executor = ThreadPoolExecutor(max_workers=2)
+    executor = ThreadPoolExecutor(max_workers=3)
 
     os.makedirs(args.output_dir, exist_ok=True)
     video_output = str(Path(args.output_dir) / "converted.mp4")
@@ -1992,6 +2020,15 @@ def main():
         print(f"\n[Background] Starting WiLoR CPU load...")
         wilor_load_start = time.perf_counter()
         wilor_cpu_future = executor.submit(_load_wilor_cpu, args.wilor_dir)
+
+    # Start audio prep in background (extract WAV + load ASR model on CPU)
+    audio_prep_future = None
+    if not args.skip_audio:
+        # Import NeMo in main thread first to avoid import race conditions
+        import nemo.collections.asr  # noqa: F401
+        print(f"[Background] Starting audio extraction + ASR model load...")
+        audio_prep_future = executor.submit(
+            _prepare_audio, input_path, args.asr_model)
 
     # Collect pre-loaded WiLoR model if background load was started
     wilor_preloaded = None
@@ -2093,18 +2130,26 @@ def main():
     if frames is not None:
         del frames
 
-    # Audio transcription (runs after SLAM/hands to avoid GPU contention)
+    # Audio transcription — collect background prep, then run GPU inference
     audio_result = None
     audio_time = 0
     if not args.skip_audio:
-        # Need num_frames and fps — get from metadata if we skipped everything
         if num_frames == 0:
             fps, _, _, num_frames = get_video_metadata(input_path)
         print(f"\n[Audio] Transcription (Parakeet)")
         audio_start = time.perf_counter()
+        # Collect background audio prep (WAV extraction + model load on CPU)
+        audio_preloaded = None
+        if audio_prep_future is not None:
+            if audio_prep_future.done():
+                print(f"  Audio prep finished (overlapped with SLAM/hands)")
+            else:
+                print(f"  Waiting for audio prep to finish...")
+            audio_preloaded = audio_prep_future.result()
         audio_result = run_audio_transcription(
             input_path, fps, num_frames,
             model_name=args.asr_model, device=args.device,
+            preloaded=audio_preloaded,
         )
         audio_time = time.perf_counter() - audio_start
         if audio_result is not None:
