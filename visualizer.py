@@ -928,7 +928,7 @@ def _run_pipeline(video_path: str, output_dir: str):
         sys.executable, script, video_path,
         "-o", output_dir,
         "--fast-traj",
-        "--hand-stride", "2",
+        "--hand-stride", "1",
     ]
 
     try:

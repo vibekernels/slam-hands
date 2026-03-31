@@ -216,9 +216,12 @@ Previous total (estimated baseline): ~660s (8s decode + 90s SLAM + 25s model loa
 | Config | SLAM | Hands | Video | **Total** | vs baseline |
 |---|---|---|---|---|---|
 | + single-decode (RGB+SLAM) + Triton (prev best) | 16.1s | 13.7s | 21s overlapped | **37.5s** | 18x |
-| + split decode + PL stub + statedict mmap | 8-13s | 12-13s | 18s overlapped | **18.6-19.7s** | 34x |
+| + split decode + PL stub + statedict mmap (stride=2) | 8-13s | 12-13s | 18s overlapped | **18.6-19.7s** | 34x |
+| + split decode + PL stub + statedict mmap (stride=1) | 10.9s | 22.5s | 31s overlapped | **33.0s** | 20x |
 
 *Warm runs (model cached). Cold start adds ~25s for model loading.
+
+**Recommended default: stride=1** (`./annotate.sh`). Stride=2 saves ~14s but introduces 2.4mm interpolation error on hand keypoints. At 33s for 62s of video, stride=1 is fast enough and produces exact per-frame hand poses.
 
 ## What Didn't Work
 - **torch.compile on backbone only**: <1ms improvement, backbone already memory-bound in fp16

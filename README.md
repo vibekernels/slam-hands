@@ -10,15 +10,19 @@ Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0
 ## Quick start
 
 ```bash
-# Full pipeline: SLAM + hand pose + video conversion
-python3 annotate_pipeline.py /path/to/video.mov --output-dir /path/to/output
+# Recommended: uses optimized settings (~33s for 62s of 1080p30 on RTX 5090)
+./annotate.sh /path/to/video.mov
 
-# Faster trajectory (less SLAM backend refinement)
-python3 annotate_pipeline.py /path/to/video.mov -o /path/to/output --fast-traj
+# Or with explicit output directory:
+./annotate.sh /path/to/video.mov /path/to/output
 
 # Visualize results
 python3 visualizer.py /path/to/output --port 8888
 # Open http://localhost:8888 in a browser
+
+# Or upload a video through the browser:
+python3 visualizer.py --port 8888
+# Open http://localhost:8888 and drag-and-drop a video
 ```
 
 ### Pipeline options
@@ -188,7 +192,11 @@ python3 -c "import native_decode; print('native_decode OK')"
 Browser-based tool for inspecting output datasets. Shows the video with 2D hand keypoint overlay and a Three.js 3D scene with camera trajectory and hand skeletons.
 
 ```bash
+# View an existing dataset
 python3 visualizer.py /path/to/output_dataset --port 8888
+
+# Upload mode: drag-and-drop a video in the browser to process + visualize
+python3 visualizer.py --port 8888
 ```
 
 Controls:
@@ -205,20 +213,20 @@ Benchmarked on 1858 frames (62s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| Module pre-import | 5s | PL, timm, ultralytics, smplx, wilor (inherited by forked child) |
-| SLAM + hands (forked) | 31s | Separate processes, shared-memory frame transfer |
-| Video conversion | 33s | ffmpeg libx264, fully overlapped |
+| SLAM + hands (split decode) | 23s | Separate processes, each decodes independently |
+| Video conversion | 31s | ffmpeg libx264, fully overlapped |
 | Audio transcription | 14s | Parakeet on CPU, fully overlapped |
-| Dataset assembly | 0.5s | Parquet + info.json |
-| **Total** | **~39s** | Full pipeline with `--fast-traj` |
+| Dataset assembly | 1.6s | Parquet + info.json |
+| **Total** | **~33s** | `./annotate.sh` (recommended settings) |
 
-Five performance techniques keep total time close to the longest single phase:
+Key optimizations (34x faster than naive sequential baseline):
 
-1. **Fork-based multiprocessing** — SLAM and hand pose (YOLO + WiLoR) run in separate processes with separate GILs, connected by a shared-memory ring buffer (256 slots). Eliminates ~20s of GIL contention that serialized the two workloads when threaded.
-2. **Parallel model loading** — The forked child loads YOLO to GPU on the main thread while constructing the WiLoR model on a background CPU thread. This overlaps CUDA init + YOLO load (~1s) with WiLoR construction (~5s), reducing child startup from ~9s to ~5s.
-3. **Triple CUDA streams** — Within the hand worker process, YOLO detection runs on one CUDA stream and WiLoR inference on another, allowing the GPU to overlap both workloads.
-4. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s by memory-mapping weights instead of copying 2.5 GB.
-5. **Full overlap** — Video conversion (ffmpeg subprocess, started before module imports) and audio transcription (Parakeet subprocess on CPU) run entirely in the background, adding zero time to the critical path.
+1. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only). Forked child decodes video independently at full resolution for hand pose. No shared-memory transfer needed.
+2. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API. Decode + resize runs in a native thread that never acquires the Python GIL, so DROID-SLAM's CUDA kernels run concurrently.
+3. **pytorch_lightning stub** — WiLoR inherits from LightningModule but only needs nn.Module at inference. A 10-line stub replaces the full import, saving 3.4s.
+4. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s.
+5. **Fused Triton kernels** — Custom Triton kernels fuse SwiGLU and residual+LayerScale+LayerNorm in the ViT-H backbone, reducing elementwise overhead by 44%.
+6. **Full overlap** — Video conversion (ffmpeg subprocess) and audio transcription (Parakeet on CPU) run entirely in the background, adding zero time to the critical path.
 
 ---
 
