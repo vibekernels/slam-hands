@@ -13,14 +13,30 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from threading import Thread
 from queue import Queue
+
+# ---------------------------------------------------------------------------
+# Suppress known-harmless warnings from third-party libraries.
+# Real errors still surface via stderr/exceptions.
+# ---------------------------------------------------------------------------
+# timm: "Importing from timm.models.layers is deprecated"
+warnings.filterwarnings("ignore", message="Importing from timm.models.layers", category=FutureWarning)
+# smplx/MANO: "You are using a MANO model, with only 10 shape coefficients"
+logging.getLogger("smplx.body_models").setLevel(logging.ERROR)
+# PyTorch: "torch.cross without specifying dim"
+warnings.filterwarnings("ignore", message="Using torch.cross without specifying the dim")
+# NeMo: verbose info/warnings about training data, CUDA graphs, etc.
+for _nemo_logger in ("nemo", "nemo.collections", "nemo.utils", "nemo_logger"):
+    logging.getLogger(_nemo_logger).setLevel(logging.ERROR)
 
 import cv2
 import numpy as np
@@ -120,30 +136,33 @@ def get_video_metadata(video_path: str):
     try:
         nd = _get_native_decode()
         fps, width, height, num_frames = nd.AsyncVideoDecoder.get_metadata(video_path)
-        return fps, width, height, int(num_frames)
+        if width > 0 and height > 0:
+            return fps, width, height, int(num_frames)
+        # Some HEVC containers don't expose dimensions in codecpar before decode
     except (ImportError, AttributeError):
-        # Fallback to ffprobe
-        import subprocess
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
-             video_path],
-            capture_output=True, text=True,
-        )
-        info = json.loads(result.stdout)["streams"][0]
-        w, h = int(info["width"]), int(info["height"])
-        # Parse fps from r_frame_rate "30000/1001" or "30/1"
-        num, den = info["r_frame_rate"].split("/")
-        fps = float(num) / float(den)
-        # nb_frames may be "N/A" for some containers
-        nb = info.get("nb_frames", "N/A")
-        if nb != "N/A":
-            nf = int(nb)
-        else:
-            dur = float(info.get("duration", "0"))
-            nf = int(dur * fps)
-        return fps, w, h, nf
+        pass
+    # Fallback to ffprobe
+    import subprocess
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_streams", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
+         video_path],
+        capture_output=True, text=True,
+    )
+    info = json.loads(result.stdout)["streams"][0]
+    w, h = int(info["width"]), int(info["height"])
+    # Parse fps from r_frame_rate "30000/1001" or "30/1"
+    num, den = info["r_frame_rate"].split("/")
+    fps = float(num) / float(den)
+    # nb_frames may be "N/A" for some containers
+    nb = info.get("nb_frames", "N/A")
+    if nb != "N/A":
+        nf = int(nb)
+    else:
+        dur = float(info.get("duration", "0"))
+        nf = int(dur * fps)
+    return fps, w, h, nf
 
 
 def get_iphone_intrinsics(width: int, height: int):
@@ -1139,11 +1158,12 @@ def _hand_worker_selfdecode(
             wilor_thread = Thread(target=_wilor_inference_loop, daemon=True)
             wilor_thread.start()
 
-            # ── Decode video + YOLO detection: stream frames from native decoder ──
-            nd = _get_native_decode()
-            decoder = nd.AsyncVideoDecoder()
-            # Use small SLAM size (64x64) since we only need RGB frames
-            decoder.start(video_path, 64, 64, slam_only=False, queue_depth=128)
+            # ── Decode video + YOLO detection: stream frames via OpenCV ──
+            # Note: native C++ decoder skips HDR→SDR tonemapping (just swscale
+            # pixel format conversion), producing dark/wrong colors that break
+            # YOLO detection. OpenCV's VideoCapture handles color space conversion
+            # correctly for iPhone HEVC HDR videos.
+            cap = cv2.VideoCapture(video_path)
 
             t_yolo_start = time.perf_counter()
             total_crops = 0
@@ -1192,27 +1212,22 @@ def _hand_worker_selfdecode(
                             )
                         total_crops += len(bboxes)
 
-            # Stream frames from native decoder
+            # Stream frames from OpenCV
             fi = 0
             while True:
-                result = decoder.get_next()
-                if result is None:
+                ret, img_bgr = cap.read()
+                if not ret:
                     break
-                rgb_np, _ = result
-                if rgb_np is None:
-                    fi += 1
-                    continue
 
                 if stride <= 1 or fi % stride == 0:
                     sampled_indices.append(fi)
-                    img_bgr = np.array(rgb_np)[:, :, ::-1].copy()
                     yolo_batch.append((fi, img_bgr))
                     if len(yolo_batch) >= YOLO_BATCH:
                         _flush_yolo()
                         yolo_batch = []
                 fi += 1
 
-            decoder.stop()
+            cap.release()
             num_frames = fi
             _flush_yolo()
             yolo_batch = []
@@ -1973,7 +1988,14 @@ def _load_wilor_cpu(wilor_dir):
         model_cfg.MANO.MEAN_PARAMS = './mano_data/mano_mean_params.npz'
         model_cfg.freeze()
 
-        model = WiLoR(cfg=model_cfg, init_renderer=False)
+        # Suppress smplx "only 10 shape coefficients" print during MANO init
+        with open(os.devnull, 'w') as _devnull:
+            _saved_stdout = sys.stdout
+            sys.stdout = _devnull
+            try:
+                model = WiLoR(cfg=model_cfg, init_renderer=False)
+            finally:
+                sys.stdout = _saved_stdout
 
         # Fast mmap load: tensors stay as memory-mapped views (no copy)
         sd_path = os.path.join(wilor_dir, 'pretrained_models', 'wilor_final_statedict.pt')
@@ -2919,6 +2941,13 @@ def _audio_subprocess_worker(video_path, fps, num_frames, model_name, result_fil
     """
     try:
         import os as _os
+        import logging as _logging
+        import warnings as _warnings
+        # Suppress NeMo/Megatron/OneLogger warnings before import
+        _warnings.filterwarnings("ignore")
+        for _name in ("nemo", "nemo.collections", "nemo.utils", "nemo_logger"):
+            _logging.getLogger(_name).setLevel(_logging.ERROR)
+        _logging.getLogger("onelogger").setLevel(_logging.ERROR)
         try:
             _os.nice(15)  # Lower priority to avoid starving SLAM
         except OSError:
@@ -2930,6 +2959,11 @@ def _audio_subprocess_worker(video_path, fps, num_frames, model_name, result_fil
             with open(result_file, "w") as f:
                 json.dump(None, f)
             return
+
+        # Suppress NeMo's verbose warnings about training config, CUDA graphs, etc.
+        import logging as _logging
+        for _name in ("nemo", "nemo.collections", "nemo.utils", "nemo_logger"):
+            _logging.getLogger(_name).setLevel(_logging.ERROR)
 
         import nemo.collections.asr as nemo_asr
         model = nemo_asr.models.ASRModel.from_pretrained(model_name)
@@ -2994,7 +3028,7 @@ def start_audio_subprocess(video_path, fps, num_frames, model_name):
     env["OMP_NUM_THREADS"] = "2"
     env["MKL_NUM_THREADS"] = "2"
     env["OPENBLAS_NUM_THREADS"] = "2"
-    proc = sp.Popen(cmd, stdout=sp.DEVNULL, stderr=sys.stderr, env=env)
+    proc = sp.Popen(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL, env=env)
     return proc, result_file
 
 

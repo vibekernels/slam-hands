@@ -28,6 +28,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libavutil/log.h>
 #include <libavutil/imgutils.h>
 }
 
@@ -107,9 +108,13 @@ public:
 
     static py::tuple get_metadata(const std::string& video_path) {
         AVFormatContext* fmt_ctx = nullptr;
-        if (avformat_open_input(&fmt_ctx, video_path.c_str(), nullptr, nullptr) < 0)
-            throw std::runtime_error("Cannot open: " + video_path);
+        // Temporarily suppress FFmpeg warnings (e.g. unknown APAC codec)
+        int prev_level = av_log_get_level();
+        av_log_set_level(AV_LOG_FATAL);
+        int open_err = avformat_open_input(&fmt_ctx, video_path.c_str(), nullptr, nullptr);
+        if (open_err < 0) { av_log_set_level(prev_level); throw std::runtime_error("Cannot open: " + video_path); }
         avformat_find_stream_info(fmt_ctx, nullptr);
+        av_log_set_level(prev_level);
 
         int idx = -1;
         for (unsigned i = 0; i < fmt_ctx->nb_streams; i++)
@@ -118,8 +123,27 @@ public:
         if (idx < 0) { avformat_close_input(&fmt_ctx); throw std::runtime_error("No video"); }
 
         auto* s = fmt_ctx->streams[idx];
+        int width = s->codecpar->width, height = s->codecpar->height;
+
+        // Some HEVC containers don't populate codecpar dimensions.
+        // Open the codec to get reliable width/height from the bitstream.
+        if (width <= 0 || height <= 0) {
+            const AVCodec* codec = avcodec_find_decoder(s->codecpar->codec_id);
+            if (codec) {
+                AVCodecContext* dec = avcodec_alloc_context3(codec);
+                if (dec) {
+                    avcodec_parameters_to_context(dec, s->codecpar);
+                    if (avcodec_open2(dec, codec, nullptr) == 0) {
+                        width = dec->width;
+                        height = dec->height;
+                    }
+                    avcodec_free_context(&dec);
+                }
+            }
+        }
+
         auto result = py::make_tuple(
-            av_q2d(s->avg_frame_rate), s->codecpar->width, s->codecpar->height, s->nb_frames);
+            av_q2d(s->avg_frame_rate), width, height, s->nb_frames);
         avformat_close_input(&fmt_ctx);
         return result;
     }
@@ -171,9 +195,13 @@ private:
         AVPacket* pkt = nullptr;
 
         try {
+            // Suppress FFmpeg warnings during open (e.g. unknown APAC codec)
+            int prev_level = av_log_get_level();
+            av_log_set_level(AV_LOG_FATAL);
             if (avformat_open_input(&fmt_ctx, video_path.c_str(), nullptr, nullptr) < 0)
-                throw std::runtime_error("Cannot open video");
+                { av_log_set_level(prev_level); throw std::runtime_error("Cannot open video"); }
             avformat_find_stream_info(fmt_ctx, nullptr);
+            av_log_set_level(prev_level);
 
             int video_idx = -1;
             for (unsigned i = 0; i < fmt_ctx->nb_streams; i++)
@@ -272,6 +300,7 @@ cleanup:
 
 PYBIND11_MODULE(native_decode, m) {
     m.doc() = "GIL-free async video decoder for SLAM pipeline";
+
 
     py::class_<AsyncVideoDecoder>(m, "AsyncVideoDecoder")
         .def(py::init<>())
