@@ -13,7 +13,11 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -760,6 +764,212 @@ requestAnimationFrame(animationLoop);
 """
 
 
+UPLOAD_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LeRobot Dataset Visualizer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; color: #eee; font-family: 'Segoe UI', system-ui, sans-serif;
+       display: flex; align-items: center; justify-content: center; height: 100vh; }
+
+.upload-box {
+    background: #16213e; border: 2px dashed #0f3460; border-radius: 16px;
+    padding: 60px 80px; text-align: center; max-width: 600px; width: 90%;
+    transition: border-color 0.2s;
+}
+.upload-box.dragover { border-color: #e94560; }
+
+.upload-box h1 { font-size: 24px; margin-bottom: 8px; color: #53d8fb; }
+.upload-box p { font-size: 14px; color: #888; margin-bottom: 24px; }
+
+.upload-box input[type="file"] { display: none; }
+
+.upload-btn {
+    background: #e94560; color: #fff; border: none; padding: 12px 32px;
+    border-radius: 8px; font-size: 16px; cursor: pointer;
+}
+.upload-btn:hover { background: #d63851; }
+
+.progress-area { display: none; margin-top: 24px; text-align: left; }
+.progress-area.active { display: block; }
+
+.progress-bar-bg {
+    background: #0f3460; border-radius: 4px; height: 8px; margin: 8px 0 12px;
+}
+.progress-bar {
+    background: #e94560; height: 100%; border-radius: 4px; width: 0%;
+    transition: width 0.3s;
+}
+
+.log-area {
+    background: #0d0d1a; border-radius: 8px; padding: 12px; font-family: monospace;
+    font-size: 12px; max-height: 200px; overflow-y: auto; line-height: 1.5;
+    color: #aaa; white-space: pre-wrap; word-break: break-all;
+}
+
+.status-text { font-size: 13px; color: #53d8fb; }
+.error-text { color: #f87171; }
+</style>
+</head>
+<body>
+<div class="upload-box" id="dropZone">
+    <h1>LeRobot Dataset Visualizer</h1>
+    <p>Upload a video to process through the annotation pipeline</p>
+    <label class="upload-btn" for="fileInput">Choose Video</label>
+    <input type="file" id="fileInput" accept="video/*">
+    <p style="margin-top: 12px; font-size: 12px; color: #555;">or drag and drop</p>
+
+    <div class="progress-area" id="progressArea">
+        <div class="status-text" id="statusText">Uploading...</div>
+        <div class="progress-bar-bg"><div class="progress-bar" id="progressBar"></div></div>
+        <div class="log-area" id="logArea"></div>
+    </div>
+</div>
+
+<script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const progressArea = document.getElementById('progressArea');
+const statusText = document.getElementById('statusText');
+const progressBar = document.getElementById('progressBar');
+const logArea = document.getElementById('logArea');
+
+function handleFile(file) {
+    if (!file) return;
+    progressArea.classList.add('active');
+    statusText.textContent = 'Uploading ' + file.name + '...';
+    progressBar.style.width = '0%';
+    logArea.textContent = '';
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload?filename=' + encodeURIComponent(file.name));
+    xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+            const pct = Math.round(e.loaded / e.total * 100);
+            progressBar.style.width = pct + '%';
+            statusText.textContent = 'Uploading... ' + pct + '%';
+        }
+    };
+    xhr.onload = () => {
+        if (xhr.status === 200) {
+            statusText.textContent = 'Processing video...';
+            progressBar.style.width = '100%';
+            pollStatus();
+        } else {
+            statusText.textContent = 'Upload failed: ' + xhr.statusText;
+            statusText.classList.add('error-text');
+        }
+    };
+    xhr.onerror = () => {
+        statusText.textContent = 'Upload failed (network error)';
+        statusText.classList.add('error-text');
+    };
+    xhr.send(file);
+}
+
+function pollStatus() {
+    const interval = setInterval(() => {
+        fetch('/api/status').then(r => r.json()).then(data => {
+            if (data.log) {
+                logArea.textContent = data.log;
+                logArea.scrollTop = logArea.scrollHeight;
+            }
+            if (data.phase) {
+                statusText.textContent = data.phase;
+            }
+            if (data.state === 'done') {
+                clearInterval(interval);
+                statusText.textContent = 'Done! Loading visualization...';
+                setTimeout(() => window.location.href = '/', 500);
+            } else if (data.state === 'error') {
+                clearInterval(interval);
+                statusText.textContent = 'Processing failed';
+                statusText.classList.add('error-text');
+            }
+        }).catch(() => {});
+    }, 1000);
+}
+
+fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    handleFile(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>
+"""
+
+
+# --- Processing state ---
+_processing = {
+    "state": "idle",   # idle, running, done, error
+    "phase": "",
+    "log": "",
+    "dataset_dir": None,
+}
+
+
+def _run_pipeline(video_path: str, output_dir: str):
+    """Run annotate_pipeline.py in a subprocess, capturing output."""
+    global _processing
+    _processing["state"] = "running"
+    _processing["phase"] = "Starting pipeline..."
+    _processing["log"] = ""
+
+    script = str(Path(__file__).parent / "annotate_pipeline.py")
+    cmd = [
+        sys.executable, script, video_path,
+        "-o", output_dir,
+        "--fast-traj",
+        "--hand-stride", "2",
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        lines = []
+        for line in proc.stdout:
+            lines.append(line.rstrip())
+            # Keep last 50 lines
+            if len(lines) > 50:
+                lines = lines[-50:]
+            _processing["log"] = "\n".join(lines)
+            # Extract phase from pipeline output
+            low = line.lower()
+            if "slam" in low and ("track" in low or "running" in low):
+                _processing["phase"] = "Running SLAM..."
+            elif "hand" in low or "wilor" in low or "yolo" in low:
+                _processing["phase"] = "Detecting hands..."
+            elif "convert" in low or "ffmpeg" in low:
+                _processing["phase"] = "Converting video..."
+            elif "audio" in low or "transcript" in low:
+                _processing["phase"] = "Transcribing audio..."
+            elif "saved" in low or "dataset" in low:
+                _processing["phase"] = "Saving dataset..."
+
+        proc.wait()
+        if proc.returncode == 0:
+            _processing["state"] = "done"
+            _processing["phase"] = "Done!"
+            _processing["dataset_dir"] = output_dir
+        else:
+            _processing["state"] = "error"
+            _processing["phase"] = f"Pipeline failed (exit code {proc.returncode})"
+    except Exception as e:
+        _processing["state"] = "error"
+        _processing["phase"] = f"Error: {e}"
+        _processing["log"] += f"\n{e}"
+
+
 class VisualizerHandler(SimpleHTTPRequestHandler):
     """HTTP handler that serves the visualizer HTML, video, and data API."""
 
@@ -779,22 +989,106 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/upload":
+            self._handle_upload()
+        else:
+            self.send_error(404)
+
+    def _handle_upload(self):
+        global _processing
+
+        if _processing["state"] == "running":
+            self.send_error(409, "Pipeline already running")
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self.send_error(400, "No data")
+            return
+
+        # Get original filename from query string
+        qs = parse_qs(urlparse(self.path).query)
+        filename = qs.get("filename", ["video.mov"])[0]
+        ext = Path(filename).suffix or ".mov"
+
+        # Save to temp file
+        upload_dir = Path(tempfile.gettempdir()) / "visualizer_uploads"
+        upload_dir.mkdir(exist_ok=True)
+        video_path = upload_dir / f"upload_{int(time.time())}{ext}"
+        output_dir = str(upload_dir / f"upload_{int(time.time())}_dataset")
+
+        with open(video_path, "wb") as f:
+            remaining = content_length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"status": "ok"}).encode())
+
+        # Start pipeline in background
+        _processing["state"] = "idle"
+        _processing["dataset_dir"] = output_dir
+        t = threading.Thread(target=_run_pipeline, args=(str(video_path), output_dir), daemon=True)
+        t.start()
+
     def do_GET(self):
         path = urlparse(self.path).path
 
         if path == "/" or path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode())
+            # If we have a dataset loaded, show visualization; otherwise show upload page
+            if self.dataset is not None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(HTML_TEMPLATE.encode())
+            else:
+                # Check if processing just finished
+                if _processing["state"] == "done" and _processing["dataset_dir"]:
+                    try:
+                        ds = load_dataset(_processing["dataset_dir"])
+                        VisualizerHandler.dataset = ds
+                        VisualizerHandler.video_path = ds["video_path"]
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html")
+                        self.end_headers()
+                        self.wfile.write(HTML_TEMPLATE.encode())
+                        return
+                    except Exception:
+                        pass
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(UPLOAD_TEMPLATE.encode())
 
         elif path == "/api/data":
+            if self.dataset is None:
+                self.send_error(404, "No dataset loaded")
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             data = {k: v for k, v in self.dataset.items() if k != "video_path"}
             self.wfile.write(json.dumps(data).encode())
+
+        elif path == "/api/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "state": _processing["state"],
+                "phase": _processing["phase"],
+                "log": _processing["log"],
+            }).encode())
 
         elif path == "/video":
             self._serve_video()
@@ -855,21 +1149,25 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Browser-based LeRobot dataset visualizer")
-    parser.add_argument("dataset", help="Path to LeRobot dataset directory")
+    parser.add_argument("dataset", nargs="?", default=None, help="Path to LeRobot dataset directory (optional — if omitted, shows upload page)")
     parser.add_argument("--port", type=int, default=8888, help="HTTP server port")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     args = parser.parse_args()
 
-    print(f"Loading dataset from {args.dataset}...")
-    dataset = load_dataset(args.dataset)
-    print(f"  {dataset['num_frames']} frames, {dataset['fps']:.1f} fps")
-    print(f"  Video: {dataset['video_path']}")
-    print(f"  SLAM: {'yes' if dataset['has_slam'] else 'no'}")
-    print(f"  Left hand: {'yes' if dataset['has_left_hand'] else 'no'}")
-    print(f"  Right hand: {'yes' if dataset['has_right_hand'] else 'no'}")
-
-    VisualizerHandler.dataset = dataset
-    VisualizerHandler.video_path = dataset["video_path"]
+    if args.dataset:
+        print(f"Loading dataset from {args.dataset}...")
+        dataset = load_dataset(args.dataset)
+        print(f"  {dataset['num_frames']} frames, {dataset['fps']:.1f} fps")
+        print(f"  Video: {dataset['video_path']}")
+        print(f"  SLAM: {'yes' if dataset['has_slam'] else 'no'}")
+        print(f"  Left hand: {'yes' if dataset['has_left_hand'] else 'no'}")
+        print(f"  Right hand: {'yes' if dataset['has_right_hand'] else 'no'}")
+        VisualizerHandler.dataset = dataset
+        VisualizerHandler.video_path = dataset["video_path"]
+    else:
+        print("No dataset specified — starting in upload mode")
+        VisualizerHandler.dataset = None
+        VisualizerHandler.video_path = None
 
     server = HTTPServer((args.host, args.port), VisualizerHandler)
     print(f"\nVisualizer running at http://localhost:{args.port}")
