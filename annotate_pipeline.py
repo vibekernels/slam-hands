@@ -1379,7 +1379,7 @@ def write_lerobot_dataset(
         "task_index": np.zeros(num_frames, dtype=np.int64),
     }
 
-    # SLAM columns — store as list columns (not split scalars)
+    # SLAM columns — fixed-size list columns with explicit float32 dtype
     if slam_result is not None:
         poses = slam_result["poses"]  # [N, 7]: tx,ty,tz,qx,qy,qz,qw
         if len(poses) >= num_frames:
@@ -1389,22 +1389,26 @@ def write_lerobot_dataset(
             poses = np.vstack([poses, pad])
         poses = poses.astype(np.float32)
 
-        data["observation.slam.pose"] = [poses[i].tolist() for i in range(num_frames)]
+        data["observation.slam.pose"] = pa.FixedSizeListArray.from_arrays(
+            pa.array(poses.ravel(), type=pa.float32()), 7)
 
         intrinsics = slam_result["intrinsics"].astype(np.float32)  # [4]: fx,fy,cx,cy
-        data["observation.slam.intrinsics"] = [intrinsics.tolist()] * num_frames
+        intrinsics_tiled = np.tile(intrinsics, (num_frames, 1))
+        data["observation.slam.intrinsics"] = pa.FixedSizeListArray.from_arrays(
+            pa.array(intrinsics_tiled.ravel(), type=pa.float32()), 4)
 
-    # Hand pose columns — flat list columns matching EgoVerse convention
+    # Hand pose columns — Array2D for keypoints, scalar for detected flag
     if hand_result is not None:
         for side in ["left", "right"]:
-            kp3d = hand_result[f"{side}_hand_keypoints_3d"]  # [N, 21, 3]
-            data[f"observation.hand.{side}.keypoints_3d"] = [
-                kp3d[i].flatten().astype(np.float32).tolist() for i in range(num_frames)
-            ]
+            kp3d = hand_result[f"{side}_hand_keypoints_3d"].astype(np.float32)  # [N, 21, 3]
+            kp2d = hand_result[f"{side}_hand_keypoints_2d"].astype(np.float32)  # [N, 21, 2]
 
-            kp2d = hand_result[f"{side}_hand_keypoints_2d"]  # [N, 21, 2]
+            # Store as nested list-of-lists for Array2D compatibility
+            data[f"observation.hand.{side}.keypoints_3d"] = [
+                [kp3d[i, j].tolist() for j in range(21)] for i in range(num_frames)
+            ]
             data[f"observation.hand.{side}.keypoints_2d"] = [
-                kp2d[i].flatten().astype(np.float32).tolist() for i in range(num_frames)
+                [kp2d[i, j].tolist() for j in range(21)] for i in range(num_frames)
             ]
 
             data[f"observation.hand.{side}.detected"] = hand_result[
@@ -1421,12 +1425,25 @@ def write_lerobot_dataset(
     pq.write_table(table, parquet_path)
     print(f"  Data: {parquet_path} ({num_frames} rows)")
 
-    # 4. Write episode metadata
+    # 4. Write episode metadata (all columns required by lerobot v0.5)
     episode_data = {
-        "episode_index": [0],
-        "length": [num_frames],
-        "task_index": [0],
+        "episode_index": pa.array([0], type=pa.int64()),
+        "length": pa.array([num_frames], type=pa.int64()),
+        "task_index": pa.array([0], type=pa.int64()),
+        "tasks": [["default"]],
+        "dataset_from_index": pa.array([0], type=pa.int64()),
+        "dataset_to_index": pa.array([num_frames], type=pa.int64()),
+        "data/chunk_index": pa.array([0], type=pa.int32()),
+        "data/file_index": pa.array([0], type=pa.int32()),
+        "meta/episodes/chunk_index": pa.array([0], type=pa.int32()),
+        "meta/episodes/file_index": pa.array([0], type=pa.int32()),
     }
+    if video_dest.exists():
+        episode_data[f"videos/{VIDEO_KEY}/chunk_index"] = pa.array([0], type=pa.int32())
+        episode_data[f"videos/{VIDEO_KEY}/file_index"] = pa.array([0], type=pa.int32())
+        episode_data[f"videos/{VIDEO_KEY}/from_timestamp"] = pa.array([0.0], type=pa.float32())
+        episode_data[f"videos/{VIDEO_KEY}/to_timestamp"] = pa.array(
+            [(num_frames - 1) / fps], type=pa.float32())
     pq.write_table(pa.table(episode_data), episodes_dir / "file-000.parquet")
 
     # 5. Write tasks

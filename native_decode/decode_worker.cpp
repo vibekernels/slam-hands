@@ -180,7 +180,7 @@ public:
         }
 
         auto result = py::make_tuple(
-            av_q2d(s->avg_frame_rate), width, height, s->nb_frames);
+            av_q2d(s->r_frame_rate), width, height, s->nb_frames);
         avformat_close_input(&fmt_ctx);
         return result;
     }
