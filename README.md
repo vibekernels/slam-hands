@@ -23,6 +23,14 @@ python3 visualizer.py /path/to/output --port 8888
 # Or upload a video through the browser:
 python3 visualizer.py --port 8888
 # Open http://localhost:8888 and drag-and-drop a video
+
+# Service mode: keep models warm for fast repeated processing
+python3 visualizer.py --service --port 8888
+# First video: ~32s, subsequent: ~32s (vs ~39s cold start each time)
+
+# Or use the service programmatically:
+python3 pipeline_service.py --listen
+# Send JSON jobs on stdin: {"video_path": "/path/to/video.mov", "output_dir": "/path/to/output"}
 ```
 
 ### Pipeline options
@@ -227,6 +235,7 @@ Key optimizations (34x faster than naive sequential baseline):
 4. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s.
 5. **Fused Triton kernels** — Custom Triton kernels fuse SwiGLU and residual+LayerScale+LayerNorm in the ViT-H backbone, reducing elementwise overhead by 44%.
 6. **Full overlap** — Video conversion (ffmpeg subprocess) and audio transcription (Parakeet on CPU) run entirely in the background, adding zero time to the critical path.
+7. **Service mode** — `pipeline_service.py` keeps YOLO, WiLoR, and DROID-SLAM loaded across videos. One-time ~10s startup, then each video skips ~6s of imports and model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
 ---
 

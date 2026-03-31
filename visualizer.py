@@ -915,9 +915,44 @@ _processing = {
     "dataset_dir": None,
 }
 
+# Pipeline service instance (initialized lazily or at startup with --service)
+_pipeline_service = None
 
-def _run_pipeline(video_path: str, output_dir: str):
-    """Run annotate_pipeline.py in a subprocess, capturing output."""
+
+def _run_pipeline_service(video_path: str, output_dir: str):
+    """Run pipeline via persistent service (models already warm)."""
+    global _processing
+    _processing["state"] = "running"
+    _processing["phase"] = "Starting pipeline..."
+    _processing["log"] = ""
+
+    lines = []
+    def _on_progress(phase, detail=""):
+        msg = f"{phase} {detail}".strip()
+        lines.append(msg)
+        if len(lines) > 50:
+            lines[:] = lines[-50:]
+        _processing["log"] = "\n".join(lines)
+        _processing["phase"] = phase
+
+    try:
+        _pipeline_service.process_video(
+            video_path, output_dir,
+            fast_traj=True,
+            hand_stride=1,
+            on_progress=_on_progress,
+        )
+        _processing["state"] = "done"
+        _processing["phase"] = "Done!"
+        _processing["dataset_dir"] = output_dir
+    except Exception as e:
+        _processing["state"] = "error"
+        _processing["phase"] = f"Error: {e}"
+        _processing["log"] += f"\n{e}"
+
+
+def _run_pipeline_subprocess(video_path: str, output_dir: str):
+    """Run annotate_pipeline.py in a subprocess (cold start)."""
     global _processing
     _processing["state"] = "running"
     _processing["phase"] = "Starting pipeline..."
@@ -939,11 +974,9 @@ def _run_pipeline(video_path: str, output_dir: str):
         lines = []
         for line in proc.stdout:
             lines.append(line.rstrip())
-            # Keep last 50 lines
             if len(lines) > 50:
                 lines = lines[-50:]
             _processing["log"] = "\n".join(lines)
-            # Extract phase from pipeline output
             low = line.lower()
             if "slam" in low and ("track" in low or "running" in low):
                 _processing["phase"] = "Running SLAM..."
@@ -968,6 +1001,14 @@ def _run_pipeline(video_path: str, output_dir: str):
         _processing["state"] = "error"
         _processing["phase"] = f"Error: {e}"
         _processing["log"] += f"\n{e}"
+
+
+def _run_pipeline(video_path: str, output_dir: str):
+    """Route to service (warm) or subprocess (cold) based on availability."""
+    if _pipeline_service is not None:
+        _run_pipeline_service(video_path, output_dir)
+    else:
+        _run_pipeline_subprocess(video_path, output_dir)
 
 
 class VisualizerHandler(SimpleHTTPRequestHandler):
@@ -1148,11 +1189,27 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
 
 
 def main():
+    global _pipeline_service
+
     parser = argparse.ArgumentParser(description="Browser-based LeRobot dataset visualizer")
     parser.add_argument("dataset", nargs="?", default=None, help="Path to LeRobot dataset directory (optional — if omitted, shows upload page)")
     parser.add_argument("--port", type=int, default=8888, help="HTTP server port")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--service", action="store_true",
+                        help="Keep pipeline models warm for fast repeated processing (~20s vs ~33s per video)")
+    parser.add_argument("--droid-weights", default="/workspace/DROID-SLAM/checkpoints/droid.pth")
+    parser.add_argument("--wilor-dir", default="/workspace/WiLoR")
     args = parser.parse_args()
+
+    # Start persistent pipeline service if requested (must happen before dataset load
+    # because PipelineService forks before CUDA init)
+    if args.service:
+        from pipeline_service import PipelineService
+        print("Starting persistent pipeline service...")
+        _pipeline_service = PipelineService(
+            droid_weights=args.droid_weights,
+            wilor_dir=args.wilor_dir,
+        )
 
     if args.dataset:
         print(f"Loading dataset from {args.dataset}...")
@@ -1170,7 +1227,8 @@ def main():
         VisualizerHandler.video_path = None
 
     server = HTTPServer((args.host, args.port), VisualizerHandler)
-    print(f"\nVisualizer running at http://localhost:{args.port}")
+    mode = "service" if _pipeline_service else "subprocess"
+    print(f"\nVisualizer running at http://localhost:{args.port} (pipeline: {mode})")
     print(f"Press Ctrl+C to stop\n")
 
     try:
@@ -1178,6 +1236,8 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping server...")
         server.shutdown()
+        if _pipeline_service:
+            _pipeline_service.shutdown()
 
 
 if __name__ == "__main__":
