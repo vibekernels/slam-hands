@@ -259,20 +259,18 @@ def build_ffmpeg_cmd_nvenc(
 
 
 def check_scale_cuda_available() -> bool:
-    """Check if ffmpeg's scale_cuda filter actually works (not just listed).
+    """Check if ffmpeg's scale_cuda filter is available.
 
-    Tests a minimal encode to catch CUDA_ERROR_NO_DEVICE errors that occur
-    when the encoder is listed but CUDA isn't accessible to ffmpeg.
+    Checks the filter list rather than running a test encode, since scale_cuda
+    requires CUDA-memory input (hwaccel_output_format=cuda) which can't be
+    produced from a synthetic lavfi source.
     """
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-y",
-             "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.04:r=1",
-             "-vf", "scale_cuda=format=nv12",
-             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            ["ffmpeg", "-hide_banner", "-filters"],
             capture_output=True, text=True, timeout=5,
         )
-        return result.returncode == 0
+        return "scale_cuda" in result.stdout
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return False
 

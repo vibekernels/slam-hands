@@ -995,8 +995,9 @@ def run_slam_and_hand_forked(
     import multiprocessing as mp
     from multiprocessing import shared_memory
 
-    sys.path.insert(0, os.path.join(os.path.dirname(weights_path), "..", "droid_slam"))
-    from droid import Droid
+    # NOTE: Do NOT import droid here — loading the droid_backends CUDA extension
+    # initializes the CUDA driver, which prevents fork. Import after fork instead.
+    droid_slam_path = os.path.join(os.path.dirname(weights_path), "..", "droid_slam")
 
     nd = _get_native_decode()
 
@@ -1032,7 +1033,7 @@ def run_slam_and_hand_forked(
 
     result_path = f"/tmp/hand_result_{os.getpid()}.npz"
 
-    # Fork child BEFORE any CUDA calls in this function
+    # Fork child BEFORE any CUDA calls — droid import deferred to after fork
     child = mp_ctx.Process(
         target=_hand_worker_forked,
         args=(
@@ -1045,6 +1046,10 @@ def run_slam_and_hand_forked(
     child.start()
 
     try:
+        # Import Droid AFTER fork (loading droid_backends.so inits CUDA driver)
+        sys.path.insert(0, droid_slam_path)
+        from droid import Droid
+
         # ── SLAM setup (CUDA init happens here) ──
         slam_args = argparse.Namespace(
             weights=weights_path, buffer=512, image_size=[h1, w1],
@@ -2811,8 +2816,8 @@ def main():
             )
 
     # Pre-import heavy modules so the forked child inherits them (zero re-import).
-    # Import order matters: ultralytics must be imported before fork (hangs otherwise).
-    # No CUDA init, no model creation — just module loading.
+    # These imports must happen BEFORE `from droid import Droid` which initializes
+    # the CUDA driver via droid_backends.so, preventing fork after that point.
     if not args.skip_hands:
         import pytorch_lightning  # noqa: F401
         import timm  # noqa: F401
