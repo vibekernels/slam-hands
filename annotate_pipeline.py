@@ -3311,18 +3311,15 @@ def main():
     video_convert_future = None
     video_convert_proc = None
 
-    # Start video conversion subprocess BEFORE module imports to get ~5s head start.
-    # Uses subprocess (not thread) so it doesn't interfere with fork.
+    # Video conversion deferred until after SLAM+hands complete.
+    # NVENC takes only ~2s on a free GPU but 30+s when competing with SLAM/YOLO/WiLoR
+    # for GPU resources. Running it sequentially after inference is much faster overall.
+    ffmpeg_cmd = None
     if not args.skip_video_convert:
-        import subprocess as _sp
         from convert_video import build_ffmpeg_cmd
         ffmpeg_cmd = build_ffmpeg_cmd(input_path, video_output, max_threads=4)
         if ffmpeg_cmd:
-            print(f"[Background] Starting video conversion (subprocess)...")
-            video_convert_proc = _sp.Popen(
-                ffmpeg_cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                preexec_fn=lambda: os.nice(10),
-            )
+            print(f"[Video conversion] Will run after inference (NVENC, ~2s)")
 
     # Pre-import heavy modules so the forked child inherits them (zero re-import).
     # These imports must happen BEFORE `from droid import Droid` which initializes
@@ -3360,7 +3357,7 @@ def main():
     # Helper to start background audio + video convert
     def _start_bg():
         nonlocal video_convert_future, audio_proc, audio_result_file
-        if not args.skip_video_convert and video_convert_future is None and video_convert_proc is None:
+        if not args.skip_video_convert and video_convert_future is None and video_convert_proc is None and ffmpeg_cmd is None:
             from convert_video import convert_video
             print(f"[Background] Starting video conversion...")
             def _nice_convert():
@@ -3480,7 +3477,7 @@ def main():
             print(f"  Audio: no audio stream or subprocess failed")
             audio_time = 0
 
-    # Collect video conversion result
+    # Run video conversion now that GPU is free (NVENC ~2s on idle GPU)
     if video_convert_proc is not None:
         if video_convert_proc.poll() is not None:
             print(f"\n  Video conversion finished (overlapped)")
@@ -3490,6 +3487,15 @@ def main():
         if video_convert_proc.returncode != 0:
             print(f"  WARNING: ffmpeg failed (code {video_convert_proc.returncode})")
         phase1_time = time.perf_counter() - phase1_start
+    elif ffmpeg_cmd is not None:
+        import subprocess as _sp
+        print(f"\n[Video conversion] Running NVENC...")
+        phase1_start = time.perf_counter()
+        _vc = _sp.run(ffmpeg_cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        phase1_time = time.perf_counter() - phase1_start
+        print(f"  Video conversion: {phase1_time:.1f}s")
+        if _vc.returncode != 0:
+            print(f"  WARNING: ffmpeg failed (code {_vc.returncode})")
     elif video_convert_future is not None:
         if video_convert_future.done():
             print(f"\n  Video conversion finished (overlapped with body)")
