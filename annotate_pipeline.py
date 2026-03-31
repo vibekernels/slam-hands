@@ -1039,12 +1039,11 @@ def _hand_worker_selfdecode(
     """Child process: decode video independently + run YOLO + WiLoR.
 
     Unlike _hand_worker_forked, this does NOT use shared memory. The child
-    decodes the video itself using the native C++ decoder, eliminating the
-    6MB/frame shared memory copy from the parent's critical path. This allows
-    the parent to use slam_only=True (much faster decode).
+    decodes the video with OpenCV and runs YOLO + WiLoR concurrently with
+    SLAM in the parent. This allows the parent to use slam_only=True
+    (fast native C++ decoder) while the child does its own decode.
 
     Inherits all Python imports via fork — no re-import needed.
-    If _wilor_prebuilt_for_fork is set, skips CPU model construction (~2s).
     """
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -1058,25 +1057,15 @@ def _hand_worker_selfdecode(
         from ultralytics import YOLO
 
         with torch.no_grad():
-            # ── Parallel model loading: WiLoR on CPU thread, YOLO on GPU ──
+            t_load = time.perf_counter()
+
+            # ── Phase 1: CPU-only work (overlaps with SLAM tracking) ──
+            # Build WiLoR on CPU thread while we wait for GPU signal
             wilor_load_result = [None]
             def _build_wilor_bg():
                 wilor_load_result[0] = _load_wilor_cpu(wilor_dir)
             wilor_build_thread = Thread(target=_build_wilor_bg, daemon=True)
             wilor_build_thread.start()
-
-            hand_stream = torch.cuda.Stream()
-            wilor_stream = torch.cuda.Stream()
-
-            t_load = time.perf_counter()
-            with torch.cuda.stream(hand_stream):
-                detector = YOLO(
-                    os.path.join(wilor_dir, 'pretrained_models', 'detector.pt'),
-                ).to('cuda')
-            print(f"  [Hand proc] YOLO on GPU ({time.perf_counter()-t_load:.1f}s)", flush=True)
-
-            wilor_build_thread.join()
-            model_cpu, model_cfg = wilor_load_result[0]
 
             orig_cwd = os.getcwd()
             os.chdir(wilor_dir)
@@ -1096,12 +1085,24 @@ def _hand_worker_selfdecode(
             BATCH_SIZE = 48
             YOLO_BATCH = 16
 
+            # ── GPU work (runs concurrently with SLAM in parent) ──
+            hand_stream = torch.cuda.Stream()
+            wilor_stream = torch.cuda.Stream()
+
+            with torch.cuda.stream(hand_stream):
+                detector = YOLO(
+                    os.path.join(wilor_dir, 'pretrained_models', 'detector.pt'),
+                ).to('cuda')
+
+            wilor_build_thread.join()
+            model_cpu, model_cfg = wilor_load_result[0]
+
             with torch.cuda.stream(wilor_stream):
                 model = model_cpu.to('cuda').eval().half()
                 model.backbone.skip_blocks = True
             del model_cpu
             t_ready = time.perf_counter()
-            print(f"  [Hand proc] Ready in {t_ready-t_load:.1f}s (parallel YOLO+WiLoR)", flush=True)
+            print(f"  [Hand proc] Ready in {t_ready-t_load:.1f}s", flush=True)
 
             # Pre-allocate output arrays
             max_frames = max(num_frames_est + 100, 4000)
@@ -1158,18 +1159,11 @@ def _hand_worker_selfdecode(
             wilor_thread = Thread(target=_wilor_inference_loop, daemon=True)
             wilor_thread.start()
 
-            # ── Decode video + YOLO detection: stream frames via OpenCV ──
-            # Note: native C++ decoder skips HDR→SDR tonemapping (just swscale
-            # pixel format conversion), producing dark/wrong colors that break
-            # YOLO detection. OpenCV's VideoCapture handles color space conversion
-            # correctly for iPhone HEVC HDR videos.
-            cap = cv2.VideoCapture(video_path)
-
+            # ── Decode + YOLO detection (streaming from native decoder) ──
             t_yolo_start = time.perf_counter()
             total_crops = 0
             yolo_batch = []
             sampled_indices = []
-            num_frames = 0
 
             prep_pool = TPE(max_workers=4)
 
@@ -1212,13 +1206,15 @@ def _hand_worker_selfdecode(
                             )
                         total_crops += len(bboxes)
 
-            # Stream frames from OpenCV
+            # Stream frames from OpenCV through YOLO
+            # OpenCV uses its own thread pool — doesn't compete with
+            # parent's native decoder for FFmpeg CPU threads.
+            cap = cv2.VideoCapture(video_path)
             fi = 0
             while True:
                 ret, img_bgr = cap.read()
                 if not ret:
                     break
-
                 if stride <= 1 or fi % stride == 0:
                     sampled_indices.append(fi)
                     yolo_batch.append((fi, img_bgr))
@@ -1226,15 +1222,14 @@ def _hand_worker_selfdecode(
                         _flush_yolo()
                         yolo_batch = []
                 fi += 1
-
             cap.release()
-            num_frames = fi
             _flush_yolo()
             yolo_batch = []
 
             prep_pool.shutdown(wait=True)
             crop_queue.put(_SENTINEL)
 
+            num_frames = fi
             t_yolo = time.perf_counter() - t_yolo_start
             print(
                 f"  [Hand proc] Decode+YOLO: {t_yolo:.1f}s "
@@ -1540,8 +1535,9 @@ def run_slam_and_hand_split(
     num_frames_est = num_frames_est if num_frames_est > 0 else 2000
     result_path = f"/tmp/hand_result_{os.getpid()}.npz"
 
-    # Fork child BEFORE any CUDA calls
     mp_ctx = mp.get_context('fork')
+
+    # Fork child BEFORE any CUDA calls
     child = mp_ctx.Process(
         target=_hand_worker_selfdecode,
         args=(
@@ -1983,9 +1979,10 @@ def _load_wilor_cpu(wilor_dir):
         if model_cfg.MODEL.IMAGE_SIZE == 256:
             model_cfg.MODEL.BBOX_SHAPE = [192, 256]
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS', None)
-        model_cfg.MANO.DATA_DIR = './mano_data/'
-        model_cfg.MANO.MODEL_PATH = './mano_data/'
-        model_cfg.MANO.MEAN_PARAMS = './mano_data/mano_mean_params.npz'
+        _mano_dir = os.path.join(wilor_dir, 'mano_data')
+        model_cfg.MANO.DATA_DIR = _mano_dir + '/'
+        model_cfg.MANO.MODEL_PATH = _mano_dir + '/'
+        model_cfg.MANO.MEAN_PARAMS = os.path.join(_mano_dir, 'mano_mean_params.npz')
         model_cfg.freeze()
 
         # Suppress smplx "only 10 shape coefficients" print during MANO init

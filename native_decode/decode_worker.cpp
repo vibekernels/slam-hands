@@ -32,6 +32,43 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
+#include <cmath>
+#include <algorithm>
+
+// Build a 256-entry LUT that converts HLG signal values (as naively
+// quantised to 8-bit by swscale) into SDR BT.709 display values.
+// This approximates the full HLG→SDR conversion chain:
+//   HLG OETF⁻¹ → scene-linear → system gamma (1.2) → BT.709 OETF
+static void build_hlg_to_sdr_lut(uint8_t lut[256]) {
+    // HLG constants (ITU-R BT.2100)
+    const double a = 0.17883277, b = 0.28466892, c = 0.55991073;
+    // System gamma for nominal 1000-nit peak → SDR display
+    const double sys_gamma = 1.2;
+
+    for (int i = 0; i < 256; i++) {
+        double x = i / 255.0;  // HLG signal [0,1]
+
+        // HLG inverse OETF → scene linear light
+        double lin;
+        if (x <= 0.5)
+            lin = (x * x) / 3.0;
+        else
+            lin = (std::exp((x - c) / a) + b) / 12.0;
+
+        // System gamma (OOTF approximation for HLG → display)
+        lin = std::pow(lin, sys_gamma);
+
+        // BT.709 OETF (linear → display gamma)
+        double out;
+        if (lin < 0.018)
+            out = 4.5 * lin;
+        else
+            out = 1.099 * std::pow(lin, 0.45) - 0.099;
+
+        lut[i] = (uint8_t)std::clamp((int)(out * 255.0 + 0.5), 0, 255);
+    }
+}
+
 namespace py = pybind11;
 
 struct DecodedFrame {
@@ -170,9 +207,20 @@ private:
             sws_scale(sws_rgb, frame->data, frame->linesize, 0, src_h,
                       rgb_frame->data, rgb_frame->linesize);
             df.rgb_data.resize(src_h * src_w * 3);
-            for (int y = 0; y < src_h; y++)
-                std::memcpy(df.rgb_data.data() + y * src_w * 3,
-                            rgb_frame->data[0] + y * rgb_frame->linesize[0], src_w * 3);
+            if (has_hlg_lut_) {
+                // Apply HLG→SDR LUT while copying rows
+                for (int y = 0; y < src_h; y++) {
+                    const uint8_t* src_row = rgb_frame->data[0] + y * rgb_frame->linesize[0];
+                    uint8_t* dst_row = df.rgb_data.data() + y * src_w * 3;
+                    int n = src_w * 3;
+                    for (int i = 0; i < n; i++)
+                        dst_row[i] = hlg_lut_[src_row[i]];
+                }
+            } else {
+                for (int y = 0; y < src_h; y++)
+                    std::memcpy(df.rgb_data.data() + y * src_w * 3,
+                                rgb_frame->data[0] + y * rgb_frame->linesize[0], src_w * 3);
+            }
         }
 
         std::unique_lock<std::mutex> lock(mutex_);
@@ -220,33 +268,48 @@ private:
             if (avcodec_open2(dec_ctx, codec, nullptr) < 0)
                 throw std::runtime_error("Cannot open codec");
 
-            int src_w = dec_ctx->width, src_h = dec_ctx->height;
-
-            // swscale: source → BGR24 SLAM resolution (always needed)
-            sws_slam = sws_getContext(src_w, src_h, dec_ctx->pix_fmt,
-                slam_w_, slam_h_, AV_PIX_FMT_BGR24,
-                SWS_BILINEAR, nullptr, nullptr, nullptr);
-
-            // swscale: source → RGB24 full resolution (optional)
-            if (!slam_only_) {
-                sws_rgb = sws_getContext(src_w, src_h, dec_ctx->pix_fmt,
-                    src_w, src_h, AV_PIX_FMT_RGB24,
-                    SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-            }
+            // Dimensions may not be known until first frame (HEVC in MOV).
+            // swscale contexts created lazily after first decoded frame.
+            int src_w = 0, src_h = 0;
+            has_hlg_lut_ = false;
+            bool sws_initialized = false;
 
             frame = av_frame_alloc();
             pkt = av_packet_alloc();
-
             rgb_frame = av_frame_alloc();
-            if (!slam_only_) {
-                rgb_frame->format = AV_PIX_FMT_RGB24;
-                rgb_frame->width = src_w;
-                rgb_frame->height = src_h;
-                av_frame_get_buffer(rgb_frame, 32);
-            }
 
             int slam_linesize = slam_w_ * 3;
             std::vector<uint8_t> slam_buf(slam_h_ * slam_linesize);
+
+            auto init_sws = [&](AVFrame* first_frame) {
+                src_w = first_frame->width;
+                src_h = first_frame->height;
+                auto real_fmt = (AVPixelFormat)first_frame->format;
+
+                // Detect 10-bit HDR (iPhone HLG) and build tonemapping LUT
+                if (real_fmt == AV_PIX_FMT_YUV420P10LE ||
+                    real_fmt == AV_PIX_FMT_YUV420P10BE ||
+                    real_fmt == AV_PIX_FMT_P010LE ||
+                    real_fmt == AV_PIX_FMT_P010BE) {
+                    build_hlg_to_sdr_lut(hlg_lut_);
+                    has_hlg_lut_ = true;
+                }
+
+                sws_slam = sws_getContext(src_w, src_h, real_fmt,
+                    slam_w_, slam_h_, AV_PIX_FMT_BGR24,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+                if (!slam_only_) {
+                    sws_rgb = sws_getContext(src_w, src_h, real_fmt,
+                        src_w, src_h, AV_PIX_FMT_RGB24,
+                        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                    rgb_frame->format = AV_PIX_FMT_RGB24;
+                    rgb_frame->width = src_w;
+                    rgb_frame->height = src_h;
+                    av_frame_get_buffer(rgb_frame, 32);
+                }
+                sws_initialized = true;
+            };
 
             // Main decode loop
             while (av_read_frame(fmt_ctx, pkt) >= 0) {
@@ -255,6 +318,7 @@ private:
                 av_packet_unref(pkt);
                 while (avcodec_receive_frame(dec_ctx, frame) >= 0) {
                     if (done_) goto cleanup;
+                    if (!sws_initialized) init_sws(frame);
                     process_frame(frame, src_w, src_h, sws_rgb, rgb_frame,
                                   sws_slam, slam_buf.data(), slam_linesize);
                 }
@@ -264,6 +328,7 @@ private:
             avcodec_send_packet(dec_ctx, nullptr);
             while (avcodec_receive_frame(dec_ctx, frame) >= 0) {
                 if (done_) goto cleanup;
+                if (!sws_initialized) init_sws(frame);
                 process_frame(frame, src_w, src_h, sws_rgb, rgb_frame,
                               sws_slam, slam_buf.data(), slam_linesize);
             }
@@ -291,6 +356,8 @@ cleanup:
     std::atomic<bool> done_{false};
     std::atomic<int> frame_count_{0};
     std::string error_;
+    bool has_hlg_lut_ = false;
+    uint8_t hlg_lut_[256];
     std::thread worker_;
     std::mutex mutex_;
     std::condition_variable cv_, cv_producer_;
