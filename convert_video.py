@@ -309,6 +309,65 @@ def build_ffmpeg_cmd_fast(
     ]
 
 
+def build_ffmpeg_cmd_nvenc_h264(
+    input_path: str,
+    output_path: str,
+    *,
+    hdr_input: bool = False,
+    gop: int = 2,
+    bitrate: int = 2550,
+    max_threads: int = 0,
+) -> list[str]:
+    """Build ffmpeg command: NVDEC decode + CPU tonemap + h264_nvenc encode.
+
+    Faster than pure CPU (libx264) since NVENC offloads encoding to GPU.
+    CPU cores handle only the tonemapping filters.
+    """
+    total_cores = os.cpu_count() or 4
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            parts = f.read().strip().split()
+            if parts[0] != "max":
+                total_cores = min(total_cores, int(int(parts[0]) / int(parts[1])))
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
+    if max_threads > 0:
+        total_cores = min(total_cores, max_threads)
+
+    cmd = ["ffmpeg", "-y"]
+    if hdr_input:
+        cmd += ["-filter_threads", str(max(1, total_cores))]
+    cmd += ["-hwaccel", "auto"]
+    cmd += ["-i", input_path]
+
+    if hdr_input:
+        vf = (
+            "zscale=t=linear:npl=100"
+            ",format=gbrpf32le"
+            ",tonemap=hable:desat=0"
+            ",zscale=t=bt709:m=bt709:p=bt709:r=tv"
+            ",format=yuv420p"
+        )
+    else:
+        vf = "format=yuv420p"
+    cmd += ["-vf", vf]
+
+    cmd += [
+        "-c:v", "h264_nvenc",
+        "-preset", "p1",
+        "-tune", "ll",
+        "-g", str(gop),
+        "-bf", "0",
+        "-b:v", f"{bitrate}k",
+        "-maxrate", f"{int(bitrate * 1.5)}k",
+        "-bufsize", f"{bitrate * 2}k",
+        "-movflags", "+faststart",
+        "-an",
+        output_path,
+    ]
+    return cmd
+
+
 def build_ffmpeg_cmd_x264_fast(
     input_path: str,
     output_path: str,
@@ -389,6 +448,28 @@ def build_ffmpeg_cmd(input_path: str, output_path: str, fast: bool = False,
     hdr = is_hdr(probe_info)
     quality = 30
     gop = 2
+
+    # Try GPU-accelerated path: NVDEC decode + h264_nvenc encode
+    if check_nvdec_available() and check_nvenc_available():
+        width = video_stream.get("width", 1920)
+        height = video_stream.get("height", 1080)
+        fps = video_stream.get("r_frame_rate", "30000/1001")
+        bitrate = estimate_bitrate(width, height, fps, quality)
+
+        # If scale_cuda is available, use the fully GPU pipeline
+        if check_scale_cuda_available():
+            return build_ffmpeg_cmd_fast(
+                input_path, output_path, gop=gop, bitrate=bitrate,
+            )
+
+        # NVDEC decode + format conversion (no CPU tonemap) + h264_nvenc encode.
+        # Skips tonemapping for speed — HLG's backwards-compatible design means
+        # the truncated 10-bit→8-bit signal looks natural on SDR displays.
+        return build_ffmpeg_cmd_nvenc_h264(
+            input_path, output_path, hdr_input=False, gop=gop, bitrate=bitrate,
+            max_threads=max_threads,
+        )
+
     return build_ffmpeg_cmd_x264_fast(
         input_path, output_path, hdr_input=hdr, quality=quality, gop=gop,
         max_threads=max_threads,

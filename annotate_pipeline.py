@@ -29,6 +29,15 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 
+# PyTorch 2.6+ defaults to weights_only=True in torch.load, which breaks
+# loading YOLO/WiLoR checkpoints that contain custom classes. Patch globally.
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
 _SENTINEL = object()  # End-of-stream marker for concurrent frame queue
 
 # ---------------------------------------------------------------------------
@@ -2793,7 +2802,7 @@ def main():
     if not args.skip_video_convert:
         import subprocess as _sp
         from convert_video import build_ffmpeg_cmd
-        ffmpeg_cmd = build_ffmpeg_cmd(input_path, video_output, max_threads=8)
+        ffmpeg_cmd = build_ffmpeg_cmd(input_path, video_output, max_threads=4)
         if ffmpeg_cmd:
             print(f"[Background] Starting video conversion (subprocess)...")
             video_convert_proc = _sp.Popen(
