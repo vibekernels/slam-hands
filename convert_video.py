@@ -316,6 +316,7 @@ def build_ffmpeg_cmd_x264_fast(
     hdr_input: bool = False,
     quality: int = 23,
     gop: int = 2,
+    max_threads: int = 0,
 ) -> list[str]:
     """Build fast CPU encode command: libx264 ultrafast (~7s for 62s 1080p video).
 
@@ -332,9 +333,15 @@ def build_ffmpeg_cmd_x264_fast(
                 total_cores = min(total_cores, int(int(parts[0]) / int(parts[1])))
     except (FileNotFoundError, ValueError, IndexError):
         pass
+    if max_threads > 0:
+        total_cores = min(total_cores, max_threads)
     # Use ~half the cores for filters (two-pass tonemap is more expensive than
     # single-pass zscale, but produces correct colors). Rest for the encoder.
+    # The expensive filter also acts as a natural rate-limiter: it throttles
+    # frame delivery to the encoder, reducing peak CPU contention when running
+    # concurrently with GPU workloads (SLAM, hand pose).
     filter_threads = max(1, total_cores // 2)
+    encoder_threads = max(2, total_cores - filter_threads)
 
     cmd = ["ffmpeg", "-y"]
     if hdr_input:
@@ -354,11 +361,6 @@ def build_ffmpeg_cmd_x264_fast(
     else:
         vf = "format=yuv420p"
     cmd += ["-vf", vf]
-
-    # Limit x264 threads to actual core count (Docker cgroup), not host CPU count.
-    # Without this, x264 creates 1.5 * os.cpu_count() threads (~180 on host with
-    # 120 logical cores), causing massive oversubscription in cgroup-limited containers.
-    encoder_threads = max(2, total_cores - filter_threads)
     cmd += [
         "-c:v", "libx264",
         "-preset", "ultrafast",
@@ -373,11 +375,13 @@ def build_ffmpeg_cmd_x264_fast(
     return cmd
 
 
-def build_ffmpeg_cmd(input_path: str, output_path: str, fast: bool = False) -> list[str] | None:
+def build_ffmpeg_cmd(input_path: str, output_path: str, fast: bool = False,
+                     max_threads: int = 0) -> list[str] | None:
     """Build the ffmpeg command for video conversion, without running it.
 
     Probes the input and returns the command list, or None if conversion
     is not needed. Used to start ffmpeg as a subprocess early in the pipeline.
+    max_threads: limit total CPU threads (0 = use all available cores).
     """
     input_path = str(Path(input_path).resolve())
     probe_info = probe_video(input_path)
@@ -387,6 +391,7 @@ def build_ffmpeg_cmd(input_path: str, output_path: str, fast: bool = False) -> l
     gop = 2
     return build_ffmpeg_cmd_x264_fast(
         input_path, output_path, hdr_input=hdr, quality=quality, gop=gop,
+        max_threads=max_threads,
     )
 
 

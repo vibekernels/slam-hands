@@ -766,7 +766,7 @@ def _hand_worker_forked(
             img_size_cfg = _cfg.MODEL.IMAGE_SIZE
             rescale_factor = 2.0
             BATCH_SIZE = 48
-            YOLO_BATCH = 32
+            YOLO_BATCH = 16  # smaller batches = less GPU burst, better SLAM interleaving
 
             with torch.cuda.stream(wilor_stream):
                 model = model_cpu.to('cuda').eval().half()
@@ -2793,7 +2793,7 @@ def main():
     if not args.skip_video_convert:
         import subprocess as _sp
         from convert_video import build_ffmpeg_cmd
-        ffmpeg_cmd = build_ffmpeg_cmd(input_path, video_output, fast=True)
+        ffmpeg_cmd = build_ffmpeg_cmd(input_path, video_output, max_threads=8)
         if ffmpeg_cmd:
             print(f"[Background] Starting video conversion (subprocess)...")
             video_convert_proc = _sp.Popen(
