@@ -193,6 +193,33 @@ Previous total (estimated baseline): ~660s (8s decode + 90s SLAM + 25s model loa
 - Eliminates separate 9.3s PyAV body decode pass entirely
 - SLAM phase slower (16.1s vs 8.3s) due to full-res decode, but net saves ~5s end-to-end
 
+### 19. Split decode architecture (no shared memory)
+- Parent runs SLAM with `slam_only=True` native decoder (SLAM-res only, no full-res RGB)
+- Forked child decodes video independently with its own native decoder instance
+- Eliminates shared-memory ring buffer (was 6MB/frame × 1858 frames memcpy overhead)
+- SLAM tracking improves from ~90fps to 150-220fps without full-res decode burden
+- GPU contention between child (YOLO/WiLoR) and parent (DROID-SLAM) is the remaining bottleneck (~5s impact)
+
+### 20. pytorch_lightning stub for inference (3.4s import saved)
+- WiLoR inherits from `pytorch_lightning.LightningModule` but only uses `nn.Module` methods at inference
+- Replace `import pytorch_lightning` with a 10-line stub: `LightningModule = nn.Module` + no-op `save_hyperparameters`/`log`
+- Saves 3.4s of import time (pytorch_lightning pulls in heavy dependencies)
+- Installed before fork so child inherits the stub via `sys.modules`
+
+### 21. WiLoR statedict extraction for mmap loading
+- Extracted `state_dict` from `wilor_final.ckpt` (2.4GB) → `wilor_final_statedict.pt`
+- Child loads statedict with `torch.load(mmap=True)` + `load_state_dict(assign=True)`
+- Avoids parsing full Lightning checkpoint structure in child process
+
+### Final Pipeline Results (1858 frames, 62s video)
+
+| Config | SLAM | Hands | Video | **Total** | vs baseline |
+|---|---|---|---|---|---|
+| + single-decode (RGB+SLAM) + Triton (prev best) | 16.1s | 13.7s | 21s overlapped | **37.5s** | 18x |
+| + split decode + PL stub + statedict mmap | 8-13s | 12-13s | 18s overlapped | **18.6-19.7s** | 34x |
+
+*Warm runs (model cached). Cold start adds ~25s for model loading.
+
 ## What Didn't Work
 - **torch.compile on backbone only**: <1ms improvement, backbone already memory-bound in fp16
 - **bf16 autocast on full model**: MHR head sparse_coo_tensor matmul crashes
@@ -206,3 +233,5 @@ Previous total (estimated baseline): ~660s (8s decode + 90s SLAM + 25s model loa
 - **Streaming decode→SLAM (multiprocessing)**: Frame transfer via SharedMemory costs ~6s (22GB memcpy for 6MB × 1858 frames), negating any overlap savings
 - **NVDEC hardware decode**: hevc_cuvid works but is slower (203fps vs 250fps) due to GPU→CPU transfer for frame.to_rgb()
 - **mmap + assign=True + CPU half()**: Deferred mmap page-in makes .half() take 13s
+- **Pre-building WiLoR before fork**: Constructing MANO/WiLoR model in parent then forking caused child to deadlock at YOLO model loading — unclear root cause but related to inherited model state
+- **Phased decode (all frames first, then GPU inference)**: CPU-only decode of all frames (8.5s) then serial GPU inference was slower (22.5s total) than streaming decode+YOLO together (19.8s) because serial decode doesn't overlap with GPU work
