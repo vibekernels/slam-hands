@@ -222,20 +222,19 @@ Benchmarked on 1858 frames (62s) of 1920x1080 30fps iPhone video, RTX 5090:
 | Phase | Time | Notes |
 |-------|------|-------|
 | SLAM + hands (split decode) | 23s | Separate processes, each decodes independently |
-| Video conversion | 31s | ffmpeg libx264, fully overlapped |
+| Video conversion (h264_nvenc) | 3s | Deferred until after inference (GPU idle) |
 | Audio transcription | 14s | Parakeet on CPU, fully overlapped |
-| Dataset assembly | 1.6s | Parquet + info.json |
+| Dataset assembly | 1s | Parquet + info.json |
 | **Total** | **~33s** | `./annotate.sh` (recommended settings) |
 
-Key optimizations (34x faster than naive sequential baseline):
+Key optimizations:
 
-1. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only). Forked child decodes video independently at full resolution for hand pose. No shared-memory transfer needed.
-2. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API. Decode + resize runs in a native thread that never acquires the Python GIL, so DROID-SLAM's CUDA kernels run concurrently.
+1. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only, 584x328). Forked child decodes video independently with OpenCV at full resolution for hand pose. No shared-memory transfer needed.
+2. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API for SLAM decoding. Decode + swscale resize runs in a native thread that never acquires the Python GIL, so DROID-SLAM's CUDA kernels run concurrently. Includes HLG→SDR tonemapping via precomputed LUT for iPhone HDR video.
 3. **pytorch_lightning stub** — WiLoR inherits from LightningModule but only needs nn.Module at inference. A 10-line stub replaces the full import, saving 3.4s.
 4. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s.
-5. **Fused Triton kernels** — Custom Triton kernels fuse SwiGLU and residual+LayerScale+LayerNorm in the ViT-H backbone, reducing elementwise overhead by 44%.
-6. **Full overlap** — Video conversion (ffmpeg subprocess) and audio transcription (Parakeet on CPU) run entirely in the background, adding zero time to the critical path.
-7. **Service mode** — `pipeline_service.py` keeps YOLO, WiLoR, and DROID-SLAM loaded across videos. One-time ~10s startup, then each video skips ~6s of imports and model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
+5. **Deferred video conversion** — NVENC takes ~3s on an idle GPU but 30+s when competing with SLAM/YOLO/WiLoR for GPU resources. Running it sequentially after inference is much faster overall. Audio transcription (Parakeet, CPU-only) runs fully overlapped in a background subprocess.
+6. **Service mode** — `pipeline_service.py` keeps YOLO, WiLoR, and DROID-SLAM loaded across videos. One-time ~10s startup, then each video skips ~6s of imports and model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
 ---
 
@@ -244,10 +243,10 @@ Key optimizations (34x faster than naive sequential baseline):
 The video converter can also be used independently:
 
 ```bash
-# Fastest (requires NVIDIA GPU with NVDEC + NVENC):
+# Fastest (requires NVIDIA GPU with NVDEC + NVENC + scale_cuda):
 python3 convert_video.py /path/to/iphone_video.mov --fast
 
-# Default (CPU libsvtav1, works everywhere):
+# Default (auto-selects: h264_nvenc if available, else libx264 ultrafast):
 python3 convert_video.py /path/to/iphone_video.mov
 ```
 
@@ -290,13 +289,14 @@ Output must be decodable by PyAV and/or torchcodec (LeRobotDataset's video backe
 
 ### iPhone-specific handling
 
-iPhone videos are typically HEVC Main 10 with HDR (BT.2020 primaries, HLG transfer, Dolby Vision profile 8). The script performs:
+iPhone videos are typically HEVC Main 10 with HDR (BT.2020 primaries, HLG transfer, Dolby Vision profile 8). Conversion behavior depends on the codec path:
 
-- **HDR to SDR tonemapping** via zscale (BT.2020/HLG -> BT.709)
-- **10-bit to 8-bit** conversion (yuv420p10le -> yuv420p)
-- **Color space conversion** (BT.2020 -> BT.709 primaries, matrix, and transfer)
+- **NVENC (default on GPU systems)**: Skips tonemapping — HLG's backwards-compatible design means the 10-bit→8-bit truncation looks natural on SDR displays. Converts to yuv420p + h264_nvenc.
+- **libx264 fallback (no NVENC)**: Full HDR→SDR tonemapping via zscale (BT.2020/HLG → BT.709), 10-bit→8-bit, color space conversion.
+- **`--nvenc` flag**: NVENC AV1 with explicit zscale tonemapping.
+- **`--fast` flag**: Full GPU pipeline (NVDEC → scale_cuda → h264_nvenc), no tonemapping.
 
-Non-HDR inputs skip tonemapping and just do pixel format conversion.
+Non-HDR inputs skip tonemapping in all paths and just do pixel format conversion.
 
 ### Video conversion performance
 

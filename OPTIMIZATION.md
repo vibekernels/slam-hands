@@ -1,4 +1,7 @@
-# SAM-3D-Body Pipeline Optimization Log
+# Annotation Pipeline Optimization Log
+
+Note: Optimizations 1-8 and 11 apply to SAM-3D-Body inference (optional `--body` mode).
+Optimizations 9-10 and 12-25 apply to the main pipeline (DROID-SLAM + WiLoR hands).
 
 ## Hardware
 - RTX 5090 (Blackwell sm_120), 32GB VRAM
@@ -194,10 +197,10 @@ Previous total (estimated baseline): ~660s (8s decode + 90s SLAM + 25s model loa
 - SLAM phase slower (16.1s vs 8.3s) due to full-res decode, but net saves ~5s end-to-end
 
 ### 19. Split decode architecture (no shared memory)
-- Parent runs SLAM with `slam_only=True` native decoder (SLAM-res only, no full-res RGB)
-- Forked child decodes video independently with its own native decoder instance
+- Parent runs SLAM with `slam_only=True` native C++ decoder (SLAM-res only, no full-res RGB)
+- Forked child decodes video independently with OpenCV at full resolution
 - Eliminates shared-memory ring buffer (was 6MB/frame × 1858 frames memcpy overhead)
-- SLAM tracking improves from ~90fps to 150-220fps without full-res decode burden
+- OpenCV in child avoids competing with parent's native decoder for FFmpeg CPU threads
 - GPU contention between child (YOLO/WiLoR) and parent (DROID-SLAM) is the remaining bottleneck (~5s impact)
 
 ### 20. pytorch_lightning stub for inference (3.4s import saved)
@@ -211,25 +214,58 @@ Previous total (estimated baseline): ~660s (8s decode + 90s SLAM + 25s model loa
 - Child loads statedict with `torch.load(mmap=True)` + `load_state_dict(assign=True)`
 - Avoids parsing full Lightning checkpoint structure in child process
 
+### 22. HLG→SDR tonemapping LUT in native decoder
+- iPhone HEVC videos are 10-bit HDR (BT.2020/HLG); swscale converts pixel format but not transfer function
+- Without tonemapping, 10-bit→8-bit naive quantization produces dark/wrong colors
+- Precomputed 256-entry LUT: HLG OETF⁻¹ → scene linear → system gamma (1.2) → BT.709 OETF
+- Applied per-pixel during RGB row copy in C++ — zero overhead vs previous memcpy
+- Detected automatically from first decoded frame's pixel format (yuv420p10le → LUT enabled)
+- Fixes YOLO hand detection on native decoder output (was getting 0 detections without it)
+
+### 23. Deferred NVENC video conversion
+- NVENC takes ~3s on an idle GPU but 30-35s when competing with SLAM/YOLO/WiLoR
+- Previously ran overlapped with inference, causing severe GPU contention
+- Now runs sequentially after SLAM+hands complete, when GPU is idle
+- Net saving: ~28s (31s overlapped → 3s sequential after inference)
+
+### 24. OpenCV decode in child process
+- Previously child used a second native C++ decoder instance
+- Two FFmpeg decoder instances competed for CPU threads, slowing both
+- Child switched to OpenCV VideoCapture which uses its own thread pool
+- SLAM: 82fps (up from ~70fps with two native decoders competing)
+- Slight detection rate drop (~1-2%) from missing HLG tonemapping in OpenCV, acceptable
+
+### 25. Persistent pipeline service (pipeline_service.py)
+- Two-process architecture: parent (DROID-SLAM) + child (YOLO/WiLoR) stay alive across videos
+- Child keeps YOLO + WiLoR on GPU permanently; parent keeps Droid imported
+- JSON-lines IPC over unix socketpair for per-video dispatch
+- Saves ~6s per video (no imports, no model loading)
+- One-time startup: ~10s. Per-video overhead: ~0.5s (fresh Droid instance)
+
 ### Final Pipeline Results (1858 frames, 62s video)
 
 | Config | SLAM | Hands | Video | **Total** | vs baseline |
 |---|---|---|---|---|---|
-| + single-decode (RGB+SLAM) + Triton (prev best) | 16.1s | 13.7s | 21s overlapped | **37.5s** | 18x |
-| + split decode + PL stub + statedict mmap (stride=2) | 8-13s | 12-13s | 18s overlapped | **18.6-19.7s** | 34x |
-| + split decode + PL stub + statedict mmap (stride=1) | 10.9s | 22.5s | 31s overlapped | **33.0s** | 20x |
+| single-decode + Triton (body, prev) | 16.1s | 13.7s | 21s overlapped | **37.5s** | 18x |
+| + split decode + PL stub (stride=1) | 22s | 18s | 3s deferred | **33s** | 20x |
+| + pipeline service (stride=1) | 22s | 18s | 3s deferred | **32s** | 21x |
 
-*Warm runs (model cached). Cold start adds ~25s for model loading.
+*`./annotate.sh` default. SLAM is the critical path (~22s tracking + 1s backend + video + assembly).
+*Service mode: ~10s one-time startup, then ~32s per video (vs ~39s wall time cold start).
 
-**Recommended default: stride=1** (`./annotate.sh`). Stride=2 saves ~14s but introduces 2.4mm interpolation error on hand keypoints. At 33s for 62s of video, stride=1 is fast enough and produces exact per-frame hand poses.
+**Recommended default: stride=1** (`./annotate.sh`). Stride=2 saves ~3s total but introduces interpolation error on hand keypoints. At 33s for 62s of video, stride=1 is fast enough and produces exact per-frame hand poses.
 
 ## What Didn't Work
+
+### SAM-3D-Body specific
 - **torch.compile on backbone only**: <1ms improvement, backbone already memory-bound in fp16
 - **bf16 autocast on full model**: MHR head sparse_coo_tensor matmul crashes
 - **fp16 on decoder/head**: Same sparse op crash
 - **CUDA graphs**: Model uses dynamic control flow (body_batch_idx, hand_batch_idx) — not graph-capturable
 - **bf16 vs fp16 backbone**: <2% difference on Blackwell
 - **Token Merging (ToMe)**: Would break spatial structure needed by decoder cross-attention
+
+### Pipeline-level
 - **Multi-threaded CPU prep**: GIL limits benefit; threaded Queue with single worker is sufficient
 - **CUDA stream double-buffering**: <3% improvement over single-stream pipelining
 - **Streaming decode→SLAM (threading)**: GIL serialization makes it slower than batch approach
@@ -238,3 +274,6 @@ Previous total (estimated baseline): ~660s (8s decode + 90s SLAM + 25s model loa
 - **mmap + assign=True + CPU half()**: Deferred mmap page-in makes .half() take 13s
 - **Pre-building WiLoR before fork**: Constructing MANO/WiLoR model in parent then forking caused child to deadlock at YOLO model loading — unclear root cause but related to inherited model state
 - **Phased decode (all frames first, then GPU inference)**: CPU-only decode of all frames (8.5s) then serial GPU inference was slower (22.5s total) than streaming decode+YOLO together (19.8s) because serial decode doesn't overlap with GPU work
+- **Phased GPU execution (defer child GPU until SLAM done)**: Child waited 16s for SLAM, then took 24s for decode+YOLO — total 53s, worse than concurrent 33s. GPU contention between SLAM and hands costs ~15% on SLAM but concurrent is still faster overall
+- **Overlapped NVENC video conversion**: NVENC competing with SLAM/YOLO/WiLoR for GPU resources caused 32-35s video conversion instead of 2s. Deferring until after inference is much faster overall
+- **Native C++ decoder in child process**: Two native decoder instances (parent SLAM + child hands) competed for FFmpeg CPU threads, slowing both. OpenCV in child avoids this contention
