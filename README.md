@@ -10,7 +10,7 @@ Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0
 ## Quick start
 
 ```bash
-# Recommended: uses optimized settings (~30s for 62s of 1080p30 on RTX 5090)
+# Recommended: uses optimized settings (~29s for 62s of 1080p30 on RTX 5090)
 ./annotate.sh /path/to/video.mov
 
 # Or with explicit output directory:
@@ -26,7 +26,7 @@ python3 visualizer.py --port 8888
 
 # Service mode: keep models warm for fast repeated processing
 python3 visualizer.py --service --port 8888
-# First video: ~30s, subsequent: ~30s (vs ~39s cold start each time)
+# First video: ~29s, subsequent: ~29s (vs ~39s cold start each time)
 
 # Or use the service programmatically:
 python3 pipeline_service.py --listen
@@ -50,7 +50,6 @@ options:
   --hand-det-conf F        YOLO hand detection confidence threshold (default: 0.3)
   --fast-traj              Use fewer SLAM backend steps for faster trajectory
   --slam-backend-steps N N Backend optimization steps (default: 3 5)
-  --wilor-dir PATH         Path to WiLoR repo (default: /workspace/WiLoR)
   --device DEVICE          Torch device (default: cuda)
 ```
 
@@ -87,7 +86,7 @@ The parquet contains per-frame columns:
 - NVIDIA GPU with 11+ GB VRAM (sm_80+: Ampere, Ada Lovelace, Blackwell)
 - CUDA 12.1+ with cuDNN, cuBLAS, cuSOLVER
 - Python 3.10+
-- FFmpeg 6.0+ with ffprobe
+- FFmpeg 6.0+ with ffprobe (built with `--enable-cuvid` for NVDEC hardware decode)
 
 ### System packages
 
@@ -130,30 +129,33 @@ make
 
 The DROID-SLAM checkpoint (`droid.pth`, ~16 MB) can be obtained from the [original repo](https://github.com/princeton-vl/DROID-SLAM). Weights are exported to `cuda_slam/data/weights/` as raw float32 tensors.
 
-### WiLoR
+### CUDA Hand Pose
+
+The hand pose module is a standalone CUDA binary (YOLO detection + WiLoR ViT + MANO) with no PyTorch dependency at inference:
 
 ```bash
-git clone https://github.com/rolpotamias/WiLoR.git
-cd WiLoR
+cd robot-video/cuda_hand
 
-pip install -r requirements.txt
+# Export weights from pretrained models (one-time, requires PyTorch)
+python3 export_weights.py
+
+# Build the binary (requires CUDA 12.1+, cuDNN, cuBLAS, FFmpeg dev headers)
+make
 ```
 
-Key packages this installs: `ultralytics==8.1.34` (YOLO hand detector), `smplx==0.1.28`, `timm`, `pytorch-lightning`, `scikit-image`.
-
-Download model weights:
+The export script requires the original model weights:
 ```bash
+# YOLO hand detector + WiLoR checkpoint
 mkdir -p pretrained_models
 wget https://huggingface.co/spaces/rolpotamias/WiLoR/resolve/main/pretrained_models/detector.pt -P pretrained_models/
 wget https://huggingface.co/spaces/rolpotamias/WiLoR/resolve/main/pretrained_models/wilor_final.ckpt -P pretrained_models/
-```
 
-Download the MANO hand model (requires registration):
-```bash
-# Register at https://mano.is.tue.mpg.de and download MANO_RIGHT.pkl
+# MANO hand model (requires registration at https://mano.is.tue.mpg.de)
 mkdir -p mano_data
 cp /path/to/MANO_RIGHT.pkl mano_data/
 ```
+
+Weights are exported to `cuda_hand/data/weights/` as raw binary tensors. After export, PyTorch is only needed for SLAM weight export — the hand pipeline runs entirely in CUDA.
 
 ### NeMo (Parakeet ASR)
 
@@ -178,8 +180,7 @@ Requires the FFmpeg dev headers installed above. Falls back to OpenCV if not ava
 
 ```bash
 ./cuda_slam/cuda_droid --help 2>&1 | head -1 && echo "CUDA DROID-SLAM OK"
-python3 -c "from wilor.models import load_wilor; print('WiLoR OK')"
-python3 -c "from ultralytics import YOLO; print('YOLO OK')"
+./cuda_hand/cuda_hand --help 2>&1 | head -1 && echo "CUDA Hand Pose OK"
 python3 -c "import nemo.collections.asr; print('NeMo ASR OK')"
 python3 -c "import native_decode; print('native_decode OK')"
 ```
@@ -210,22 +211,22 @@ Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| CUDA SLAM | 26s | 70 fps, batched correlation, frames piped via stdin |
-| Hand detection (stride=1) | 20s | Parallel with SLAM, every frame |
+| CUDA SLAM | 27s | 69 fps, batched correlation, frames piped via stdin |
+| CUDA hand pose (stride=1) | 16s | Parallel with SLAM, NVDEC decode, FP16 YOLO, batched WiLoR ViT |
 | Audio transcription | ~8s | Parakeet on CPU, fully overlapped |
 | Video conversion (h264_nvenc) | ~3s | NVENC runs concurrently (dedicated HW encoder) |
 | Dataset assembly | <1s | Parquet + info.json |
-| **Total** | **~30s** | Service mode (warm), all outputs included |
+| **Total** | **~29s** | Service mode (warm), all outputs included |
 
 Key optimizations:
 
 1. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. Frames are piped directly from the native decoder via stdin, eliminating disk I/O. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos. Batched `cublasSgemmBatched` processes all edge correlations in a single GPU call per update step.
-2. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only, 584x328). Forked child decodes video independently with OpenCV at full resolution for hand pose. No shared-memory transfer needed.
-3. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API for SLAM decoding. Decode + swscale resize runs in a native thread that never acquires the Python GIL. Includes HLG→SDR tonemapping via precomputed LUT for iPhone HDR video.
-4. **pytorch_lightning stub** — WiLoR inherits from LightningModule but only needs nn.Module at inference. A 10-line stub replaces the full import, saving 3.4s.
-5. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s.
+2. **CUDA hand pose** — Pure CUDA reimplementation of the full hand pose pipeline: YOLOv8m detection, WiLoR ViT-H, MANO skinning, and RefineNet. No PyTorch dependency at inference. YOLO runs in FP16 with tensor cores and 8-frame batching (3.5x faster). WiLoR ViT uses FP16 GEMMs with FP32 accumulation via `cublasGemmEx`. All GPU buffers pre-allocated at startup.
+3. **NVDEC hardware video decode** — Hand processing uses NVIDIA's dedicated video decode hardware (`hevc_cuvid`) via FFmpeg. Decoded frames arrive directly in GPU memory (P010/NV12 format), converted to BGR by a custom CUDA kernel. Eliminates CPU decode (5.7s→0.6s) and host-to-device transfer (1.0s→0s).
+4. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only, 584x328). CUDA hand binary decodes video independently via NVDEC at full resolution. No shared-memory transfer needed.
+5. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API for SLAM decoding. Decode + swscale resize runs in a native thread that never acquires the Python GIL. Includes HLG→SDR tonemapping via precomputed LUT for iPhone HDR video.
 6. **Concurrent NVENC video conversion** — NVENC uses a dedicated hardware encoder separate from CUDA cores, so it runs concurrently with SLAM and hand detection. Started at the beginning of the pipeline rather than waiting for inference to complete.
-7. **Service mode** — `pipeline_service.py` keeps YOLO and WiLoR loaded across videos. One-time ~9s startup, then each video skips ~6s of imports and model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
+7. **Service mode** — `pipeline_service.py` keeps models loaded across videos. One-time ~2s startup, then each video skips model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
 ---
 

@@ -15,6 +15,7 @@
 #include <numeric>
 #include <chrono>
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cudnn.h>
@@ -26,6 +27,8 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_cuda.h>
 }
 
 #include "nn.cuh"
@@ -289,6 +292,63 @@ __global__ void wilor_preprocess_kernel(
     output[(crop_idx * 3 + c) * outH * outW + oh * outW + ow] = val;
 }
 
+
+// ============================================================================
+// NVDEC NV12/P010 to BGR conversion kernels
+// ============================================================================
+
+// NV12 (8-bit): Y plane uint8 + interleaved UV plane uint8
+__global__ void nv12_to_bgr_kernel(const uint8_t* y_plane, const uint8_t* uv_plane,
+                                    uint8_t* bgr, int width, int height,
+                                    int y_stride, int uv_stride, int bgr_stride) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    float Y = (float)y_plane[y * y_stride + x];
+    int uv_x = (x / 2) * 2;
+    int uv_y = y / 2;
+    float U = (float)uv_plane[uv_y * uv_stride + uv_x] - 128.0f;
+    float V = (float)uv_plane[uv_y * uv_stride + uv_x + 1] - 128.0f;
+
+    // BT.709 YUV to RGB
+    float R = Y + 1.5748f * V;
+    float G = Y - 0.1873f * U - 0.4681f * V;
+    float B = Y + 1.8556f * U;
+
+    int idx = y * bgr_stride + x * 3;
+    bgr[idx + 0] = (uint8_t)fminf(fmaxf(B + 0.5f, 0.0f), 255.0f);
+    bgr[idx + 1] = (uint8_t)fminf(fmaxf(G + 0.5f, 0.0f), 255.0f);
+    bgr[idx + 2] = (uint8_t)fminf(fmaxf(R + 0.5f, 0.0f), 255.0f);
+}
+
+// P010 (10-bit): Y plane uint16 (10 bits in MSB) + interleaved UV plane uint16
+__global__ void p010_to_bgr_kernel(const uint16_t* y_plane, const uint16_t* uv_plane,
+                                    uint8_t* bgr, int width, int height,
+                                    int y_stride_bytes, int uv_stride_bytes, int bgr_stride) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    // P010: 16-bit values with 10 bits in MSB, shift right by 6 for 10-bit value
+    int y_stride = y_stride_bytes / 2;  // stride in uint16 elements
+    int uv_stride = uv_stride_bytes / 2;
+    float Y = (float)(y_plane[y * y_stride + x] >> 6) / 4.0f;  // scale 10-bit to 8-bit range
+    int uv_x = (x / 2) * 2;
+    int uv_y = y / 2;
+    float U = (float)(uv_plane[uv_y * uv_stride + uv_x] >> 6) / 4.0f - 128.0f;
+    float V = (float)(uv_plane[uv_y * uv_stride + uv_x + 1] >> 6) / 4.0f - 128.0f;
+
+    // BT.709 YUV to RGB
+    float R = Y + 1.5748f * V;
+    float G = Y - 0.1873f * U - 0.4681f * V;
+    float B = Y + 1.8556f * U;
+
+    int idx = y * bgr_stride + x * 3;
+    bgr[idx + 0] = (uint8_t)fminf(fmaxf(B + 0.5f, 0.0f), 255.0f);
+    bgr[idx + 1] = (uint8_t)fminf(fmaxf(G + 0.5f, 0.0f), 255.0f);
+    bgr[idx + 2] = (uint8_t)fminf(fmaxf(R + 0.5f, 0.0f), 255.0f);
+}
 
 // ============================================================================
 // YOLO preprocessing: resize + normalize + HWC->CHW
@@ -1978,6 +2038,9 @@ static void process_video(
     AVFrame* av_frame = nullptr;
     AVFrame* bgr_frame = nullptr;
     AVPacket* pkt = nullptr;
+    bool using_nvdec = false;
+    bool nvdec_is_p010 = false;  // true for 10-bit P010, false for 8-bit NV12
+    AVBufferRef* hw_device_ctx = nullptr;
 
     if (video_mode) {
         if (avformat_open_input(&fmt_ctx, video_path.c_str(), nullptr, nullptr) < 0) {
@@ -1998,29 +2061,82 @@ static void process_video(
         }
 
         auto* codecpar = fmt_ctx->streams[video_stream_idx]->codecpar;
-        const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
-        dec_ctx = avcodec_alloc_context3(codec);
-        avcodec_parameters_to_context(dec_ctx, codecpar);
-        // Use 4 decode threads for speed
-        dec_ctx->thread_count = 4;
-        avcodec_open2(dec_ctx, codec, nullptr);
+
+        // Try NVDEC (CUVID) hardware decoder first
+        const char* cuvid_name = nullptr;
+        if (codecpar->codec_id == AV_CODEC_ID_HEVC) cuvid_name = "hevc_cuvid";
+        else if (codecpar->codec_id == AV_CODEC_ID_H264) cuvid_name = "h264_cuvid";
+        else if (codecpar->codec_id == AV_CODEC_ID_AV1) cuvid_name = "av1_cuvid";
+
+        const AVCodec* codec = nullptr;
+        if (cuvid_name) {
+            codec = avcodec_find_decoder_by_name(cuvid_name);
+            if (codec) {
+                dec_ctx = avcodec_alloc_context3(codec);
+                avcodec_parameters_to_context(dec_ctx, codecpar);
+                // Create CUDA hw device context using OUR primary CUDA context
+                // so that decoded frame pointers are valid in our kernels
+                {
+                    CUcontext cu_ctx;
+                    cuCtxGetCurrent(&cu_ctx);
+                    if (!cu_ctx) { cudaFree(0); cuCtxGetCurrent(&cu_ctx); }
+                    hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_CUDA);
+                    if (hw_device_ctx) {
+                        AVHWDeviceContext* device_ctx = (AVHWDeviceContext*)hw_device_ctx->data;
+                        AVCUDADeviceContext* cuda_ctx = (AVCUDADeviceContext*)device_ctx->hwctx;
+                        cuda_ctx->cuda_ctx = cu_ctx;
+                        cuda_ctx->stream = nullptr;
+                        av_hwdevice_ctx_init(hw_device_ctx);
+                    }
+                }
+                if (hw_device_ctx) {
+                    dec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+                    if (avcodec_open2(dec_ctx, codec, nullptr) == 0) {
+                        using_nvdec = true;
+                        nvdec_is_p010 = (codecpar->bits_per_raw_sample > 8) ||
+                                         (codecpar->format == AV_PIX_FMT_YUV420P10LE);
+                        fprintf(stderr, "[cuda_hand] Using NVDEC hardware decoder (%s, %s)\n",
+                                cuvid_name, nvdec_is_p010 ? "P010" : "NV12");
+                    } else {
+                        avcodec_free_context(&dec_ctx);
+                        dec_ctx = nullptr;
+                    }
+                } else {
+                    avcodec_free_context(&dec_ctx);
+                    dec_ctx = nullptr;
+                    hw_device_ctx = nullptr;
+                }
+            }
+        }
+
+        // Fallback to CPU decoder
+        if (!using_nvdec) {
+            codec = avcodec_find_decoder(codecpar->codec_id);
+            dec_ctx = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(dec_ctx, codecpar);
+            dec_ctx->thread_count = 4;
+            avcodec_open2(dec_ctx, codec, nullptr);
+            fprintf(stderr, "[cuda_hand] Using CPU decoder (fallback)\n");
+        }
 
         int vW = dec_ctx->width, vH = dec_ctx->height;
         int total_video_frames = (int)fmt_ctx->streams[video_stream_idx]->nb_frames;
         fprintf(stderr, "[cuda_hand] Video: %dx%d, ~%d frames, stride=%d\n",
                 vW, vH, total_video_frames, stride);
 
-        // Setup BGR converter
-        sws_ctx = sws_getContext(vW, vH, dec_ctx->pix_fmt,
-                                 vW, vH, AV_PIX_FMT_BGR24,
-                                 SWS_BILINEAR, nullptr, nullptr, nullptr);
+        // Setup BGR converter (only needed for CPU decode path)
+        if (!using_nvdec) {
+            sws_ctx = sws_getContext(vW, vH, dec_ctx->pix_fmt,
+                                     vW, vH, AV_PIX_FMT_BGR24,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+            bgr_frame = av_frame_alloc();
+            bgr_frame->format = AV_PIX_FMT_BGR24;
+            bgr_frame->width = vW;
+            bgr_frame->height = vH;
+            av_frame_get_buffer(bgr_frame, 32);
+        }
 
         av_frame = av_frame_alloc();
-        bgr_frame = av_frame_alloc();
-        bgr_frame->format = AV_PIX_FMT_BGR24;
-        bgr_frame->width = vW;
-        bgr_frame->height = vH;
-        av_frame_get_buffer(bgr_frame, 32);
         pkt = av_packet_alloc();
 
         // Pre-init YOLO with batch size for better GPU utilization
@@ -2202,23 +2318,47 @@ static void process_video(
             int cur_frame_idx = frame_idx;
             frame_idx++;
 
-            sws_scale(sws_ctx, av_frame->data, av_frame->linesize, 0, H,
-                       bgr_frame->data, bgr_frame->linesize);
-            auto t1 = now();
-            t_decode_total += secs(t0, t1);
-
-            // Upload to batch buffer slot
             uint8_t* dst = (uint8_t*)d_frame_buf.data + n_in_batch * single_frame_bytes;
-            if (bgr_frame->linesize[0] == W * 3) {
-                CUDA_CHECK(cudaMemcpy(dst, bgr_frame->data[0], single_frame_bytes, cudaMemcpyHostToDevice));
-            } else {
-                for (int row = 0; row < H; row++) {
-                    CUDA_CHECK(cudaMemcpy(dst + row * W * 3,
-                                          bgr_frame->data[0] + row * bgr_frame->linesize[0],
-                                          W * 3, cudaMemcpyHostToDevice));
+
+            if (using_nvdec) {
+                // NVDEC path: frame data is already on GPU in NV12/P010 format
+                // av_frame->data[0] = Y plane (GPU ptr), av_frame->data[1] = UV plane (GPU ptr)
+                dim3 block(32, 8);
+                dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+                int bgr_stride = W * 3;
+
+                if (nvdec_is_p010) {
+                    p010_to_bgr_kernel<<<grid, block>>>(
+                        (const uint16_t*)av_frame->data[0],
+                        (const uint16_t*)av_frame->data[1],
+                        dst, W, H,
+                        av_frame->linesize[0], av_frame->linesize[1], bgr_stride);
+                } else {
+                    nv12_to_bgr_kernel<<<grid, block>>>(
+                        av_frame->data[0], av_frame->data[1],
+                        dst, W, H,
+                        av_frame->linesize[0], av_frame->linesize[1], bgr_stride);
                 }
+                auto t1 = now();
+                t_decode_total += secs(t0, t1);
+            } else {
+                // CPU decode path: sws_scale + cudaMemcpy
+                sws_scale(sws_ctx, av_frame->data, av_frame->linesize, 0, H,
+                           bgr_frame->data, bgr_frame->linesize);
+                auto t1 = now();
+                t_decode_total += secs(t0, t1);
+
+                if (bgr_frame->linesize[0] == W * 3) {
+                    CUDA_CHECK(cudaMemcpy(dst, bgr_frame->data[0], single_frame_bytes, cudaMemcpyHostToDevice));
+                } else {
+                    for (int row = 0; row < H; row++) {
+                        CUDA_CHECK(cudaMemcpy(dst + row * W * 3,
+                                              bgr_frame->data[0] + row * bgr_frame->linesize[0],
+                                              W * 3, cudaMemcpyHostToDevice));
+                    }
+                }
+                t_upload_total += secs(t1, now());
             }
-            t_upload_total += secs(t1, now());
 
             // Initialize frame result
             FrameResult fr;
@@ -2350,11 +2490,12 @@ static void process_video(
 
     if (video_mode) {
         av_frame_free(&av_frame);
-        av_frame_free(&bgr_frame);
+        if (bgr_frame) av_frame_free(&bgr_frame);
         av_packet_free(&pkt);
-        sws_freeContext(sws_ctx);
+        if (sws_ctx) sws_freeContext(sws_ctx);
         avcodec_free_context(&dec_ctx);
         avformat_close_input(&fmt_ctx);
+        if (hw_device_ctx) av_buffer_unref(&hw_device_ctx);
     }
     auto t_program_end = std::chrono::high_resolution_clock::now();
     double t_total_prog = std::chrono::duration<double>(t_program_end - t_program_start).count();
