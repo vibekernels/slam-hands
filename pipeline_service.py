@@ -355,9 +355,8 @@ class PipelineService:
         return dataset_path
 
     def _run_slam(self, video_path, fps, width, height, fast_traj=True, backend_steps=(3, 5)):
-        """Run CUDA DROID-SLAM on a single video, piping frames via stdin."""
+        """Run CUDA DROID-SLAM on a single video with NVDEC hardware decode."""
         import tempfile
-        import threading
 
         h0, w0 = height, width
         scale = np.sqrt((384 * 512) / (h0 * w0))
@@ -380,12 +379,13 @@ class PipelineService:
             with open(calib_path, "wb") as f:
                 f.write(struct.pack("4f", fx_s, fy_s, cx_s, cy_s))
 
-            # Build command with stdin mode (pipe frames directly, no disk I/O)
+            # Build command with video mode (NVDEC decode + GPU resize)
             cmd = [
                 self._cuda_slam_bin,
                 "--weights", self._cuda_slam_weights,
                 "--calib", calib_path,
-                "--stdin", str(h1), str(w1),
+                "--video", video_path,
+                "--resize", str(h1), str(w1),
                 "--max-frames", "99999",
                 "--cam-to-world",
                 "--pose-output", pose_path,
@@ -397,49 +397,29 @@ class PipelineService:
                 cmd += ["--backend", str(backend_steps[0]), str(backend_steps[1])]
 
             t_slam_start = time.perf_counter()
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            # Feed decoded frames via stdin in a background thread
-            num_frames_box = [0]
-            feed_error = [None]
-
-            def feed_frames():
-                decoder = self._nd.AsyncVideoDecoder()
-                decoder.start(video_path, w1, h1, slam_only=True, queue_depth=128)
-                n = 0
-                try:
-                    while True:
-                        result = decoder.get_next()
-                        if result is None:
-                            break
-                        _, slam_bgr = result
-                        proc.stdin.write(slam_bgr.astype(np.float32).tobytes())
-                        n += 1
-                except (BrokenPipeError, OSError) as e:
-                    feed_error[0] = e
-                finally:
-                    decoder.stop()
-                    try:
-                        proc.stdin.close()
-                    except OSError:
-                        pass
-                    num_frames_box[0] = n
-
-            feeder = threading.Thread(target=feed_frames, daemon=True)
-            feeder.start()
 
             stdout_bytes = proc.stdout.read()
             proc.wait()
-            feeder.join()
 
-            num_frames = num_frames_box[0]
             t_slam = time.perf_counter() - t_slam_start
 
             if proc.returncode != 0:
                 stderr_text = proc.stderr.read().decode(errors="replace")
                 print(f"  CUDA SLAM stderr: {stderr_text[-500:]}", flush=True)
                 raise RuntimeError(f"CUDA DROID-SLAM failed (code {proc.returncode})")
+
+            # Parse frame count from stdout
+            stdout_text = stdout_bytes.decode(errors="replace")
+            num_frames = 0
+            for line in stdout_text.split("\n"):
+                if "keyframes from" in line:
+                    # "=== Final Poses (130 keyframes from 1829 frames) ==="
+                    try:
+                        num_frames = int(line.split("from")[1].split("frames")[0].strip())
+                    except (ValueError, IndexError):
+                        pass
 
             print(f"  CUDA SLAM: {t_slam:.1f}s ({num_frames} frames, "
                   f"{num_frames/t_slam:.0f} fps)", flush=True)
