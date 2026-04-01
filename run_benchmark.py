@@ -31,7 +31,7 @@ print("=" * 60)
 t1 = time.perf_counter()
 result = service.process_video(
     "/workspace/IMG_1466.mov", output_dir,
-    fast_traj=True, hand_det_conf=0.3,
+    fast_traj=True, hand_det_conf=0.3, hand_stride=1,
 )
 t1 = time.perf_counter() - t1
 print(f"  => {t1:.1f}s")
@@ -47,7 +47,7 @@ print("=" * 60)
 t2 = time.perf_counter()
 result = service.process_video(
     "/workspace/IMG_1466.mov", output_dir,
-    fast_traj=True, hand_det_conf=0.3,
+    fast_traj=True, hand_det_conf=0.3, hand_stride=1,
 )
 t2 = time.perf_counter() - t2
 print(f"  => {t2:.1f}s")
@@ -63,7 +63,7 @@ print("=" * 60)
 t3 = time.perf_counter()
 result = service.process_video(
     "/workspace/IMG_1466.mov", output_dir,
-    fast_traj=True, hand_det_conf=0.3,
+    fast_traj=True, hand_det_conf=0.3, hand_stride=1,
 )
 t3 = time.perf_counter() - t3
 print(f"  => {t3:.1f}s")

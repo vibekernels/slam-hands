@@ -210,21 +210,21 @@ Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| CUDA SLAM | 24s | 76 fps, frames piped via stdin |
-| Hand detection (stride=2) | 11s | Parallel with SLAM, interpolated |
+| CUDA SLAM | 26s | 70 fps, batched correlation, frames piped via stdin |
+| Hand detection (stride=1) | 20s | Parallel with SLAM, every frame |
 | Audio transcription | ~8s | Parakeet on CPU, fully overlapped |
-| Video conversion (h264_nvenc) | 2.4s | Deferred until after inference (GPU idle) |
+| Video conversion (h264_nvenc) | ~3s | NVENC runs concurrently (dedicated HW encoder) |
 | Dataset assembly | <1s | Parquet + info.json |
 | **Total** | **~30s** | Service mode (warm), all outputs included |
 
 Key optimizations:
 
-1. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. Frames are piped directly from the native decoder via stdin, eliminating disk I/O. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos.
+1. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. Frames are piped directly from the native decoder via stdin, eliminating disk I/O. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos. Batched `cublasSgemmBatched` processes all edge correlations in a single GPU call per update step.
 2. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only, 584x328). Forked child decodes video independently with OpenCV at full resolution for hand pose. No shared-memory transfer needed.
 3. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API for SLAM decoding. Decode + swscale resize runs in a native thread that never acquires the Python GIL. Includes HLG→SDR tonemapping via precomputed LUT for iPhone HDR video.
 4. **pytorch_lightning stub** — WiLoR inherits from LightningModule but only needs nn.Module at inference. A 10-line stub replaces the full import, saving 3.4s.
 5. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s.
-6. **Deferred video conversion** — NVENC takes ~3s on an idle GPU but 30+s when competing with SLAM/YOLO/WiLoR for GPU resources. Running it sequentially after inference is much faster overall.
+6. **Concurrent NVENC video conversion** — NVENC uses a dedicated hardware encoder separate from CUDA cores, so it runs concurrently with SLAM and hand detection. Started at the beginning of the pipeline rather than waiting for inference to complete.
 7. **Service mode** — `pipeline_service.py` keeps YOLO and WiLoR loaded across videos. One-time ~9s startup, then each video skips ~6s of imports and model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
 ---

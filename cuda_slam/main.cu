@@ -697,6 +697,91 @@ __global__ void coords_hw2_to_2hw(
     chw[1 * HW + idx] = hw2[idx * 2 + 1];  // y channel
 }
 
+// Batched version: [M, H*W, 2] -> [M, 2, H*W]
+__global__ void batch_coords_hw2_to_2hw(
+    const float* __restrict__ hw2,  // [M*H*W*2]
+    float* __restrict__ chw,        // [M*2*H*W]
+    int M, int HW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * HW) return;
+    int e = idx / HW;
+    int k = idx % HW;
+    chw[e * 2 * HW + 0 * HW + k] = hw2[e * HW * 2 + k * 2 + 0];
+    chw[e * 2 * HW + 1 * HW + k] = hw2[e * HW * 2 + k * 2 + 1];
+}
+
+// Simple 2x2 average pooling kernel for batched correlation pyramid building
+// Input: [N, H, W], Output: [N, H/2, W/2]
+__global__ void avg_pool_2x2_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int H, int W)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int oH = H / 2, oW = W / 2;
+    int total = N * oH * oW;
+    if (idx >= total) return;
+
+    int n = idx / (oH * oW);
+    int rem = idx % (oH * oW);
+    int oy = rem / oW;
+    int ox = rem % oW;
+
+    int iy = oy * 2, ix = ox * 2;
+    const float* in_n = input + (size_t)n * H * W;
+    float val = 0.25f * (in_n[iy * W + ix] + in_n[iy * W + ix + 1] +
+                         in_n[(iy + 1) * W + ix] + in_n[(iy + 1) * W + ix + 1]);
+    output[(size_t)n * oH * oW + oy * oW + ox] = val;
+}
+
+// Batched correlation sampling: sample from batch of correlation volumes+pyramids
+// Output layout: [M, 196, hw] where 196 = 4_levels * 7*7
+// This kernel handles one level; level_idx offsets into the 196 channels
+__global__ void batch_corr_sample_kernel(
+    const float* __restrict__ volumes,  // [M, hw, H2, W2] for this level
+    const float* __restrict__ coords,   // [M, 2, H1, W1]
+    float* __restrict__ corr_out,       // [M, 196, H1*W1] base pointer
+    int M, int r, int H1, int W1, int H2, int W2, int hw,
+    float coord_scale, int level_idx)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int e = blockIdx.z;
+    if (y >= H1 || x >= W1 || e >= M) return;
+
+    int D = 2 * r + 1;
+    int hw1 = H1 * W1;
+    float x0 = coords[e * 2 * hw1 + 0 * hw1 + y * W1 + x] * coord_scale;
+    float y0 = coords[e * 2 * hw1 + 1 * hw1 + y * W1 + x] * coord_scale;
+    float dx = x0 - floorf(x0);
+    float dy = y0 - floorf(y0);
+
+    int rd = 2 * r + 1;
+    const float* vol = volumes + (size_t)e * hw * H2 * W2;
+    // Output offset: edge e starts at e*196*hw1, this level starts at level_idx*D*D*hw1
+    float* out = corr_out + (size_t)e * 196 * hw1 + level_idx * D * D * hw1;
+    int src = y * W1 + x;
+
+    for (int i = 0; i < rd + 1; i++) {
+        for (int j = 0; j < rd + 1; j++) {
+            int x1 = (int)floorf(x0) - r + i;
+            int y1 = (int)floorf(y0) - r + j;
+            if (y1 >= 0 && y1 < H2 && x1 >= 0 && x1 < W2) {
+                float s = vol[src * H2 * W2 + y1 * W2 + x1];
+                if (i > 0 && j > 0)
+                    out[((i-1)*D + (j-1)) * hw1 + src] += s * dx * dy;
+                if (i > 0 && j < rd)
+                    out[((i-1)*D + j) * hw1 + src] += s * dx * (1.0f-dy);
+                if (i < rd && j > 0)
+                    out[(i*D + (j-1)) * hw1 + src] += s * (1.0f-dx) * dy;
+                if (i < rd && j < rd)
+                    out[(i*D + j) * hw1 + src] += s * (1.0f-dx) * (1.0f-dy);
+            }
+        }
+    }
+}
+
 // ============ Batched edge gather/scatter kernels ============
 
 // Gather per-keyframe features into contiguous batch buffer using edge indices
@@ -793,14 +878,21 @@ struct CudaDroid {
     GpuBuf preproc_buf;  // preprocessed image
 
     // Correlation buffers (per-edge, reused in loop)
-    GpuBuf corr_volume;  // [H*W, H*W] for one edge
+    GpuBuf corr_volume;  // [H*W, H*W] for one edge (motion filter)
     GpuBuf corr_pyramid[4];
     GpuBuf coords_scaled; // [2, h, w]
 
+    // Batched correlation buffers
+    GpuBuf batch_corr_vols;  // [CORR_BATCH, hw, hw]
+    GpuBuf batch_corr_pyr[4]; // batched pyramid levels
+    float **d_Aptr, **d_Bptr, **d_Cptr;  // device pointer arrays
+    float **h_Aptr, **h_Bptr, **h_Cptr;  // host pointer arrays
+
     // Batched buffers for edge processing
     GpuBuf batch_corr;    // [MAX_BATCH, 196, h, w]
-    GpuBuf batch_coords;  // [MAX_BATCH, 2, h, w] - channel-first format
-    GpuBuf coords_hw2;    // [h*w*2] temp for projmap output (interleaved)
+    GpuBuf batch_coords;      // [MAX_BATCH, 2, h, w] - channel-first format
+    GpuBuf batch_coords_hw2;  // [MAX_BATCH, h*w, 2] - projmap output (interleaved)
+    GpuBuf coords_hw2;        // [h*w*2] temp for projmap output (single edge)
     GpuBuf batch_motion;  // [MAX_BATCH, 4, h, w]
     GpuBuf batch_nets;    // [MAX_BATCH, 128, h, w] - gathered edge nets
     GpuBuf batch_inps;    // [MAX_BATCH, 128, h, w] - gathered inp features
@@ -857,19 +949,33 @@ struct CudaDroid {
         workspace.alloc(64 * 1024 * 1024 / sizeof(float));  // 64MB workspace
         preproc_buf.alloc(3 * H * W);
 
-        // Correlation buffers (per-edge, reused in loop)
+        // Correlation buffers — single-edge (for motion filter)
         corr_volume.alloc(hw * hw);
-        // Pyramid levels 1-3 (level 0 uses corr_volume directly)
         for (int l = 1; l < 4; l++) {
             int ph = h >> l, pw = w >> l;
             corr_pyramid[l].alloc(hw * ph * pw);
         }
         coords_scaled.alloc(2 * hw);
 
+        // Batched correlation buffers (for run_update_pass)
+        static const int CORR_BATCH = MAX_BATCH_EDGES;  // batch all edges at once
+        batch_corr_vols.alloc((size_t)CORR_BATCH * hw * hw);
+        for (int l = 1; l < 4; l++) {
+            int ph = h >> l, pw = w >> l;
+            batch_corr_pyr[l].alloc((size_t)CORR_BATCH * hw * ph * pw);
+        }
+        // Device pointer arrays for cublasSgemmBatched
+        CUDA_CHECK(cudaMalloc(&d_Aptr, CORR_BATCH * sizeof(float*)));
+        CUDA_CHECK(cudaMalloc(&d_Bptr, CORR_BATCH * sizeof(float*)));
+        CUDA_CHECK(cudaMalloc(&d_Cptr, CORR_BATCH * sizeof(float*)));
+        h_Aptr = new float*[CORR_BATCH];
+        h_Bptr = new float*[CORR_BATCH];
+        h_Cptr = new float*[CORR_BATCH];
+
         // Batched edge buffers
         batch_corr.alloc(MAX_BATCH_EDGES * 196 * hw);
         batch_coords.alloc(MAX_BATCH_EDGES * 2 * hw);
-        coords_hw2.alloc(hw * 2);  // temp for projmap HW2 output
+        batch_coords_hw2.alloc(MAX_BATCH_EDGES * hw * 2);  // projmap output [M,HW,2]
         batch_motion.alloc(MAX_BATCH_EDGES * 4 * hw);
         batch_nets.alloc(MAX_BATCH_EDGES * 128 * hw);
         batch_inps.alloc(MAX_BATCH_EDGES * 128 * hw);
@@ -982,6 +1088,66 @@ struct CudaDroid {
                 coords_2hw,
                 level_out,
                 3, h, w, ph, pw, scale);
+        }
+    }
+
+    // Batched correlation: build + pyramid + sample for multiple edges at once
+    void batch_build_and_sample_correlation(int batch_size, int edge_start,
+                                            float* coords_2hw, float* corr_out_196hw) {
+        int hw = h * w;
+
+        // 1. Setup pointer arrays for cublasSgemmBatched
+        for (int e = 0; e < batch_size; e++) {
+            int ii_val = state.ii_host[edge_start + e];
+            int jj_val = state.jj_host[edge_start + e];
+            h_Aptr[e] = state.fmaps.data + jj_val * 128 * hw;
+            h_Bptr[e] = state.fmaps.data + ii_val * 128 * hw;
+            h_Cptr[e] = batch_corr_vols.data + (size_t)e * hw * hw;
+        }
+        CUDA_CHECK(cudaMemcpy(d_Aptr, h_Aptr, batch_size * sizeof(float*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_Bptr, h_Bptr, batch_size * sizeof(float*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_Cptr, h_Cptr, batch_size * sizeof(float*), cudaMemcpyHostToDevice));
+
+        // 2. Batched GEMM: all edge correlations in one call
+        float alpha = 1.0f / 16.0f, beta = 0.0f;
+        CUBLAS_CHECK(cublasSgemmBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+            hw, hw, 128,
+            &alpha,
+            (const float**)d_Aptr, hw,
+            (const float**)d_Bptr, hw,
+            &beta,
+            d_Cptr, hw,
+            batch_size));
+
+        // 3. Build pyramids via custom 2x2 avg_pool kernel
+        {
+            int N1 = batch_size * hw;
+            int total1 = N1 * (h / 2) * (w / 2);
+            avg_pool_2x2_kernel<<<(total1 + 255) / 256, 256>>>(
+                batch_corr_vols.data, batch_corr_pyr[1].data, N1, h, w);
+            for (int l = 2; l < 4; l++) {
+                int ph = h >> (l-1), pw = w >> (l-1);
+                int Nl = batch_size * hw;
+                int totalL = Nl * (ph / 2) * (pw / 2);
+                avg_pool_2x2_kernel<<<(totalL + 255) / 256, 256>>>(
+                    batch_corr_pyr[l-1].data, batch_corr_pyr[l].data, Nl, ph, pw);
+            }
+        }
+
+        // 4. Batched sampling into [M, 196, hw] layout
+        CUDA_CHECK(cudaMemset(corr_out_196hw, 0, (size_t)batch_size * 196 * hw * sizeof(float)));
+
+        dim3 block(8, 8);
+        dim3 grid((w + 7) / 8, (h + 7) / 8, batch_size);
+
+        for (int l = 0; l < 4; l++) {
+            int ph = h >> l, pw = w >> l;
+            float scale = 1.0f / (float)(1 << l);
+            float* level_data = (l == 0) ? batch_corr_vols.data : batch_corr_pyr[l].data;
+
+            batch_corr_sample_kernel<<<grid, block>>>(
+                level_data, coords_2hw, corr_out_196hw,
+                batch_size, 3, h, w, ph, pw, hw, scale, l);
         }
     }
 
@@ -1166,24 +1332,20 @@ struct CudaDroid {
             for (int bs = 0; bs < total_edges; bs += MAX_BATCH_EDGES) {
                 int batch_size = std::min(MAX_BATCH_EDGES, total_edges - bs);
 
-                // 1. Reproject using current poses -> coords1
-                for (int e = 0; e < batch_size; e++) {
-                    int ii_val = state.ii_host[bs + e];
-                    int jj_val = state.jj_host[bs + e];
+                // 1. Batched reproject using current poses -> coords1
+                projmap_kernel<<<batch_size, 256>>>(
+                    state.poses.data, state.disps.data, state.intrinsics.data,
+                    (const int*)state.ii_gpu.data + bs,
+                    (const int*)state.jj_gpu.data + bs,
+                    batch_coords_hw2.data, buf_a.data, batch_size, h, w);
 
-                    projmap_kernel<<<1, 256>>>(
-                        state.poses.data, state.disps.data, state.intrinsics.data,
-                        (const int*)state.ii_gpu.data + bs + e,
-                        (const int*)state.jj_gpu.data + bs + e,
-                        coords_hw2.data, buf_a.data, 1, h, w);
+                // 2. Batched coords layout conversion [M,HW,2] -> [M,2,HW]
+                batch_coords_hw2_to_2hw<<<(batch_size * hw + 255) / 256, 256>>>(
+                    batch_coords_hw2.data, batch_coords.data, batch_size, hw);
 
-                    float* edge_coords = batch_coords.data + e * 2 * hw;
-                    coords_hw2_to_2hw<<<(hw+255)/256, 256>>>(coords_hw2.data, edge_coords, hw);
-
-                    // 2. Correlation
-                    build_correlation(ii_val, jj_val);
-                    sample_correlation(edge_coords, batch_corr.data + e * 196 * hw);
-                }
+                // 3. Batched correlation: GEMM + pyramid + sampling
+                batch_build_and_sample_correlation(batch_size, bs,
+                    batch_coords.data, batch_corr.data);
 
                 // 3. Compute motion: [flow, residual] = [coords1 - coords0, target - coords1]
                 // For step 0: target = coords1, so residual = 0, flow = coords1 - identity

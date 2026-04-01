@@ -478,7 +478,7 @@ class PipelineService:
         video_path,
         output_dir,
         fast_traj=True,
-        backend_steps=(3, 5),
+        backend_steps=None,
         hand_stride=2,
         hand_det_conf=0.3,
         skip_slam=False,
@@ -491,6 +491,9 @@ class PipelineService:
 
         on_progress: optional callback(phase: str, detail: str) for status updates.
         """
+        if backend_steps is None:
+            backend_steps = (2, 3) if fast_traj else (3, 5)
+
         video_path = str(Path(video_path).resolve())
         output_dir = str(Path(output_dir).resolve())
         os.makedirs(output_dir, exist_ok=True)
@@ -519,6 +522,14 @@ class PipelineService:
             audio_proc, audio_result_file = start_audio_subprocess(
                 video_path, fps, nf_est, self.asr_model,
             )
+
+        # ── Start video conversion early (NVENC uses dedicated hardware) ──
+        video_proc = None
+        if ffmpeg_cmd is not None:
+            _progress("Video", "starting (NVENC, background)...")
+            video_proc = subprocess.Popen(
+                ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            t_vc = time.perf_counter()
 
         # ── Dispatch hand processing to child ──
         hand_result = None
@@ -589,14 +600,13 @@ class PipelineService:
                     else:
                         audio_result["frame_text"] = ft[:num_frames]
 
-        # ── Video conversion (GPU now idle) ──
-        if ffmpeg_cmd is not None:
-            _progress("Video", "converting (NVENC)...")
-            t_vc = time.perf_counter()
-            vc = subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # ── Wait for video conversion (started early, NVENC runs on dedicated HW) ──
+        if video_proc is not None:
+            _progress("Video", "waiting for NVENC...")
+            video_proc.wait()
             _progress("Video", f"done ({time.perf_counter()-t_vc:.1f}s)")
-            if vc.returncode != 0:
-                print(f"  WARNING: ffmpeg failed (code {vc.returncode})", flush=True)
+            if video_proc.returncode != 0:
+                print(f"  WARNING: ffmpeg failed (code {video_proc.returncode})", flush=True)
 
         # ── Assemble dataset ──
         _progress("Assembly", "writing dataset...")
