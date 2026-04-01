@@ -2,7 +2,7 @@
 
 Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) datasets following the [EgoVerse](https://arxiv.org/abs/2501.14394) format with:
 
-- **SLAM camera poses** (7-DoF: translation + quaternion) via DROID-SLAM
+- **SLAM camera poses** (7-DoF: translation + quaternion) via CUDA DROID-SLAM
 - **3D hand poses** (21 MANO keypoints per hand) via WiLoR
 - **Audio transcription** (word-level timestamps) via NVIDIA Parakeet
 - **Video conversion** (iPhone HEVC HDR to SDR MP4)
@@ -10,7 +10,7 @@ Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0
 ## Quick start
 
 ```bash
-# Recommended: uses optimized settings (~33s for 62s of 1080p30 on RTX 5090)
+# Recommended: uses optimized settings (~30s for 62s of 1080p30 on RTX 5090)
 ./annotate.sh /path/to/video.mov
 
 # Or with explicit output directory:
@@ -26,7 +26,7 @@ python3 visualizer.py --port 8888
 
 # Service mode: keep models warm for fast repeated processing
 python3 visualizer.py --service --port 8888
-# First video: ~32s, subsequent: ~32s (vs ~39s cold start each time)
+# First video: ~30s, subsequent: ~30s (vs ~39s cold start each time)
 
 # Or use the service programmatically:
 python3 pipeline_service.py --listen
@@ -46,11 +46,10 @@ options:
   --skip-hands             Skip hand pose estimation
   --skip-audio             Skip audio transcription
   --asr-model MODEL        NeMo ASR model name (default: parakeet-tdt_ctc-110m)
-  --hand-stride N          Process every Nth frame for hands (default: 1)
+  --hand-stride N          Process every Nth frame for hands (default: 2)
   --hand-det-conf F        YOLO hand detection confidence threshold (default: 0.3)
   --fast-traj              Use fewer SLAM backend steps for faster trajectory
-  --slam-backend-steps N N Backend optimization steps (default: 7 12)
-  --droid-weights PATH     Path to DROID-SLAM checkpoint (default: /workspace/DROID-SLAM/checkpoints/droid.pth)
+  --slam-backend-steps N N Backend optimization steps (default: 3 5)
   --wilor-dir PATH         Path to WiLoR repo (default: /workspace/WiLoR)
   --device DEVICE          Torch device (default: cuda)
 ```
@@ -85,8 +84,8 @@ The parquet contains per-frame columns:
 ### System requirements
 
 - Linux (tested on Ubuntu 22.04+)
-- NVIDIA GPU with 11+ GB VRAM
-- CUDA 12.1+ with matching drivers
+- NVIDIA GPU with 11+ GB VRAM (sm_80+: Ampere, Ada Lovelace, Blackwell)
+- CUDA 12.1+ with cuDNN, cuBLAS, cuSOLVER
 - Python 3.10+
 - FFmpeg 6.0+ with ffprobe
 
@@ -115,31 +114,21 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install pyarrow numpy opencv-python scipy tqdm pybind11
 ```
 
-### DROID-SLAM
+### CUDA DROID-SLAM
+
+The SLAM module is a standalone CUDA binary with no PyTorch dependency:
 
 ```bash
-git clone --recursive https://github.com/princeton-vl/DROID-SLAM.git
-cd DROID-SLAM
+cd robot-video/cuda_slam
 
-pip install -r requirements.txt
+# Export weights from a DROID-SLAM checkpoint (one-time)
+python3 export_weights.py --checkpoint /path/to/droid.pth --out data
 
-# Build third-party CUDA extensions
-pip install thirdparty/lietorch
-pip install thirdparty/pytorch_scatter
-
-# Build DROID backend
-python setup.py build_ext --inplace
-# or: pip install -e .
+# Build the binary (requires CUDA 12.1+, cuDNN, cuBLAS, cuSOLVER)
+make
 ```
 
-Download the checkpoint:
-```bash
-mkdir -p checkpoints
-# Via the provided script:
-./tools/download_model.sh
-# Or manually (~16 MB):
-gdown 1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh -O checkpoints/droid.pth
-```
+The DROID-SLAM checkpoint (`droid.pth`, ~16 MB) can be obtained from the [original repo](https://github.com/princeton-vl/DROID-SLAM). Weights are exported to `cuda_slam/data/weights/` as raw float32 tensors.
 
 ### WiLoR
 
@@ -188,7 +177,7 @@ Requires the FFmpeg dev headers installed above. Falls back to OpenCV if not ava
 ### Verify installation
 
 ```bash
-python3 -c "from droid import Droid; print('DROID-SLAM OK')"
+./cuda_slam/cuda_droid --help 2>&1 | head -1 && echo "CUDA DROID-SLAM OK"
 python3 -c "from wilor.models import load_wilor; print('WiLoR OK')"
 python3 -c "from ultralytics import YOLO; print('YOLO OK')"
 python3 -c "import nemo.collections.asr; print('NeMo ASR OK')"
@@ -217,24 +206,26 @@ Controls:
 
 ## Performance
 
-Benchmarked on 1858 frames (62s) of 1920x1080 30fps iPhone video, RTX 5090:
+Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| SLAM + hands (split decode) | 23s | Separate processes, each decodes independently |
-| Video conversion (h264_nvenc) | 3s | Deferred until after inference (GPU idle) |
-| Audio transcription | 14s | Parakeet on CPU, fully overlapped |
-| Dataset assembly | 1s | Parquet + info.json |
-| **Total** | **~33s** | `./annotate.sh` (recommended settings) |
+| CUDA SLAM | 24s | 76 fps, frames piped via stdin |
+| Hand detection (stride=2) | 11s | Parallel with SLAM, interpolated |
+| Audio transcription | ~8s | Parakeet on CPU, fully overlapped |
+| Video conversion (h264_nvenc) | 2.4s | Deferred until after inference (GPU idle) |
+| Dataset assembly | <1s | Parquet + info.json |
+| **Total** | **~30s** | Service mode (warm), all outputs included |
 
 Key optimizations:
 
-1. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only, 584x328). Forked child decodes video independently with OpenCV at full resolution for hand pose. No shared-memory transfer needed.
-2. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API for SLAM decoding. Decode + swscale resize runs in a native thread that never acquires the Python GIL, so DROID-SLAM's CUDA kernels run concurrently. Includes HLG→SDR tonemapping via precomputed LUT for iPhone HDR video.
-3. **pytorch_lightning stub** — WiLoR inherits from LightningModule but only needs nn.Module at inference. A 10-line stub replaces the full import, saving 3.4s.
-4. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s.
-5. **Deferred video conversion** — NVENC takes ~3s on an idle GPU but 30+s when competing with SLAM/YOLO/WiLoR for GPU resources. Running it sequentially after inference is much faster overall. Audio transcription (Parakeet, CPU-only) runs fully overlapped in a background subprocess.
-6. **Service mode** — `pipeline_service.py` keeps YOLO, WiLoR, and DROID-SLAM loaded across videos. One-time ~10s startup, then each video skips ~6s of imports and model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
+1. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. Frames are piped directly from the native decoder via stdin, eliminating disk I/O. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos.
+2. **Split decode architecture** — Parent runs SLAM with native C++ decoder (SLAM-res only, 584x328). Forked child decodes video independently with OpenCV at full resolution for hand pose. No shared-memory transfer needed.
+3. **Native GIL-free decoder** — pybind11 C++ extension using FFmpeg C API for SLAM decoding. Decode + swscale resize runs in a native thread that never acquires the Python GIL. Includes HLG→SDR tonemapping via precomputed LUT for iPhone HDR video.
+4. **pytorch_lightning stub** — WiLoR inherits from LightningModule but only needs nn.Module at inference. A 10-line stub replaces the full import, saving 3.4s.
+5. **mmap + assign loading** — `torch.load(mmap=True)` + `load_state_dict(assign=True)` reduces WiLoR checkpoint loading from ~25s to ~0.4s.
+6. **Deferred video conversion** — NVENC takes ~3s on an idle GPU but 30+s when competing with SLAM/YOLO/WiLoR for GPU resources. Running it sequentially after inference is much faster overall.
+7. **Service mode** — `pipeline_service.py` keeps YOLO and WiLoR loaded across videos. One-time ~9s startup, then each video skips ~6s of imports and model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
 ---
 
