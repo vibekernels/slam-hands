@@ -710,3 +710,225 @@ __global__ void scale_half_kernel(__half* data, float scale, int n) {
 inline void scale_half(__half* data, float scale, int n) {
     scale_half_kernel<<<(n+255)/256, 256>>>(data, scale, n);
 }
+
+// ============ FP16 Convolution Layer (tensor-core accelerated) ============
+
+struct HalfConvLayer {
+    cudnnFilterDescriptor_t filterDesc = nullptr;
+    cudnnConvolutionDescriptor_t convDesc = nullptr;
+    cudnnConvolutionFwdAlgo_t algo;
+    size_t workspaceSize = 0;
+
+    GpuHalfBuf weight, bias;
+    int Ci, Co, kH, kW, stride, pad;
+
+    void init(cudnnHandle_t cudnn, int batch,
+              int ci, int co, int kh, int kw, int s, int p,
+              int inH, int inW,
+              const float* w_data, const float* b_data) {
+        Ci = ci; Co = co; kH = kh; kW = kw; stride = s; pad = p;
+
+        // Convert FP32 weights to FP16 on GPU
+        int w_count = co * ci * kh * kw;
+        weight.alloc(w_count);
+        { GpuBuf tmp; tmp.alloc(w_count); tmp.copyFrom(w_data, w_count);
+          float_to_half(tmp.data, weight.data, w_count); }
+        bias.alloc(co);
+        { GpuBuf tmp; tmp.alloc(co); tmp.copyFrom(b_data, co);
+          float_to_half(tmp.data, bias.data, co); }
+
+        CUDNN_CHECK(cudnnCreateFilterDescriptor(&filterDesc));
+        CUDNN_CHECK(cudnnSetFilter4dDescriptor(filterDesc, CUDNN_DATA_HALF,
+            CUDNN_TENSOR_NCHW, co, ci, kh, kw));
+
+        CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&convDesc));
+        CUDNN_CHECK(cudnnSetConvolution2dDescriptor(convDesc, p, p, s, s, 1, 1,
+            CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+        CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
+
+        cudnnTensorDescriptor_t inDesc, outDesc;
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&inDesc));
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&outDesc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(inDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, ci, inH, inW));
+        int outH, outW, outN, outC;
+        CUDNN_CHECK(cudnnGetConvolution2dForwardOutputDim(convDesc, inDesc, filterDesc,
+            &outN, &outC, &outH, &outW));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(outDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, co, outH, outW));
+
+        int returnedAlgoCount;
+        cudnnConvolutionFwdAlgoPerf_t perf[8];
+        CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
+            cudnn, inDesc, filterDesc, convDesc, outDesc,
+            8, &returnedAlgoCount, perf));
+        algo = perf[0].algo;
+        workspaceSize = perf[0].memory;
+
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(inDesc));
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(outDesc));
+    }
+
+    void forward(cudnnHandle_t cudnn, __half* input, __half* output, void* workspace,
+                 int batch, int inH, int inW) {
+        cudnnTensorDescriptor_t inDesc, outDesc, biasDesc;
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&inDesc));
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&outDesc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(inDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, Ci, inH, inW));
+        int outH = (inH + 2*pad - kH) / stride + 1;
+        int outW = (inW + 2*pad - kW) / stride + 1;
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(outDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, Co, outH, outW));
+
+        float alpha = 1.0f, beta = 0.0f;
+        CUDNN_CHECK(cudnnConvolutionForward(cudnn, &alpha, inDesc, input,
+            filterDesc, weight.data, convDesc, algo, workspace, workspaceSize,
+            &beta, outDesc, output));
+
+        // Add bias
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&biasDesc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(biasDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, 1, Co, 1, 1));
+        alpha = 1.0f; beta = 1.0f;
+        CUDNN_CHECK(cudnnAddTensor(cudnn, &alpha, biasDesc, bias.data,
+            &beta, outDesc, output));
+
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(biasDesc));
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(inDesc));
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(outDesc));
+    }
+};
+
+// ============ FP16 Activation Kernels ============
+
+__global__ void silu_half_kernel(__half* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = __half2float(data[idx]);
+        data[idx] = __float2half(x / (1.0f + expf(-x)));
+    }
+}
+
+__global__ void sigmoid_half_kernel(__half* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = __half2float(data[idx]);
+        data[idx] = __float2half(1.0f / (1.0f + expf(-x)));
+    }
+}
+
+inline void silu_half_inplace(__half* data, int n) {
+    silu_half_kernel<<<(n+255)/256, 256>>>(data, n);
+}
+inline void sigmoid_half_inplace(__half* data, int n) {
+    sigmoid_half_kernel<<<(n+255)/256, 256>>>(data, n);
+}
+
+// ============ FP16 MaxPool2d ============
+
+__global__ void maxpool2d_half_kernel(const __half* input, __half* output,
+                                      int N, int C, int H, int W, int kH, int sH, int pH) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int oH = (H + 2*pH - kH) / sH + 1;
+    int oW = (W + 2*pH - kH) / sH + 1;
+    int total = N * C * oH * oW;
+    if (idx >= total) return;
+
+    int ow = idx % oW;
+    int oh = (idx / oW) % oH;
+    int c = (idx / (oH * oW)) % C;
+    int n = idx / (C * oH * oW);
+
+    float maxval = -1e30f;
+    for (int kh = 0; kh < kH; kh++) {
+        for (int kw = 0; kw < kH; kw++) {
+            int ih = oh * sH - pH + kh;
+            int iw = ow * sH - pH + kw;
+            if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                maxval = fmaxf(maxval, __half2float(input[((n * C + c) * H + ih) * W + iw]));
+        }
+    }
+    output[idx] = __float2half(maxval);
+}
+
+inline void maxpool2d_half(__half* input, __half* output, int N, int C, int H, int W,
+                           int kH, int sH, int pH) {
+    int oH = (H + 2*pH - kH) / sH + 1;
+    int oW = (W + 2*pH - kH) / sH + 1;
+    int total = N * C * oH * oW;
+    maxpool2d_half_kernel<<<(total+255)/256, 256>>>(input, output, N, C, H, W, kH, sH, pH);
+}
+
+// ============ FP16 Upsample nearest 2x ============
+
+__global__ void upsample2x_half_kernel(const __half* input, __half* output,
+                                        int N, int C, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int oH = H * 2, oW = W * 2;
+    int total = N * C * oH * oW;
+    if (idx >= total) return;
+
+    int ow = idx % oW;
+    int oh = (idx / oW) % oH;
+    int c = (idx / (oH * oW)) % C;
+    int n = idx / (C * oH * oW);
+
+    output[idx] = input[((n * C + c) * H + oh / 2) * W + ow / 2];
+}
+
+inline void upsample_nearest_2x_half(const __half* input, __half* output,
+                                      int N, int C, int H, int W) {
+    int total = N * C * (H*2) * (W*2);
+    upsample2x_half_kernel<<<(total+255)/256, 256>>>(input, output, N, C, H, W);
+}
+
+// ============ FP16 Concatenation along channel dim ============
+
+__global__ void concat2_half_kernel(__half* output, const __half* a, const __half* b,
+                                    int N, int C1, int C2, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * (C1 + C2) * HW;
+    if (idx >= total) return;
+    int hw = idx % HW;
+    int c = (idx / HW) % (C1 + C2);
+    int n = idx / (HW * (C1 + C2));
+    if (c < C1) output[idx] = a[n * C1 * HW + c * HW + hw];
+    else output[idx] = b[n * C2 * HW + (c - C1) * HW + hw];
+}
+
+__global__ void concat4_half_kernel(__half* output,
+                                    const __half* a, const __half* b,
+                                    const __half* c, const __half* d,
+                                    int N, int C1, int C2, int C3, int C4, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int CT = C1 + C2 + C3 + C4;
+    int total = N * CT * HW;
+    if (idx >= total) return;
+    int hw = idx % HW;
+    int ch = (idx / HW) % CT;
+    int n = idx / (HW * CT);
+    if (ch < C1) output[idx] = a[n * C1 * HW + ch * HW + hw];
+    else if (ch < C1 + C2) output[idx] = b[n * C2 * HW + (ch - C1) * HW + hw];
+    else if (ch < C1 + C2 + C3) output[idx] = c[n * C3 * HW + (ch - C1 - C2) * HW + hw];
+    else output[idx] = d[n * C4 * HW + (ch - C1 - C2 - C3) * HW + hw];
+}
+
+// ============ FP16 Channel slice ============
+
+__global__ void slice_channels_half_kernel(__half* output, const __half* input,
+                                           int N, int C_total, int C_start, int C_out, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C_out * HW;
+    if (idx >= total) return;
+    int hw = idx % HW;
+    int c = (idx / HW) % C_out;
+    int n = idx / (HW * C_out);
+    output[idx] = input[n * C_total * HW + (C_start + c) * HW + hw];
+}
+
+inline void slice_channels_half(__half* output, const __half* input,
+                                int N, int C_total, int C_start, int C_out, int HW) {
+    int total = N * C_out * HW;
+    slice_channels_half_kernel<<<(total+255)/256, 256>>>(output, input, N, C_total, C_start, C_out, HW);
+}

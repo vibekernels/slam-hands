@@ -34,6 +34,7 @@ extern "C" {
 // Constants
 // ============================================================================
 
+static const int YOLO_BATCH = 8;      // YOLO frame batch size (video mode)
 static const int YOLO_IMGSZ = 512;    // YOLO max side (long side)
 static const int YOLO_NC = 2;        // left=0, right=1
 static const int YOLO_REG_MAX = 16;
@@ -293,10 +294,10 @@ __global__ void wilor_preprocess_kernel(
 // YOLO preprocessing: resize + normalize + HWC->CHW
 // ============================================================================
 
-__global__ void yolo_preprocess_kernel(const uint8_t* input, float* output,
+__global__ void yolo_preprocess_kernel(const uint8_t* input, __half* output,
                                         int inH, int inW, int outH, int outW, int N) {
     // Letterbox resize to outH x outW, normalize to [0,1], BGR->RGB, HWC->CHW
-    // No padding needed since outH/outW are already computed to match aspect ratio
+    // Output is FP16 for tensor-core accelerated YOLO
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * 3 * outH * outW;
     if (idx >= total) return;
@@ -306,7 +307,6 @@ __global__ void yolo_preprocess_kernel(const uint8_t* input, float* output,
     int c = (idx / (outH * outW)) % 3;
     int n = idx / (3 * outH * outW);
 
-    // Direct resize (no letterbox padding — outH/outW match aspect ratio)
     float ix = (float)ow * inW / outW;
     float iy = (float)oh * inH / outH;
     int src_c = 2 - c;  // BGR to RGB
@@ -327,7 +327,7 @@ __global__ void yolo_preprocess_kernel(const uint8_t* input, float* output,
     float v11 = base[iy1 * inW * 3 + ix1 * 3 + src_c];
     float val = ((1-wy)*((1-wx)*v00 + wx*v01) + wy*((1-wx)*v10 + wx*v11)) / 255.0f;
 
-    output[idx] = val;
+    output[idx] = __float2half(val);
 }
 
 // ============================================================================
@@ -336,68 +336,41 @@ __global__ void yolo_preprocess_kernel(const uint8_t* input, float* output,
 
 struct YoloModel {
     cudnnHandle_t cudnn;
-    GpuBuf workspace;
+    GpuBuf workspace;  // raw bytes, shared across all convolutions
     size_t max_workspace = 0;
 
-    // Backbone + Neck layers (fused Conv+BN+SiLU)
-    // Layer indices match YOLOv8m architecture:
-    // 0: Conv(3->48, k3s2p1)
-    // 1: Conv(48->96, k3s2p1)
-    // 2: C2f(96->96, n=2, bottleneck_c=48)
-    // 3: Conv(96->192, k3s2p1)
-    // 4: C2f(192->192, n=4, bottleneck_c=96)
-    // 5: Conv(192->384, k3s2p1)
-    // 6: C2f(384->384, n=4, bottleneck_c=192)
-    // 7: Conv(384->576, k3s2p1)
-    // 8: C2f(576->576, n=2, bottleneck_c=288)
-    // 9: SPPF(576->576)
-    // 10: Upsample 2x
-    // 11: Concat([10, 6]) -> 960 channels
-    // 12: C2f(960->384, n=2, bottleneck_c=192)
-    // 13: Upsample 2x
-    // 14: Concat([13, 4]) -> 576 channels
-    // 15: C2f(576->192, n=2, bottleneck_c=96)
-    // 16: Conv(192->192, k3s2p1)
-    // 17: Concat([16, 12]) -> 576 channels
-    // 18: C2f(576->384, n=2, bottleneck_c=192)
-    // 19: Conv(384->384, k3s2p1)
-    // 20: Concat([19, 9]) -> 960 channels
-    // 21: C2f(960->576, n=2, bottleneck_c=288)
-    // 22: Pose head (3 scales)
+    // All convolution layers use FP16 (tensor-core accelerated)
+    HalfConvLayer l0, l1, l3, l5, l7, l16, l19;
 
-    ConvLayer l0, l1, l3, l5, l7, l16, l19;
-
-    // C2f blocks: cv1, cv2, bottleneck convs
     struct C2fBlock {
-        ConvLayer cv1, cv2;
-        struct { ConvLayer cv1, cv2; } m[4];
+        HalfConvLayer cv1, cv2;
+        struct { HalfConvLayer cv1, cv2; } m[4];
         int n_bottleneck;
-        bool shortcut;  // residual add in bottleneck
+        bool shortcut;
     };
     C2fBlock c2f_2, c2f_4, c2f_6, c2f_8, c2f_12, c2f_15, c2f_18, c2f_21;
 
-    // SPPF
-    ConvLayer sppf_cv1, sppf_cv2;
+    HalfConvLayer sppf_cv1, sppf_cv2;
 
-    // Pose head
     struct HeadScale {
-        ConvLayer cv2[3]; // 2 Conv+BN+SiLU + 1 plain Conv2d
-        ConvLayer cv3[3];
-        ConvLayer cv4[3];
+        HalfConvLayer cv2[3];
+        HalfConvLayer cv3[3];
+        HalfConvLayer cv4[3];
     };
-    HeadScale head[3]; // 3 scales
-    GpuBuf dfl_weight, dfl_bias;
-    GpuBuf strides;
+    HeadScale head[3];
+    GpuBuf dfl_weight, dfl_bias;  // FP32, small (16 values)
 
-    // Feature map buffers
-    GpuBuf bufs[30];  // numbered by layer output
-    GpuBuf tmp1, tmp2, tmp3;
+    // FP16 feature map buffers (pre-allocated)
+    GpuHalfBuf bufs[30];
+    GpuHalfBuf tmp1, tmp2, tmp3;
+    // Pre-allocated C2f scratch buffers (avoid per-call cudaMalloc)
+    GpuHalfBuf c2f_chunk0, c2f_chunk1, c2f_bn[4], c2f_concat;
 
     int batch_size;
     float det_conf;
-    int yolo_h, yolo_w;  // actual YOLO input dimensions (non-square, stride-32 aligned)
+    int yolo_h, yolo_w;
 
-    void load_conv(ConvLayer& layer, const std::string& dir, const std::string& prefix,
+    void load_conv(HalfConvLayer& layer, const std::string& dir, const std::string& prefix,
                    int batch, int ci, int co, int kh, int kw, int s, int p, int inH, int inW) {
         std::vector<float> w_data, b_data;
         std::vector<int> w_shape, b_shape;
@@ -411,9 +384,7 @@ struct YoloModel {
                   int batch, int ci, int co, int n_bn, int bn_c, int H, int W, bool shortcut = true) {
         block.n_bottleneck = n_bn;
         block.shortcut = shortcut;
-        // cv1: ci -> co, k1s1p0
         load_conv(block.cv1, dir, prefix + "_cv1", batch, ci, co, 1, 1, 1, 0, H, W);
-        // Bottleneck convs
         for (int i = 0; i < n_bn; i++) {
             char buf[64];
             snprintf(buf, sizeof(buf), "%s_m%d_cv1", prefix.c_str(), i);
@@ -421,98 +392,69 @@ struct YoloModel {
             snprintf(buf, sizeof(buf), "%s_m%d_cv2", prefix.c_str(), i);
             load_conv(block.m[i].cv2, dir, buf, batch, bn_c, bn_c, 3, 3, 1, 1, H, W);
         }
-        // cv2: (co + n_bn * bn_c) -> co, k1s1p0
-        // C2f concat: [chunk0(co/2), chunk1(co/2), bn0(bn_c), bn1(bn_c), ...]
         int cv2_ci = co + n_bn * bn_c;
         load_conv(block.cv2, dir, prefix + "_cv2", batch, cv2_ci, co, 1, 1, 1, 0, H, W);
     }
 
-    // C2f forward: split -> bottlenecks -> concat -> cv2
-    void c2f_forward(C2fBlock& block, float* input, float* output,
+    void c2f_forward(C2fBlock& block, __half* input, __half* output,
                      int N, int ci, int co, int H, int W) {
         int HW = H * W;
         int half_c = co / 2;
         int bn_c = block.m[0].cv1.Co;
 
-        // cv1: input -> tmp1 [N, co, H, W]
         block.cv1.forward(cudnn, input, tmp1.data, workspace.data, N, H, W);
-        silu_inplace(tmp1.data, N * co * HW);
+        silu_half_inplace(tmp1.data, N * co * HW);
 
-        // C2f: cv1 splits output into chunk0 and chunk1.
-        // y = [chunk0, chunk1]; y.extend(m(y[-1]) for m in self.m)
-        // cv2(cat(y, 1)) where y = [chunk0, chunk1, bn0_out, bn1_out, ...]
-        // Total concat channels = co + n_bottleneck * bn_c
+        slice_channels_half(c2f_chunk0.data, tmp1.data, N, co, 0, half_c, HW);
+        slice_channels_half(c2f_chunk1.data, tmp1.data, N, co, half_c, half_c, HW);
 
-        // Split cv1 output into chunk0 and chunk1
-        GpuBuf chunk0_buf, chunk1_buf;
-        chunk0_buf.alloc(N * half_c * HW);
-        chunk1_buf.alloc(N * half_c * HW);
-        slice_channels(chunk0_buf.data, tmp1.data, N, co, 0, half_c, HW);
-        slice_channels(chunk1_buf.data, tmp1.data, N, co, half_c, half_c, HW);
+        __half* prev = c2f_chunk1.data;
 
-        float* prev = chunk1_buf.data;
-
-        // concat_parts: [chunk0, chunk1, bn0, bn1, ...]
-        float* concat_parts[8]; // max 4 bottlenecks + 2 chunks
+        __half* concat_parts[8];
         int concat_cs[8];
-        concat_parts[0] = chunk0_buf.data;
+        concat_parts[0] = c2f_chunk0.data;
         concat_cs[0] = half_c;
-        concat_parts[1] = chunk1_buf.data;
+        concat_parts[1] = c2f_chunk1.data;
         concat_cs[1] = half_c;
 
-        GpuBuf bn_bufs[4]; // temporary buffers for bottleneck outputs
         for (int i = 0; i < block.n_bottleneck; i++) {
-            bn_bufs[i].alloc(N * bn_c * HW);
             // cv1
-            block.m[i].cv1.forward(cudnn, prev, bn_bufs[i].data, workspace.data, N, H, W);
-            silu_inplace(bn_bufs[i].data, N * bn_c * HW);
-            // cv2
-            {
-                GpuBuf cv2_buf;
-                cv2_buf.alloc(N * bn_c * HW);
-                block.m[i].cv2.forward(cudnn, bn_bufs[i].data, cv2_buf.data, workspace.data, N, H, W);
-                silu_inplace(cv2_buf.data, N * bn_c * HW);
-                // Residual add only when shortcut=True (backbone C2f blocks)
-                if (block.shortcut) {
-                    add_kernel<<<(N*bn_c*HW+255)/256, 256>>>(cv2_buf.data, prev, N * bn_c * HW);
-                }
-                // Copy to bn_bufs[i] for later concat
-                CUDA_CHECK(cudaMemcpy(bn_bufs[i].data, cv2_buf.data, N * bn_c * HW * sizeof(float), cudaMemcpyDeviceToDevice));
-                cv2_buf.free();
+            block.m[i].cv1.forward(cudnn, prev, c2f_bn[i].data, workspace.data, N, H, W);
+            silu_half_inplace(c2f_bn[i].data, N * bn_c * HW);
+            // cv2 -> tmp2
+            block.m[i].cv2.forward(cudnn, c2f_bn[i].data, tmp2.data, workspace.data, N, H, W);
+            silu_half_inplace(tmp2.data, N * bn_c * HW);
+            if (block.shortcut) {
+                add_half_kernel<<<(N*bn_c*HW+255)/256, 256>>>(tmp2.data, prev, N * bn_c * HW);
             }
-            prev = bn_bufs[i].data;
-            concat_parts[i + 2] = bn_bufs[i].data;
+            // Store result in c2f_bn[i]
+            CUDA_CHECK(cudaMemcpy(c2f_bn[i].data, tmp2.data, (size_t)N * bn_c * HW * sizeof(__half),
+                                  cudaMemcpyDeviceToDevice));
+            prev = c2f_bn[i].data;
+            concat_parts[i + 2] = c2f_bn[i].data;
             concat_cs[i + 2] = bn_c;
         }
 
-        // Concat all parts along channel dim
+        // Concat all parts
         int n_parts = 2 + block.n_bottleneck;
         int total_c = co;
         for (int i = 0; i < block.n_bottleneck; i++) total_c += bn_c;
 
-        // Manual concat
-        GpuBuf concat_buf;
-        concat_buf.alloc(N * total_c * HW);
-        size_t offset = 0;
         for (int n = 0; n < N; n++) {
-            size_t dst_base = n * total_c * HW;
+            size_t dst_base = (size_t)n * total_c * HW;
             size_t c_off = 0;
             for (int p = 0; p < n_parts; p++) {
-                size_t src_base = n * concat_cs[p] * HW;
-                CUDA_CHECK(cudaMemcpy(concat_buf.data + dst_base + c_off * HW,
+                size_t src_base = (size_t)n * concat_cs[p] * HW;
+                CUDA_CHECK(cudaMemcpy(c2f_concat.data + dst_base + c_off * HW,
                                       concat_parts[p] + src_base,
-                                      concat_cs[p] * HW * sizeof(float),
+                                      (size_t)concat_cs[p] * HW * sizeof(__half),
                                       cudaMemcpyDeviceToDevice));
                 c_off += concat_cs[p];
             }
         }
 
-        // cv2
-        block.cv2.forward(cudnn, concat_buf.data, output, workspace.data, N, H, W);
-        silu_inplace(output, N * co * HW);
-
-        concat_buf.free();
-        for (int i = 0; i < block.n_bottleneck; i++) bn_bufs[i].free();
+        block.cv2.forward(cudnn, c2f_concat.data, output, workspace.data, N, H, W);
+        silu_half_inplace(output, N * co * HW);
     }
 
     void init(const std::string& weights_dir, int batch, float conf, int vidH, int vidW) {
@@ -520,8 +462,6 @@ struct YoloModel {
         det_conf = conf;
         CUDNN_CHECK(cudnnCreate(&cudnn));
 
-        // Compute YOLO input dimensions matching ultralytics behavior:
-        // Scale to fit long side = YOLO_IMGSZ, round both dims to stride 32
         float scale = (float)YOLO_IMGSZ / std::max(vidH, vidW);
         yolo_h = ((int)(vidH * scale) + 31) / 32 * 32;
         yolo_w = ((int)(vidW * scale) + 31) / 32 * 32;
@@ -530,7 +470,7 @@ struct YoloModel {
         int H = yolo_h, W = yolo_w;
         int B = batch;
 
-        // Load backbone
+        // Load backbone (all FP16 with tensor cores)
         load_conv(l0, weights_dir, "l0", B, 3, 48, 3, 3, 2, 1, H, W);
         load_conv(l1, weights_dir, "l1", B, 48, 96, 3, 3, 2, 1, H/2, W/2);
         load_c2f(c2f_2, weights_dir, "l2", B, 96, 96, 2, 48, H/4, W/4);
@@ -541,11 +481,9 @@ struct YoloModel {
         load_conv(l7, weights_dir, "l7", B, 384, 576, 3, 3, 2, 1, H/16, W/16);
         load_c2f(c2f_8, weights_dir, "l8", B, 576, 576, 2, 288, H/32, W/32);
 
-        // SPPF
         load_conv(sppf_cv1, weights_dir, "l9_cv1", B, 576, 288, 1, 1, 1, 0, H/32, W/32);
         load_conv(sppf_cv2, weights_dir, "l9_cv2", B, 1152, 576, 1, 1, 1, 0, H/32, W/32);
 
-        // FPN neck (shortcut=false for all neck C2f blocks)
         load_c2f(c2f_12, weights_dir, "l12", B, 960, 384, 2, 192, H/16, W/16, false);
         load_c2f(c2f_15, weights_dir, "l15", B, 576, 192, 2, 96, H/8, W/8, false);
         load_conv(l16, weights_dir, "l16", B, 192, 192, 3, 3, 2, 1, H/8, W/8);
@@ -553,7 +491,6 @@ struct YoloModel {
         load_conv(l19, weights_dir, "l19", B, 384, 384, 3, 3, 2, 1, H/16, W/16);
         load_c2f(c2f_21, weights_dir, "l21", B, 960, 576, 2, 288, H/32, W/32, false);
 
-        // Pose head: 3 scales x (cv2, cv3, cv4)
         int head_channels[] = {192, 384, 576};
         int head_h[] = {H/8, H/16, H/32};
         int head_w[] = {W/8, W/16, W/32};
@@ -562,7 +499,6 @@ struct YoloModel {
             int hh = head_h[si], hw = head_w[si];
             char buf[64];
 
-            // cv2: bbox regression (3 convs: Conv+BN+SiLU, Conv+BN+SiLU, Conv2d)
             snprintf(buf, sizeof(buf), "head_cv2_s%d_c0", si);
             load_conv(head[si].cv2[0], weights_dir, buf, B, ch, 64, 3, 3, 1, 1, hh, hw);
             snprintf(buf, sizeof(buf), "head_cv2_s%d_c1", si);
@@ -570,13 +506,7 @@ struct YoloModel {
             snprintf(buf, sizeof(buf), "head_cv2_s%d_c2", si);
             load_conv(head[si].cv2[2], weights_dir, buf, B, 64, 64, 1, 1, 1, 0, hh, hw);
 
-            // cv3: class prediction (3 convs) - intermediate channels = max(ch, nc * reg_max) = 192
-            // Actually from model: cv3 intermediate = max(c1, self.nc) but YOLOv8m uses ch//2 capped
-            // Real dims from model: 192, 192, 192 for all scales
-            int cls_mid = std::max(ch, 192);  // for scale 0: ch=192, others larger → 192 intermediate
-            // Actually check: scale0=192→192, scale1=384→192, scale2=576→192
-            // The intermediate is consistently 192 for this model
-            cls_mid = 192;
+            int cls_mid = 192;
             snprintf(buf, sizeof(buf), "head_cv3_s%d_c0", si);
             load_conv(head[si].cv3[0], weights_dir, buf, B, ch, cls_mid, 3, 3, 1, 1, hh, hw);
             snprintf(buf, sizeof(buf), "head_cv3_s%d_c1", si);
@@ -584,8 +514,7 @@ struct YoloModel {
             snprintf(buf, sizeof(buf), "head_cv3_s%d_c2", si);
             load_conv(head[si].cv3[2], weights_dir, buf, B, cls_mid, YOLO_NC, 1, 1, 1, 0, hh, hw);
 
-            // cv4: keypoint prediction (2 convs + final) - intermediate channels = 63
-            int kp_ch = YOLO_NKP * 3;  // 63
+            int kp_ch = YOLO_NKP * 3;
             snprintf(buf, sizeof(buf), "head_cv4_s%d_c0", si);
             load_conv(head[si].cv4[0], weights_dir, buf, B, ch, kp_ch, 3, 3, 1, 1, hh, hw);
             snprintf(buf, sizeof(buf), "head_cv4_s%d_c1", si);
@@ -594,7 +523,7 @@ struct YoloModel {
             load_conv(head[si].cv4[2], weights_dir, buf, B, kp_ch, kp_ch, 1, 1, 1, 0, hh, hw);
         }
 
-        // DFL weight
+        // DFL weight (keep FP32 for CPU decode)
         {
             std::vector<float> w, b;
             std::vector<int> ws, bs;
@@ -606,196 +535,183 @@ struct YoloModel {
             dfl_bias.copyFrom(b.data(), b.size());
         }
 
-        // Strides
-        {
-            std::vector<float> s;
-            std::vector<int> ss;
-            load_tensor((weights_dir + "/yolo_strides.bin").c_str(), s, ss);
-            strides.alloc(s.size());
-            strides.copyFrom(s.data(), s.size());
-        }
-
-        // Allocate workspace
+        // Workspace
         max_workspace = std::max(max_workspace, (size_t)(128 * 1024 * 1024));
         workspace.alloc(max_workspace / sizeof(float) + 1);
 
-        // Allocate feature map buffers
+        // Allocate FP16 feature map buffers
         size_t max_buf = (size_t)B * std::max({
-            3 * H * W,                      // input layer
-            48 * (H/2) * (W/2),             // l0 output
-            96 * (H/4) * (W/4),             // l1/c2f_2
-            192 * (H/8) * (W/8),            // l3/c2f_4
-            384 * (H/16) * (W/16),          // l5/c2f_6
-            576 * (H/32) * (W/32),          // l7/c2f_8
-            1152 * (H/32) * (W/32),         // SPPF concat
-            960 * (H/16) * (W/16),          // FPN concat
-            576 * (H/8) * (W/8),            // FPN concat
+            (size_t)(3 * H * W),
+            (size_t)(48 * (H/2) * (W/2)),
+            (size_t)(96 * (H/4) * (W/4)),
+            (size_t)(192 * (H/8) * (W/8)),
+            (size_t)(384 * (H/16) * (W/16)),
+            (size_t)(576 * (H/32) * (W/32)),
+            (size_t)(1152 * (H/32) * (W/32)),
+            (size_t)(960 * (H/16) * (W/16)),
+            (size_t)(576 * (H/8) * (W/8)),
         });
         for (int i = 0; i < 30; i++) bufs[i].alloc(max_buf);
         tmp1.alloc(max_buf);
         tmp2.alloc(max_buf);
         tmp3.alloc(max_buf);
+        // C2f scratch buffers (pre-allocated to avoid per-call cudaMalloc)
+        c2f_chunk0.alloc(max_buf);
+        c2f_chunk1.alloc(max_buf);
+        for (int i = 0; i < 4; i++) c2f_bn[i].alloc(max_buf);
+        c2f_concat.alloc(max_buf);
     }
 
-    // Forward pass: returns detections as host arrays
     struct Detection {
-        float x1, y1, x2, y2;  // bbox in YOLO input coords (512x512)
+        float x1, y1, x2, y2;
         float score;
-        int cls;  // 0=left, 1=right
-        float kp[21 * 3];  // keypoints (x, y, conf) in YOLO input coords
+        int cls;
+        float kp[21 * 3];
+        int batch_idx;  // which frame in the batch
     };
 
     std::vector<Detection> forward(const uint8_t* input_gpu, int N, int inH, int inW) {
         int H = yolo_h, W = yolo_w;
 
-        // Preprocess: resize + normalize
+        // Preprocess: resize + normalize to FP16
         {
             int total = N * 3 * H * W;
             yolo_preprocess_kernel<<<(total+255)/256, 256>>>(input_gpu, bufs[0].data, inH, inW, H, W, N);
         }
 
-        // Backbone
+        // Backbone (all FP16)
         l0.forward(cudnn, bufs[0].data, bufs[1].data, workspace.data, N, H, W);
-        silu_inplace(bufs[1].data, N * 48 * (H/2) * (W/2));
+        silu_half_inplace(bufs[1].data, N * 48 * (H/2) * (W/2));
 
         l1.forward(cudnn, bufs[1].data, bufs[2].data, workspace.data, N, H/2, W/2);
-        silu_inplace(bufs[2].data, N * 96 * (H/4) * (W/4));
+        silu_half_inplace(bufs[2].data, N * 96 * (H/4) * (W/4));
 
         c2f_forward(c2f_2, bufs[2].data, bufs[3].data, N, 96, 96, H/4, W/4);
 
         l3.forward(cudnn, bufs[3].data, bufs[4].data, workspace.data, N, H/4, W/4);
-        silu_inplace(bufs[4].data, N * 192 * (H/8) * (W/8));
+        silu_half_inplace(bufs[4].data, N * 192 * (H/8) * (W/8));
 
         c2f_forward(c2f_4, bufs[4].data, bufs[5].data, N, 192, 192, H/8, W/8);
 
         l5.forward(cudnn, bufs[5].data, bufs[6].data, workspace.data, N, H/8, W/8);
-        silu_inplace(bufs[6].data, N * 384 * (H/16) * (W/16));
+        silu_half_inplace(bufs[6].data, N * 384 * (H/16) * (W/16));
 
         c2f_forward(c2f_6, bufs[6].data, bufs[7].data, N, 384, 384, H/16, W/16);
 
         l7.forward(cudnn, bufs[7].data, bufs[8].data, workspace.data, N, H/16, W/16);
-        silu_inplace(bufs[8].data, N * 576 * (H/32) * (W/32));
+        silu_half_inplace(bufs[8].data, N * 576 * (H/32) * (W/32));
 
         c2f_forward(c2f_8, bufs[8].data, bufs[9].data, N, 576, 576, H/32, W/32);
 
-        // SPPF (layer 9)
+        // SPPF
         {
-            int sh = H/32, sw = W/32;
+            int sh = H/32, sw = W/32, hw = sh * sw;
             sppf_cv1.forward(cudnn, bufs[9].data, bufs[10].data, workspace.data, N, sh, sw);
-            silu_inplace(bufs[10].data, N * 288 * sh * sw);
-            maxpool2d(bufs[10].data, bufs[11].data, N, 288, sh, sw, 5, 1, 2);
-            maxpool2d(bufs[11].data, bufs[12].data, N, 288, sh, sw, 5, 1, 2);
-            maxpool2d(bufs[12].data, bufs[13].data, N, 288, sh, sw, 5, 1, 2);
-            int hw = sh * sw;
+            silu_half_inplace(bufs[10].data, N * 288 * hw);
+            maxpool2d_half(bufs[10].data, bufs[11].data, N, 288, sh, sw, 5, 1, 2);
+            maxpool2d_half(bufs[11].data, bufs[12].data, N, 288, sh, sw, 5, 1, 2);
+            maxpool2d_half(bufs[12].data, bufs[13].data, N, 288, sh, sw, 5, 1, 2);
             int total = N * 1152 * hw;
-            concat4_kernel<<<(total+255)/256, 256>>>(bufs[14].data,
+            concat4_half_kernel<<<(total+255)/256, 256>>>(bufs[14].data,
                 bufs[10].data, bufs[11].data, bufs[12].data, bufs[13].data,
                 N, 288, 288, 288, 288, hw);
             sppf_cv2.forward(cudnn, bufs[14].data, bufs[15].data, workspace.data, N, sh, sw);
-            silu_inplace(bufs[15].data, N * 576 * sh * sw);
+            silu_half_inplace(bufs[15].data, N * 576 * hw);
         }
-        // FPN upsample + concat + C2f
-        upsample_nearest_2x(bufs[15].data, bufs[16].data, N, 576, H/32, W/32);
 
+        // FPN
+        upsample_nearest_2x_half(bufs[15].data, bufs[16].data, N, 576, H/32, W/32);
         {
             int hw = (H/16) * (W/16);
-            int total = N * 960 * hw;
-            concat2_kernel<<<(total+255)/256, 256>>>(bufs[17].data, bufs[16].data, bufs[7].data,
+            concat2_half_kernel<<<(N*960*hw+255)/256, 256>>>(bufs[17].data, bufs[16].data, bufs[7].data,
                 N, 576, 384, hw);
         }
         c2f_forward(c2f_12, bufs[17].data, bufs[18].data, N, 960, 384, H/16, W/16);
 
-        upsample_nearest_2x(bufs[18].data, bufs[19].data, N, 384, H/16, W/16);
-
+        upsample_nearest_2x_half(bufs[18].data, bufs[19].data, N, 384, H/16, W/16);
         {
             int hw = (H/8) * (W/8);
-            int total = N * 576 * hw;
-            concat2_kernel<<<(total+255)/256, 256>>>(bufs[20].data, bufs[19].data, bufs[5].data,
+            concat2_half_kernel<<<(N*576*hw+255)/256, 256>>>(bufs[20].data, bufs[19].data, bufs[5].data,
                 N, 384, 192, hw);
         }
-
         c2f_forward(c2f_15, bufs[20].data, bufs[21].data, N, 576, 192, H/8, W/8);
 
-        // PAN path
+        // PAN
         l16.forward(cudnn, bufs[21].data, bufs[22].data, workspace.data, N, H/8, W/8);
-        silu_inplace(bufs[22].data, N * 192 * (H/16) * (W/16));
-
+        silu_half_inplace(bufs[22].data, N * 192 * (H/16) * (W/16));
         {
             int hw = (H/16) * (W/16);
-            int total = N * 576 * hw;
-            concat2_kernel<<<(total+255)/256, 256>>>(bufs[23].data, bufs[22].data, bufs[18].data,
+            concat2_half_kernel<<<(N*576*hw+255)/256, 256>>>(bufs[23].data, bufs[22].data, bufs[18].data,
                 N, 192, 384, hw);
         }
-
         c2f_forward(c2f_18, bufs[23].data, bufs[24].data, N, 576, 384, H/16, W/16);
 
         l19.forward(cudnn, bufs[24].data, bufs[25].data, workspace.data, N, H/16, W/16);
-        silu_inplace(bufs[25].data, N * 384 * (H/32) * (W/32));
-
+        silu_half_inplace(bufs[25].data, N * 384 * (H/32) * (W/32));
         {
             int hw = (H/32) * (W/32);
-            int total = N * 960 * hw;
-            concat2_kernel<<<(total+255)/256, 256>>>(bufs[26].data, bufs[25].data, bufs[15].data,
+            concat2_half_kernel<<<(N*960*hw+255)/256, 256>>>(bufs[26].data, bufs[25].data, bufs[15].data,
                 N, 384, 576, hw);
         }
-
         c2f_forward(c2f_21, bufs[26].data, bufs[27].data, N, 960, 576, H/32, W/32);
 
-        // Detection head: process 3 scales
-        float* feat_maps[] = {bufs[21].data, bufs[24].data, bufs[27].data};
+        // Detection head: 3 scales, convert FP16→FP32 for CPU post-processing
+        __half* feat_maps[] = {bufs[21].data, bufs[24].data, bufs[27].data};
         int feat_h[] = {H/8, H/16, H/32};
         int feat_w[] = {W/8, W/16, W/32};
         float host_strides[] = {8.0f, 16.0f, 32.0f};
 
-        // Collect all detections across scales
         std::vector<Detection> all_dets;
+
+        // DFL weights (small, cached on CPU)
+        std::vector<float> h_dfl_w(16), h_dfl_b(1);
+        dfl_weight.copyTo(h_dfl_w.data(), 16);
+        dfl_bias.copyTo(h_dfl_b.data(), 1);
 
         for (int si = 0; si < 3; si++) {
             int fh = feat_h[si], fw = feat_w[si];
             int hw = fh * fw;
 
-            // cv2: bbox
-            GpuBuf bbox_feat, cls_feat, kp_feat;
+            // Head convolutions (FP16)
+            GpuHalfBuf bbox_feat, cls_feat, kp_feat;
             bbox_feat.alloc(N * 64 * hw);
             cls_feat.alloc(N * YOLO_NC * hw);
             kp_feat.alloc(N * 63 * hw);
 
-            // cv2 branch
             head[si].cv2[0].forward(cudnn, feat_maps[si], tmp1.data, workspace.data, N, fh, fw);
-            silu_inplace(tmp1.data, N * 64 * hw);
+            silu_half_inplace(tmp1.data, N * 64 * hw);
             head[si].cv2[1].forward(cudnn, tmp1.data, tmp2.data, workspace.data, N, fh, fw);
-            silu_inplace(tmp2.data, N * 64 * hw);
+            silu_half_inplace(tmp2.data, N * 64 * hw);
             head[si].cv2[2].forward(cudnn, tmp2.data, bbox_feat.data, workspace.data, N, fh, fw);
 
-            // cv3 branch (intermediate = 192)
             int cls_mid = 192;
             head[si].cv3[0].forward(cudnn, feat_maps[si], tmp1.data, workspace.data, N, fh, fw);
-            silu_inplace(tmp1.data, N * cls_mid * hw);
+            silu_half_inplace(tmp1.data, N * cls_mid * hw);
             head[si].cv3[1].forward(cudnn, tmp1.data, tmp2.data, workspace.data, N, fh, fw);
-            silu_inplace(tmp2.data, N * cls_mid * hw);
+            silu_half_inplace(tmp2.data, N * cls_mid * hw);
             head[si].cv3[2].forward(cudnn, tmp2.data, cls_feat.data, workspace.data, N, fh, fw);
-            sigmoid_inplace(cls_feat.data, N * YOLO_NC * hw);
+            sigmoid_half_inplace(cls_feat.data, N * YOLO_NC * hw);
 
-            // cv4 branch (intermediate = 63)
-            int kp_mid = YOLO_NKP * 3;  // 63
+            int kp_mid = YOLO_NKP * 3;
             head[si].cv4[0].forward(cudnn, feat_maps[si], tmp1.data, workspace.data, N, fh, fw);
-            silu_inplace(tmp1.data, N * kp_mid * hw);
+            silu_half_inplace(tmp1.data, N * kp_mid * hw);
             head[si].cv4[1].forward(cudnn, tmp1.data, tmp2.data, workspace.data, N, fh, fw);
-            silu_inplace(tmp2.data, N * kp_mid * hw);
+            silu_half_inplace(tmp2.data, N * kp_mid * hw);
             head[si].cv4[2].forward(cudnn, tmp2.data, kp_feat.data, workspace.data, N, fh, fw);
 
-            // Download to CPU for DFL decode + NMS
+            // Convert FP16→FP32 on GPU, then download to CPU
+            GpuBuf bbox_f, cls_f, kp_f;
+            bbox_f.alloc(N * 64 * hw);
+            cls_f.alloc(N * YOLO_NC * hw);
+            kp_f.alloc(N * 63 * hw);
+            half_to_float(bbox_feat.data, bbox_f.data, N * 64 * hw);
+            half_to_float(cls_feat.data, cls_f.data, N * YOLO_NC * hw);
+            half_to_float(kp_feat.data, kp_f.data, N * 63 * hw);
+
             std::vector<float> h_bbox(N * 64 * hw), h_cls(N * YOLO_NC * hw), h_kp(N * 63 * hw);
-            bbox_feat.copyTo(h_bbox.data(), h_bbox.size());
-            cls_feat.copyTo(h_cls.data(), h_cls.size());
-            kp_feat.copyTo(h_kp.data(), h_kp.size());
-
-            bbox_feat.free(); cls_feat.free(); kp_feat.free();
-
-            // DFL decode + detection extraction (CPU)
-            std::vector<float> h_dfl_w(16), h_dfl_b(1);
-            dfl_weight.copyTo(h_dfl_w.data(), 16);
-            dfl_bias.copyTo(h_dfl_b.data(), 1);
+            bbox_f.copyTo(h_bbox.data(), h_bbox.size());
+            cls_f.copyTo(h_cls.data(), h_cls.size());
+            kp_f.copyTo(h_kp.data(), h_kp.size());
 
             float stride = host_strides[si];
 
@@ -804,7 +720,6 @@ struct YoloModel {
                     for (int x = 0; x < fw; x++) {
                         int pos = y * fw + x;
 
-                        // Get max class score
                         float max_score = 0;
                         int max_cls = 0;
                         for (int c = 0; c < YOLO_NC; c++) {
@@ -813,10 +728,8 @@ struct YoloModel {
                         }
                         if (max_score < det_conf) continue;
 
-                        // DFL decode: 4 groups of 16 values -> 4 distance values
                         float dist[4];
                         for (int d = 0; d < 4; d++) {
-                            // Softmax over 16 values, then weighted sum
                             float vals[16];
                             float maxv = -1e30f;
                             for (int k = 0; k < 16; k++) {
@@ -828,15 +741,6 @@ struct YoloModel {
                                 vals[k] = expf(vals[k] - maxv);
                                 sum += vals[k];
                             }
-                            float wsum = 0;
-                            for (int k = 0; k < 16; k++) {
-                                wsum += (vals[k] / sum) * k;
-                            }
-                            // Apply DFL conv: just multiply by weight and add bias
-                            // DFL weight is [1, 16, 1, 1] but acts as sum(softmax * arange(16))
-                            // Actually DFL conv is Conv2d(16,1,1,1) - weights are learned
-                            // But for standard YOLOv8, DFL weight = arange(16) and bias=0
-                            // Let me use the actual exported weights
                             float dfl_val = h_dfl_b[0];
                             for (int k = 0; k < 16; k++) {
                                 dfl_val += (vals[k] / sum) * h_dfl_w[k];
@@ -844,29 +748,24 @@ struct YoloModel {
                             dist[d] = dfl_val;
                         }
 
-                        // Convert distances to bbox (x1, y1, x2, y2)
                         float cx = (x + 0.5f) * stride;
                         float cy = (y + 0.5f) * stride;
-                        float x1 = cx - dist[0] * stride;
-                        float y1 = cy - dist[1] * stride;
-                        float x2 = cx + dist[2] * stride;
-                        float y2 = cy + dist[3] * stride;
-
                         Detection det;
-                        det.x1 = x1; det.y1 = y1; det.x2 = x2; det.y2 = y2;
+                        det.x1 = cx - dist[0] * stride;
+                        det.y1 = cy - dist[1] * stride;
+                        det.x2 = cx + dist[2] * stride;
+                        det.y2 = cy + dist[3] * stride;
                         det.score = max_score;
                         det.cls = max_cls;
+                        det.batch_idx = n;
 
-                        // Decode keypoints
                         for (int k = 0; k < 21; k++) {
                             float kx = h_kp[(n * 63 + k * 3 + 0) * hw + pos];
                             float ky = h_kp[(n * 63 + k * 3 + 1) * hw + pos];
                             float kc = h_kp[(n * 63 + k * 3 + 2) * hw + pos];
-                            // Decode: kp = (kp * 2 - 0.5 + anchor) * stride
-                            // YOLOv8 keypoint decoding
                             det.kp[k * 3 + 0] = (kx * 2.0f + (x - 0.5f)) * stride;
                             det.kp[k * 3 + 1] = (ky * 2.0f + (y - 0.5f)) * stride;
-                            det.kp[k * 3 + 2] = 1.0f / (1.0f + expf(-kc));  // sigmoid
+                            det.kp[k * 3 + 2] = 1.0f / (1.0f + expf(-kc));
                         }
 
                         all_dets.push_back(det);
@@ -875,8 +774,15 @@ struct YoloModel {
             }
         }
 
-        // NMS
-        return nms(all_dets, 0.45f);
+        // Per-frame NMS (needed for batched inference)
+        std::vector<Detection> result;
+        for (int n = 0; n < N; n++) {
+            std::vector<Detection> frame_dets;
+            for (auto& d : all_dets) if (d.batch_idx == n) frame_dets.push_back(d);
+            auto frame_nms = nms(frame_dets, 0.45f);
+            result.insert(result.end(), frame_nms.begin(), frame_nms.end());
+        }
+        return result;
     }
 
     static float iou(const Detection& a, const Detection& b) {
@@ -891,7 +797,6 @@ struct YoloModel {
     }
 
     static std::vector<Detection> nms(std::vector<Detection>& dets, float iou_thresh) {
-        // Sort by score descending
         std::sort(dets.begin(), dets.end(), [](const Detection& a, const Detection& b) {
             return a.score > b.score;
         });
@@ -899,23 +804,19 @@ struct YoloModel {
         std::vector<bool> suppressed(dets.size(), false);
         std::vector<Detection> result;
 
-        // Per-class best detection (we only need 1 left + 1 right per frame)
         bool has_class[YOLO_NC] = {};
         for (size_t i = 0; i < dets.size(); i++) {
             if (suppressed[i]) continue;
             result.push_back(dets[i]);
             has_class[dets[i].cls] = true;
             for (size_t j = i + 1; j < dets.size(); j++) {
-                if (!suppressed[j] && dets[i].cls == dets[j].cls && iou(dets[i], dets[j]) > iou_thresh) {
+                if (!suppressed[j] && dets[i].cls == dets[j].cls && iou(dets[i], dets[j]) > iou_thresh)
                     suppressed[j] = true;
-                }
             }
-            // Stop early if we have both classes
             bool all_found = true;
             for (int c = 0; c < YOLO_NC; c++) if (!has_class[c]) all_found = false;
             if (all_found) break;
         }
-        // Keep at most 2 detections (best per class)
         if (result.size() > 2) result.resize(2);
         return result;
     }
@@ -2122,18 +2023,16 @@ static void process_video(
         av_frame_get_buffer(bgr_frame, 32);
         pkt = av_packet_alloc();
 
-        // Pre-init YOLO since we know dimensions
-        yolo.init(weights_dir, 1, det_conf, vH, vW);
+        // Pre-init YOLO with batch size for better GPU utilization
+        yolo.init(weights_dir, YOLO_BATCH, det_conf, vH, vW);
         yolo_initialized = true;
         fprintf(stderr, "[cuda_hand] YOLO loaded\n");
 
-        // Pre-alloc frame buffer
-        size_t needed = (size_t)vW * vH * 3;
-        if (needed > max_frame_bytes) {
-            max_frame_bytes = needed;
-            d_frame_buf.free();
-            CUDA_CHECK(cudaMalloc((void**)&d_frame_buf.data, max_frame_bytes));
-        }
+        // Pre-alloc batch frame buffer (holds YOLO_BATCH frames)
+        size_t single_frame_bytes = (size_t)vW * vH * 3;
+        max_frame_bytes = single_frame_bytes * YOLO_BATCH;
+        d_frame_buf.free();
+        CUDA_CHECK(cudaMalloc((void**)&d_frame_buf.data, max_frame_bytes));
     }
 
     // Read frames
@@ -2173,196 +2072,88 @@ static void process_video(
     auto now = []{ return std::chrono::high_resolution_clock::now(); };
     auto secs = [](auto a, auto b){ return std::chrono::duration<double>(b - a).count(); };
 
-    while (true) {
-        int W, H;
-        int cur_frame_idx;
+    // Helper: process detections from a YOLO batch, preprocess WiLoR crops
+    auto process_yolo_dets = [&](const std::vector<YoloModel::Detection>& dets,
+                                  int batch_frame_indices[], int n_in_batch, int W, int H) {
+        if (dets.empty()) return;
+        float yolo_scale_x = (float)yolo.yolo_w / W;
+        float yolo_scale_y = (float)yolo.yolo_h / H;
+        size_t single_frame_bytes = (size_t)W * H * 3;
 
-        auto t0 = now();
-        if (video_mode) {
-            if (!decode_next_frame()) break;
-            W = dec_ctx->width;
-            H = dec_ctx->height;
-            cur_frame_idx = frame_idx;
+        for (size_t i = 0; i < dets.size(); i++) {
+            auto& det = dets[i];
+            int bi = det.batch_idx;
+            // Find the result_idx for this frame
+            // batch_frame_indices[bi] is the frame index in the video
+            // We stored result for each frame in order, starting at all_results.size() - n_in_batch
+            int result_base = all_results.size() - n_in_batch;
+            int result_idx = result_base + bi;
 
-            if (frame_idx % stride != 0) {
-                frame_idx++;
-                continue;
-            }
-            frame_idx++;
+            float x1 = det.x1 / yolo_scale_x;
+            float y1 = det.y1 / yolo_scale_y;
+            float x2 = det.x2 / yolo_scale_x;
+            float y2 = det.y2 / yolo_scale_y;
 
-            // Convert to BGR
-            sws_scale(sws_ctx, av_frame->data, av_frame->linesize, 0, H,
-                       bgr_frame->data, bgr_frame->linesize);
-            auto t1 = now();
-            t_decode_total += secs(t0, t1);
+            float cx = (x1 + x2) / 2.0f;
+            float cy = (y1 + y2) / 2.0f;
+            float bw = (x2 - x1) * 2.0f;
+            float bh = (y2 - y1) * 2.0f;
 
-            // Upload to GPU (BGR24 contiguous)
-            size_t frame_bytes = (size_t)W * H * 3;
-            // bgr_frame linesize may have padding; copy row by row if needed
-            if (bgr_frame->linesize[0] == W * 3) {
-                CUDA_CHECK(cudaMemcpy(d_frame_buf.data, bgr_frame->data[0], frame_bytes, cudaMemcpyHostToDevice));
-            } else {
-                for (int row = 0; row < H; row++) {
-                    CUDA_CHECK(cudaMemcpy((uint8_t*)d_frame_buf.data + row * W * 3,
-                                          bgr_frame->data[0] + row * bgr_frame->linesize[0],
-                                          W * 3, cudaMemcpyHostToDevice));
+            float w_exp = bw, h_exp = bh;
+            if (bh / bw < 256.0f / 192.0f) h_exp = bw * 256.0f / 192.0f;
+            else w_exp = bh * 192.0f / 256.0f;
+            float bbox_size = std::max(w_exp, h_exp);
+
+            bool is_right = det.cls == 1;
+
+            pending_centers.push_back(cx);
+            pending_centers.push_back(cy);
+            pending_sizes.push_back(bbox_size);
+            pending_img_sizes.push_back((float)W);
+            pending_img_sizes.push_back((float)H);
+            pending_rights.push_back(is_right ? 1.0f : 0.0f);
+            pending_result_idx.push_back(result_idx);
+
+            int crop_idx_in_batch = pending_sizes.size() - 1;
+            size_t needed = (crop_idx_in_batch + 1) * 3 * VIT_IMG_H * VIT_IMG_W;
+            if (needed > d_crops_capacity) {
+                float* new_buf;
+                size_t new_cap = std::max(needed, d_crops_capacity * 2);
+                CUDA_CHECK(cudaMalloc(&new_buf, new_cap * sizeof(float)));
+                if (d_crops_buf && crop_idx_in_batch > 0) {
+                    CUDA_CHECK(cudaMemcpy(new_buf, d_crops_buf,
+                        crop_idx_in_batch * 3 * VIT_IMG_H * VIT_IMG_W * sizeof(float),
+                        cudaMemcpyDeviceToDevice));
                 }
-            }
-            t_upload_total += secs(t1, now());
-        } else {
-            FrameHeader hdr;
-            if (fread(&hdr, sizeof(hdr), 1, stdin) != 1) break;
-            W = hdr.width;
-            H = hdr.height;
-            cur_frame_idx = hdr.frame_idx;
-
-            size_t frame_bytes = (size_t)W * H * 3;
-            frame_data.resize(frame_bytes);
-            if (fread(frame_data.data(), 1, frame_bytes, stdin) != frame_bytes) break;
-
-            // Lazy init YOLO on first frame
-            if (!yolo_initialized) {
-                yolo.init(weights_dir, 1, det_conf, H, W);
-                yolo_initialized = true;
-                fprintf(stderr, "[cuda_hand] YOLO loaded\n");
+                if (d_crops_buf) CUDA_CHECK(cudaFree(d_crops_buf));
+                d_crops_buf = new_buf;
+                d_crops_capacity = new_cap;
             }
 
-            // Upload frame to GPU
-            if (frame_bytes > max_frame_bytes) {
-                max_frame_bytes = frame_bytes;
-                d_frame_buf.free();
-                CUDA_CHECK(cudaMalloc((void**)&d_frame_buf.data, max_frame_bytes));
-            }
-            CUDA_CHECK(cudaMemcpy(d_frame_buf.data, frame_data.data(), frame_bytes, cudaMemcpyHostToDevice));
+            // Preprocess crop from the correct frame in the batch buffer
+            const uint8_t* frame_ptr = (const uint8_t*)d_frame_buf.data + bi * single_frame_bytes;
+            bool flip = !is_right;
+            int total_px = 3 * VIT_IMG_H * VIT_IMG_W;
+            wilor_preprocess_kernel<<<(total_px + 255) / 256, 256>>>(
+                frame_ptr, d_crops_buf,
+                H, W, cx, cy, bbox_size, flip,
+                VIT_IMG_H, VIT_IMG_W, crop_idx_in_batch,
+                IMAGE_MEAN[0], IMAGE_MEAN[1], IMAGE_MEAN[2],
+                IMAGE_STD[0], IMAGE_STD[1], IMAGE_STD[2]);
         }
+    };
 
-        // YOLO detection (single frame at a time for simplicity)
-        auto ty0 = now();
-        auto dets = yolo.forward((const uint8_t*)d_frame_buf.data, 1, H, W);
-        t_yolo_total += secs(ty0, now());
-        total_dets += dets.size();
-
-        // Initialize frame result
-        FrameResult fr;
-        fr.frame_idx = cur_frame_idx;
-        fr.left_detected = false;
-        fr.right_detected = false;
-        memset(fr.left_kp3d, 0, sizeof(fr.left_kp3d));
-        memset(fr.right_kp3d, 0, sizeof(fr.right_kp3d));
-        memset(fr.left_kp2d, 0, sizeof(fr.left_kp2d));
-        memset(fr.right_kp2d, 0, sizeof(fr.right_kp2d));
-
-        int result_idx = all_results.size();
-        all_results.push_back(fr);
-
-        // Collect detections for batched WiLoR processing
-        if (!dets.empty()) {
-            float yolo_scale_x = (float)yolo.yolo_w / W;
-            float yolo_scale_y = (float)yolo.yolo_h / H;
-
-            for (size_t i = 0; i < dets.size(); i++) {
-                auto& det = dets[i];
-                float x1 = det.x1 / yolo_scale_x;
-                float y1 = det.y1 / yolo_scale_y;
-                float x2 = det.x2 / yolo_scale_x;
-                float y2 = det.y2 / yolo_scale_y;
-
-                float cx = (x1 + x2) / 2.0f;
-                float cy = (y1 + y2) / 2.0f;
-                float bw = (x2 - x1) * 2.0f;
-                float bh = (y2 - y1) * 2.0f;
-
-                float w_exp = bw, h_exp = bh;
-                if (bh / bw < 256.0f / 192.0f) h_exp = bw * 256.0f / 192.0f;
-                else w_exp = bh * 192.0f / 256.0f;
-                float bbox_size = std::max(w_exp, h_exp);
-
-                bool is_right = det.cls == 1;
-
-                pending_centers.push_back(cx);
-                pending_centers.push_back(cy);
-                pending_sizes.push_back(bbox_size);
-                pending_img_sizes.push_back((float)W);
-                pending_img_sizes.push_back((float)H);
-                pending_rights.push_back(is_right ? 1.0f : 0.0f);
-                pending_result_idx.push_back(result_idx);
-
-                // Preprocess crop on GPU now (while frame is still uploaded)
-                int crop_idx_in_batch = pending_sizes.size() - 1;
-                // Ensure crop buffer is large enough
-                size_t needed = (crop_idx_in_batch + 1) * 3 * VIT_IMG_H * VIT_IMG_W;
-                if (needed > d_crops_capacity) {
-                    float* new_buf;
-                    size_t new_cap = std::max(needed, d_crops_capacity * 2);
-                    CUDA_CHECK(cudaMalloc(&new_buf, new_cap * sizeof(float)));
-                    if (d_crops_buf && crop_idx_in_batch > 0) {
-                        CUDA_CHECK(cudaMemcpy(new_buf, d_crops_buf,
-                            crop_idx_in_batch * 3 * VIT_IMG_H * VIT_IMG_W * sizeof(float),
-                            cudaMemcpyDeviceToDevice));
-                    }
-                    if (d_crops_buf) CUDA_CHECK(cudaFree(d_crops_buf));
-                    d_crops_buf = new_buf;
-                    d_crops_capacity = new_cap;
-                }
-
-                bool flip = !is_right;
-                int total_px = 3 * VIT_IMG_H * VIT_IMG_W;
-                wilor_preprocess_kernel<<<(total_px + 255) / 256, 256>>>(
-                    (const uint8_t*)d_frame_buf.data, d_crops_buf,
-                    H, W, cx, cy, bbox_size, flip,
-                    VIT_IMG_H, VIT_IMG_W, crop_idx_in_batch,
-                    IMAGE_MEAN[0], IMAGE_MEAN[1], IMAGE_MEAN[2],
-                    IMAGE_STD[0], IMAGE_STD[1], IMAGE_STD[2]);
-            }
-        }
-
-        n_frames++;
-
-        // Flush WiLoR batch when we have enough crops
+    // Helper: flush WiLoR batch
+    auto flush_wilor = [&]() {
         int n_pending = pending_sizes.size();
-        if (n_pending >= wilor_batch) {
-            if (n_pending > wilor_batch) n_pending = wilor_batch;
-            auto tw0 = now();
-            std::vector<WilorModel::HandResult> results(n_pending);
-            wilor.forward(d_crops_buf, n_pending,
-                          pending_centers.data(), pending_sizes.data(),
-                          pending_img_sizes.data(), pending_rights.data(),
-                          results.data());
-            t_wilor_total += secs(tw0, now());
-
-            // Scatter results back
-            for (int i = 0; i < n_pending; i++) {
-                int ri = pending_result_idx[i];
-                bool is_right = pending_rights[i] > 0.5f;
-                if (is_right) {
-                    all_results[ri].right_detected = true;
-                    memcpy(all_results[ri].right_kp3d, results[i].kp3d, 63 * sizeof(float));
-                    memcpy(all_results[ri].right_kp2d, results[i].kp2d, 42 * sizeof(float));
-                } else {
-                    all_results[ri].left_detected = true;
-                    memcpy(all_results[ri].left_kp3d, results[i].kp3d, 63 * sizeof(float));
-                    memcpy(all_results[ri].left_kp2d, results[i].kp2d, 42 * sizeof(float));
-                }
-            }
-
-            pending_centers.clear();
-            pending_sizes.clear();
-            pending_img_sizes.clear();
-            pending_rights.clear();
-            pending_result_idx.clear();
-        }
-    }
-
-    // Flush remaining WiLoR crops
-    if (!pending_sizes.empty()) {
-        int n_pending = pending_sizes.size();
+        if (n_pending == 0) return;
+        if (n_pending > wilor_batch) n_pending = wilor_batch;
         auto tw0 = now();
         std::vector<WilorModel::HandResult> results(n_pending);
         wilor.forward(d_crops_buf, n_pending,
                       pending_centers.data(), pending_sizes.data(),
                       pending_img_sizes.data(), pending_rights.data(),
                       results.data());
-        cudaDeviceSynchronize();
         t_wilor_total += secs(tw0, now());
 
         for (int i = 0; i < n_pending; i++) {
@@ -2378,7 +2169,183 @@ static void process_video(
                 memcpy(all_results[ri].left_kp2d, results[i].kp2d, 42 * sizeof(float));
             }
         }
+
+        pending_centers.clear();
+        pending_sizes.clear();
+        pending_img_sizes.clear();
+        pending_rights.clear();
+        pending_result_idx.clear();
+    };
+
+    if (video_mode) {
+        // Batched YOLO: decode YOLO_BATCH frames, run YOLO, process detections
+        int W = dec_ctx->width, H = dec_ctx->height;
+        size_t single_frame_bytes = (size_t)W * H * 3;
+        int batch_frame_indices[YOLO_BATCH];
+        int n_in_batch = 0;
+
+        while (true) {
+            auto t0 = now();
+            if (!decode_next_frame()) {
+                // Flush partial YOLO batch
+                if (n_in_batch > 0) {
+                    auto ty0 = now();
+                    auto dets = yolo.forward((const uint8_t*)d_frame_buf.data, n_in_batch, H, W);
+                    t_yolo_total += secs(ty0, now());
+                    total_dets += dets.size();
+                    process_yolo_dets(dets, batch_frame_indices, n_in_batch, W, H);
+                }
+                break;
+            }
+
+            if (frame_idx % stride != 0) { frame_idx++; continue; }
+            int cur_frame_idx = frame_idx;
+            frame_idx++;
+
+            sws_scale(sws_ctx, av_frame->data, av_frame->linesize, 0, H,
+                       bgr_frame->data, bgr_frame->linesize);
+            auto t1 = now();
+            t_decode_total += secs(t0, t1);
+
+            // Upload to batch buffer slot
+            uint8_t* dst = (uint8_t*)d_frame_buf.data + n_in_batch * single_frame_bytes;
+            if (bgr_frame->linesize[0] == W * 3) {
+                CUDA_CHECK(cudaMemcpy(dst, bgr_frame->data[0], single_frame_bytes, cudaMemcpyHostToDevice));
+            } else {
+                for (int row = 0; row < H; row++) {
+                    CUDA_CHECK(cudaMemcpy(dst + row * W * 3,
+                                          bgr_frame->data[0] + row * bgr_frame->linesize[0],
+                                          W * 3, cudaMemcpyHostToDevice));
+                }
+            }
+            t_upload_total += secs(t1, now());
+
+            // Initialize frame result
+            FrameResult fr;
+            fr.frame_idx = cur_frame_idx;
+            fr.left_detected = false;
+            fr.right_detected = false;
+            memset(fr.left_kp3d, 0, sizeof(fr.left_kp3d));
+            memset(fr.right_kp3d, 0, sizeof(fr.right_kp3d));
+            memset(fr.left_kp2d, 0, sizeof(fr.left_kp2d));
+            memset(fr.right_kp2d, 0, sizeof(fr.right_kp2d));
+            all_results.push_back(fr);
+
+            batch_frame_indices[n_in_batch] = cur_frame_idx;
+            n_in_batch++;
+            n_frames++;
+
+            if (n_in_batch == YOLO_BATCH) {
+                // Run batched YOLO
+                auto ty0 = now();
+                auto dets = yolo.forward((const uint8_t*)d_frame_buf.data, n_in_batch, H, W);
+                t_yolo_total += secs(ty0, now());
+                total_dets += dets.size();
+
+                process_yolo_dets(dets, batch_frame_indices, n_in_batch, W, H);
+                n_in_batch = 0;
+
+                // Flush WiLoR batch when we have enough crops
+                if ((int)pending_sizes.size() >= wilor_batch) flush_wilor();
+            }
+        }
+    } else {
+        // Stdin mode: single frame at a time
+        while (true) {
+            FrameHeader hdr;
+            if (fread(&hdr, sizeof(hdr), 1, stdin) != 1) break;
+            int W = hdr.width, H = hdr.height;
+            int cur_frame_idx = hdr.frame_idx;
+
+            size_t frame_bytes = (size_t)W * H * 3;
+            frame_data.resize(frame_bytes);
+            if (fread(frame_data.data(), 1, frame_bytes, stdin) != frame_bytes) break;
+
+            if (!yolo_initialized) {
+                yolo.init(weights_dir, 1, det_conf, H, W);
+                yolo_initialized = true;
+                fprintf(stderr, "[cuda_hand] YOLO loaded\n");
+            }
+
+            if (frame_bytes > max_frame_bytes) {
+                max_frame_bytes = frame_bytes;
+                d_frame_buf.free();
+                CUDA_CHECK(cudaMalloc((void**)&d_frame_buf.data, max_frame_bytes));
+            }
+            CUDA_CHECK(cudaMemcpy(d_frame_buf.data, frame_data.data(), frame_bytes, cudaMemcpyHostToDevice));
+
+            auto ty0 = now();
+            auto dets = yolo.forward((const uint8_t*)d_frame_buf.data, 1, H, W);
+            t_yolo_total += secs(ty0, now());
+            total_dets += dets.size();
+
+            FrameResult fr;
+            fr.frame_idx = cur_frame_idx;
+            fr.left_detected = false;
+            fr.right_detected = false;
+            memset(fr.left_kp3d, 0, sizeof(fr.left_kp3d));
+            memset(fr.right_kp3d, 0, sizeof(fr.right_kp3d));
+            memset(fr.left_kp2d, 0, sizeof(fr.left_kp2d));
+            memset(fr.right_kp2d, 0, sizeof(fr.right_kp2d));
+            all_results.push_back(fr);
+
+            int result_idx = all_results.size() - 1;
+            int batch_indices[1] = {cur_frame_idx};
+            // For single-frame, manually set n_in_batch=1
+            if (!dets.empty()) {
+                float yolo_scale_x = (float)yolo.yolo_w / W;
+                float yolo_scale_y = (float)yolo.yolo_h / H;
+
+                for (size_t i = 0; i < dets.size(); i++) {
+                    auto& det = dets[i];
+                    float x1 = det.x1 / yolo_scale_x, y1 = det.y1 / yolo_scale_y;
+                    float x2 = det.x2 / yolo_scale_x, y2 = det.y2 / yolo_scale_y;
+                    float cx = (x1 + x2) / 2.0f, cy = (y1 + y2) / 2.0f;
+                    float bw = (x2 - x1) * 2.0f, bh = (y2 - y1) * 2.0f;
+                    float w_exp = bw, h_exp = bh;
+                    if (bh / bw < 256.0f / 192.0f) h_exp = bw * 256.0f / 192.0f;
+                    else w_exp = bh * 192.0f / 256.0f;
+                    float bbox_size = std::max(w_exp, h_exp);
+                    bool is_right = det.cls == 1;
+
+                    pending_centers.push_back(cx); pending_centers.push_back(cy);
+                    pending_sizes.push_back(bbox_size);
+                    pending_img_sizes.push_back((float)W); pending_img_sizes.push_back((float)H);
+                    pending_rights.push_back(is_right ? 1.0f : 0.0f);
+                    pending_result_idx.push_back(result_idx);
+
+                    int crop_idx_in_batch = pending_sizes.size() - 1;
+                    size_t needed = (crop_idx_in_batch + 1) * 3 * VIT_IMG_H * VIT_IMG_W;
+                    if (needed > d_crops_capacity) {
+                        float* new_buf;
+                        size_t new_cap = std::max(needed, d_crops_capacity * 2);
+                        CUDA_CHECK(cudaMalloc(&new_buf, new_cap * sizeof(float)));
+                        if (d_crops_buf && crop_idx_in_batch > 0)
+                            CUDA_CHECK(cudaMemcpy(new_buf, d_crops_buf,
+                                crop_idx_in_batch * 3 * VIT_IMG_H * VIT_IMG_W * sizeof(float),
+                                cudaMemcpyDeviceToDevice));
+                        if (d_crops_buf) CUDA_CHECK(cudaFree(d_crops_buf));
+                        d_crops_buf = new_buf;
+                        d_crops_capacity = new_cap;
+                    }
+
+                    bool flip = !is_right;
+                    int total_px = 3 * VIT_IMG_H * VIT_IMG_W;
+                    wilor_preprocess_kernel<<<(total_px + 255) / 256, 256>>>(
+                        (const uint8_t*)d_frame_buf.data, d_crops_buf,
+                        H, W, cx, cy, bbox_size, flip,
+                        VIT_IMG_H, VIT_IMG_W, crop_idx_in_batch,
+                        IMAGE_MEAN[0], IMAGE_MEAN[1], IMAGE_MEAN[2],
+                        IMAGE_STD[0], IMAGE_STD[1], IMAGE_STD[2]);
+                }
+            }
+            n_frames++;
+            if ((int)pending_sizes.size() >= wilor_batch) flush_wilor();
+        }
     }
+
+    // Flush remaining WiLoR crops
+    flush_wilor();
     if (d_crops_buf) { CUDA_CHECK(cudaFree(d_crops_buf)); d_crops_buf = nullptr; }
 
     if (video_mode) {
