@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import shutil
+import struct
+import subprocess
 import sys
 import time
 import warnings
@@ -607,6 +609,125 @@ def _hand_worker_selfdecode(
         sys.exit(1)
 
 
+def _hand_worker_cuda(
+    video_path, det_conf, stride,
+    result_path, num_frames_est,
+):
+    """Child process: run CUDA hand pipeline (YOLO + WiLoR + MANO).
+
+    Uses the cuda_hand binary with --video mode which decodes the video
+    internally via FFmpeg and writes binary results to a file.
+    """
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    try:
+        cuda_hand_dir = os.path.join(os.path.dirname(__file__), 'cuda_hand')
+        cuda_hand_bin = os.path.join(cuda_hand_dir, 'cuda_hand')
+        weights_dir = os.path.join(cuda_hand_dir, 'data', 'weights')
+        cuda_output = result_path.replace('.npz', '_cuda.bin')
+
+        if not os.path.exists(cuda_hand_bin):
+            raise FileNotFoundError(f"CUDA hand binary not found: {cuda_hand_bin}")
+
+        print(f"  [CUDA Hand] Starting: video={video_path}, stride={stride}", flush=True)
+        t_start = time.perf_counter()
+
+        proc = subprocess.Popen(
+            [cuda_hand_bin, '--weights-dir', weights_dir,
+             '--video', video_path, '--stride', str(stride),
+             '--det-conf', str(det_conf), '--output', cuda_output],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+
+        stderr = proc.stderr.read()
+        proc.wait(timeout=300)
+        t_total = time.perf_counter() - t_start
+
+        if proc.returncode != 0:
+            print(f"  [CUDA Hand] FAILED (rc={proc.returncode})")
+            print(f"  stderr: {stderr.decode()[:2000]}")
+            sys.exit(1)
+
+        # Parse binary output: header is [num_results, total_frames, stride]
+        with open(cuda_output, 'rb') as f:
+            num_results = struct.unpack('i', f.read(4))[0]
+            num_frames = struct.unpack('i', f.read(4))[0]
+            out_stride = struct.unpack('i', f.read(4))[0]
+
+            left_kp3d = np.zeros((num_frames, 21, 3), dtype=np.float32)
+            right_kp3d = np.zeros((num_frames, 21, 3), dtype=np.float32)
+            left_kp2d = np.zeros((num_frames, 21, 2), dtype=np.float32)
+            right_kp2d = np.zeros((num_frames, 21, 2), dtype=np.float32)
+            left_detected = np.zeros(num_frames, dtype=bool)
+            right_detected = np.zeros(num_frames, dtype=bool)
+
+            sampled_indices = []
+            for _ in range(num_results):
+                fi = struct.unpack('i', f.read(4))[0]
+                left_det = struct.unpack('B', f.read(1))[0]
+                right_det = struct.unpack('B', f.read(1))[0]
+                l_kp3d = np.frombuffer(f.read(63 * 4), dtype=np.float32).reshape(21, 3)
+                r_kp3d = np.frombuffer(f.read(63 * 4), dtype=np.float32).reshape(21, 3)
+                l_kp2d = np.frombuffer(f.read(42 * 4), dtype=np.float32).reshape(21, 2)
+                r_kp2d = np.frombuffer(f.read(42 * 4), dtype=np.float32).reshape(21, 2)
+                sampled_indices.append(fi)
+                if fi < num_frames:
+                    if left_det:
+                        left_kp3d[fi] = l_kp3d
+                        left_kp2d[fi] = l_kp2d
+                        left_detected[fi] = True
+                    if right_det:
+                        right_kp3d[fi] = r_kp3d
+                        right_kp2d[fi] = r_kp2d
+                        right_detected[fi] = True
+
+        # Interpolate if strided
+        if out_stride > 1 and len(sampled_indices) > 1:
+            if sampled_indices[-1] != num_frames - 1:
+                sampled_indices.append(num_frames - 1)
+            for arr in [left_kp3d, right_kp3d, left_kp2d, right_kp2d]:
+                _interpolate_hand_keypoints(arr, sampled_indices, num_frames)
+            for det_arr in [left_detected, right_detected]:
+                full = np.zeros(num_frames, dtype=bool)
+                full[sampled_indices] = det_arr[sampled_indices]
+                for i in range(len(sampled_indices) - 1):
+                    a, b = sampled_indices[i], sampled_indices[i + 1]
+                    mid = (a + b) // 2
+                    full[a:mid+1] = det_arr[a]
+                    full[mid+1:b] = det_arr[b]
+                det_arr[:] = full
+
+        left_rate = left_detected.sum() / num_frames * 100
+        right_rate = right_detected.sum() / num_frames * 100
+        n_hands = left_detected.sum() + right_detected.sum()
+        print(
+            f"  [CUDA Hand] Done: {t_total:.1f}s, {n_hands} detections, "
+            f"left={left_rate:.1f}% right={right_rate:.1f}%",
+            flush=True,
+        )
+        print(f"  stderr: {stderr.decode()[:500]}", flush=True)
+
+        np.savez(
+            result_path,
+            left_kp3d=left_kp3d, right_kp3d=right_kp3d,
+            left_kp2d=left_kp2d, right_kp2d=right_kp2d,
+            left_detected=left_detected, right_detected=right_detected,
+            num_frames=np.array([num_frames]),
+        )
+
+        # Clean up
+        try:
+            os.remove(cuda_output)
+        except OSError:
+            pass
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def run_slam_and_hand_split(
     video_path, fps, width, height, weights_path, wilor_dir,
     device="cuda", backend_steps=(7, 12), fast_traj=False,
@@ -643,9 +764,9 @@ def run_slam_and_hand_split(
 
     # Fork child BEFORE any CUDA calls
     child = mp_ctx.Process(
-        target=_hand_worker_selfdecode,
+        target=_hand_worker_cuda,
         args=(
-            video_path, wilor_dir, det_conf, stride,
+            video_path, det_conf, stride,
             result_path, num_frames_est,
         ),
     )

@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """Persistent annotation pipeline service.
 
-Keeps SLAM and hand models warm across multiple videos, eliminating ~13s of
-per-video import and model loading overhead.
+Keeps SLAM warm across multiple videos. Hand processing uses the CUDA binary
+(cuda_hand) which handles YOLO + WiLoR + MANO entirely on GPU without PyTorch.
 
 Architecture:
     Parent process: DROID-SLAM (native C++ decoder, CUDA)
-    Child process:  YOLO + WiLoR hand detection (OpenCV decode, CUDA)
-
-The child is forked BEFORE any CUDA calls and keeps models on GPU permanently.
-Communication is via a JSON-lines protocol over a unix socketpair.
+    Per-video:      cuda_hand binary (YOLO + WiLoR + MANO, pure CUDA)
 
 Usage:
     # As a library (from visualizer.py or scripts):
-    service = PipelineService(droid_weights, wilor_dir)
+    service = PipelineService(droid_weights)
     result = service.process_video("/path/to/video.mov", "/path/to/output")
     service.shutdown()
 
@@ -24,18 +21,13 @@ Usage:
 import argparse
 import gc
 import json
-import multiprocessing
 import os
-import signal
-import socket
 import struct
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Thread
-from queue import Queue
 
 import cv2
 import numpy as np
@@ -44,11 +36,7 @@ import torch
 # Import pipeline utilities
 sys.path.insert(0, os.path.dirname(__file__))
 from annotate_pipeline import (
-    _install_pytorch_lightning_stub,
     _get_native_decode,
-    _load_wilor_cpu,
-    _preprocess_hand_crop,
-    _run_wilor_batch,
     _interpolate_hand_keypoints,
     _interpolate_poses_simple,
     get_video_metadata,
@@ -56,337 +44,84 @@ from annotate_pipeline import (
     write_lerobot_dataset,
     start_audio_subprocess,
     collect_audio_subprocess,
-    _SENTINEL,
 )
 from convert_video import build_ffmpeg_cmd
 
 # ---------------------------------------------------------------------------
-# IPC helpers: length-prefixed JSON messages over a socket
+# CUDA hand processing helper
 # ---------------------------------------------------------------------------
 
-def _send_msg(sock, obj):
-    """Send a JSON message with a 4-byte length prefix."""
-    data = json.dumps(obj).encode()
-    sock.sendall(struct.pack("!I", len(data)) + data)
+def _parse_cuda_hand_output(cuda_output, result_path):
+    """Parse binary output from cuda_hand and save as npz."""
+    with open(cuda_output, 'rb') as f:
+        num_results = struct.unpack('i', f.read(4))[0]
+        num_frames = struct.unpack('i', f.read(4))[0]
+        out_stride = struct.unpack('i', f.read(4))[0]
 
+        left_kp3d = np.zeros((num_frames, 21, 3), dtype=np.float32)
+        right_kp3d = np.zeros((num_frames, 21, 3), dtype=np.float32)
+        left_kp2d = np.zeros((num_frames, 21, 2), dtype=np.float32)
+        right_kp2d = np.zeros((num_frames, 21, 2), dtype=np.float32)
+        left_detected = np.zeros(num_frames, dtype=bool)
+        right_detected = np.zeros(num_frames, dtype=bool)
 
-def _recv_msg(sock):
-    """Receive a length-prefixed JSON message. Returns dict or None on EOF."""
-    hdr = b""
-    while len(hdr) < 4:
-        chunk = sock.recv(4 - len(hdr))
-        if not chunk:
-            return None
-        hdr += chunk
-    length = struct.unpack("!I", hdr)[0]
-    data = b""
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
-        if not chunk:
-            return None
-        data += chunk
-    return json.loads(data)
+        sampled_indices = []
+        for _ in range(num_results):
+            fi = struct.unpack('i', f.read(4))[0]
+            left_det = struct.unpack('B', f.read(1))[0]
+            right_det = struct.unpack('B', f.read(1))[0]
+            l_kp3d = np.frombuffer(f.read(63 * 4), dtype=np.float32).reshape(21, 3)
+            r_kp3d = np.frombuffer(f.read(63 * 4), dtype=np.float32).reshape(21, 3)
+            l_kp2d = np.frombuffer(f.read(42 * 4), dtype=np.float32).reshape(21, 2)
+            r_kp2d = np.frombuffer(f.read(42 * 4), dtype=np.float32).reshape(21, 2)
+            sampled_indices.append(fi)
+            if fi < num_frames:
+                if left_det:
+                    left_kp3d[fi] = l_kp3d
+                    left_kp2d[fi] = l_kp2d
+                    left_detected[fi] = True
+                if right_det:
+                    right_kp3d[fi] = r_kp3d
+                    right_kp2d[fi] = r_kp2d
+                    right_detected[fi] = True
 
+    # Interpolate if strided
+    if out_stride > 1 and len(sampled_indices) > 1:
+        if sampled_indices[-1] != num_frames - 1:
+            sampled_indices.append(num_frames - 1)
+        for arr in [left_kp3d, right_kp3d, left_kp2d, right_kp2d]:
+            _interpolate_hand_keypoints(arr, sampled_indices, num_frames)
+        for det_arr in [left_detected, right_detected]:
+            full = np.zeros(num_frames, dtype=bool)
+            full[sampled_indices] = det_arr[sampled_indices]
+            for i in range(len(sampled_indices) - 1):
+                a, b = sampled_indices[i], sampled_indices[i + 1]
+                mid = (a + b) // 2
+                full[a:mid + 1] = det_arr[a]
+                full[mid + 1:b] = det_arr[b]
+            det_arr[:] = full
 
-# ---------------------------------------------------------------------------
-# Hand worker: persistent child process
-# ---------------------------------------------------------------------------
+    left_rate = left_detected.sum() / num_frames * 100
+    right_rate = right_detected.sum() / num_frames * 100
+    n_hands = left_detected.sum() + right_detected.sum()
+    print(
+        f"  [CUDA Hand] {n_hands} detections, "
+        f"left={left_rate:.1f}% right={right_rate:.1f}%",
+        flush=True,
+    )
 
-def _hand_worker_service(wilor_dir, child_sock_fd):
-    """Long-running hand detection process. Reuses YOLO + WiLoR across videos.
-
-    Forked before CUDA init — inherits all Python imports from parent.
-    Communicates via JSON messages over a unix socketpair.
-    """
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    sock = socket.fromfd(child_sock_fd, socket.AF_UNIX, socket.SOCK_STREAM)
-    os.close(child_sock_fd)  # close the raw fd, we use the socket object
-
-    from concurrent.futures import ThreadPoolExecutor as TPE
+    np.savez(
+        result_path,
+        left_kp3d=left_kp3d, right_kp3d=right_kp3d,
+        left_kp2d=left_kp2d, right_kp2d=right_kp2d,
+        left_detected=left_detected, right_detected=right_detected,
+        num_frames=np.array([num_frames]),
+    )
 
     try:
-        torch.cuda.set_device(0)
-        sys.path.insert(0, wilor_dir)
-        from ultralytics import YOLO
-
-        # ── One-time model loading ──
-        t_load = time.perf_counter()
-
-        # WiLoR on CPU in background thread
-        wilor_load_result = [None]
-        def _build_wilor_bg():
-            wilor_load_result[0] = _load_wilor_cpu(wilor_dir)
-        wilor_thread = Thread(target=_build_wilor_bg, daemon=True)
-        wilor_thread.start()
-
-        # Load config for preprocessing constants
-        orig_cwd = os.getcwd()
-        os.chdir(wilor_dir)
-        try:
-            from wilor.configs import get_config as _get_wilor_cfg
-            cfg = _get_wilor_cfg(
-                os.path.join(wilor_dir, 'pretrained_models', 'model_config.yaml'),
-                update_cachedir=True,
-            )
-        finally:
-            os.chdir(orig_cwd)
-
-        mean = 255.0 * np.array(cfg.MODEL.IMAGE_MEAN, dtype=np.float32)
-        std = 255.0 * np.array(cfg.MODEL.IMAGE_STD, dtype=np.float32)
-        bbox_shape = cfg.MODEL.get('BBOX_SHAPE', [192, 256])
-        img_size_cfg = cfg.MODEL.IMAGE_SIZE
-        rescale_factor = 2.0
-        BATCH_SIZE = 48
-        YOLO_BATCH = 16
-
-        # YOLO to GPU
-        hand_stream = torch.cuda.Stream()
-        wilor_stream = torch.cuda.Stream()
-        with torch.cuda.stream(hand_stream):
-            detector = YOLO(
-                os.path.join(wilor_dir, 'pretrained_models', 'detector.pt'),
-            ).to('cuda')
-
-        # WiLoR to GPU
-        wilor_thread.join()
-        model_cpu, model_cfg = wilor_load_result[0]
-        with torch.cuda.stream(wilor_stream):
-            model = model_cpu.to('cuda').eval().half()
-            model.backbone.skip_blocks = True
-        del model_cpu
-
-        t_ready = time.perf_counter() - t_load
-        print(f"  [Hand service] Models loaded in {t_ready:.1f}s", flush=True)
-        _send_msg(sock, {"status": "ready"})
-
-        # ── Per-video processing loop ──
-        while True:
-            msg = _recv_msg(sock)
-            if msg is None:
-                break  # parent closed socket
-            cmd = msg.get("cmd")
-            if cmd == "shutdown":
-                break
-            if cmd == "health":
-                vram = torch.cuda.memory_allocated() / 1e6
-                _send_msg(sock, {"status": "alive", "vram_mb": round(vram)})
-                continue
-            if cmd != "process":
-                _send_msg(sock, {"status": "error", "message": f"Unknown cmd: {cmd}"})
-                continue
-
-            video_path = msg["video_path"]
-            det_conf = msg.get("det_conf", 0.3)
-            stride = msg.get("stride", 1)
-            num_frames_est = msg.get("num_frames_est", 2000)
-            result_path = msg["result_path"]
-
-            try:
-                t_start = time.perf_counter()
-                _process_one_video(
-                    video_path, det_conf, stride, num_frames_est, result_path,
-                    detector, model, model_cfg, hand_stream, wilor_stream,
-                    mean, std, bbox_shape, img_size_cfg, rescale_factor,
-                    BATCH_SIZE, YOLO_BATCH,
-                )
-                elapsed = time.perf_counter() - t_start
-                _send_msg(sock, {"status": "done", "result_path": result_path, "time": round(elapsed, 1)})
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                _send_msg(sock, {"status": "error", "message": str(e)})
-
-            # Cleanup between videos
-            torch.cuda.empty_cache()
-
-    except Exception:
-        import traceback
-        traceback.print_exc()
-    finally:
-        sock.close()
-
-
-def _process_one_video(
-    video_path, det_conf, stride, num_frames_est, result_path,
-    detector, model, model_cfg, hand_stream, wilor_stream,
-    mean, std, bbox_shape, img_size_cfg, rescale_factor,
-    BATCH_SIZE, YOLO_BATCH,
-):
-    """Process a single video through YOLO + WiLoR. Uses pre-loaded models."""
-    from concurrent.futures import ThreadPoolExecutor as TPE
-
-    with torch.no_grad():
-        max_frames = max(num_frames_est + 100, 4000)
-        left_kp3d = np.full((max_frames, 21, 3), np.nan, dtype=np.float32)
-        right_kp3d = np.full((max_frames, 21, 3), np.nan, dtype=np.float32)
-        left_kp2d = np.full((max_frames, 21, 2), np.nan, dtype=np.float32)
-        right_kp2d = np.full((max_frames, 21, 2), np.nan, dtype=np.float32)
-        left_detected = np.zeros(max_frames, dtype=bool)
-        right_detected = np.zeros(max_frames, dtype=bool)
-
-        crop_queue = Queue(maxsize=256)
-        n_hands_done = [0]
-        wilor_error = []
-
-        def _wilor_inference_loop():
-            try:
-                torch.cuda.set_device(0)
-                with torch.cuda.stream(wilor_stream), torch.no_grad():
-                    crop_buf_imgs = []
-                    crop_buf_meta = []
-                    while True:
-                        item = crop_queue.get()
-                        if item is _SENTINEL:
-                            break
-                        img_t, meta = item
-                        crop_buf_imgs.append(img_t)
-                        crop_buf_meta.append(meta)
-                        if len(crop_buf_imgs) >= BATCH_SIZE:
-                            _run_wilor_batch(
-                                crop_buf_imgs[:BATCH_SIZE],
-                                crop_buf_meta[:BATCH_SIZE],
-                                model, model_cfg, 'cuda',
-                                left_kp3d, right_kp3d,
-                                left_kp2d, right_kp2d,
-                                left_detected, right_detected,
-                            )
-                            n_hands_done[0] += BATCH_SIZE
-                            crop_buf_imgs = crop_buf_imgs[BATCH_SIZE:]
-                            crop_buf_meta = crop_buf_meta[BATCH_SIZE:]
-                    if crop_buf_imgs:
-                        _run_wilor_batch(
-                            crop_buf_imgs, crop_buf_meta,
-                            model, model_cfg, 'cuda',
-                            left_kp3d, right_kp3d,
-                            left_kp2d, right_kp2d,
-                            left_detected, right_detected,
-                        )
-                        n_hands_done[0] += len(crop_buf_imgs)
-            except Exception:
-                import traceback
-                wilor_error.append(traceback.format_exc())
-
-        wilor_thread = Thread(target=_wilor_inference_loop, daemon=True)
-        wilor_thread.start()
-
-        # ── YOLO detection (streaming from OpenCV) ──
-        t_yolo_start = time.perf_counter()
-        total_crops = 0
-        yolo_batch = []
-        sampled_indices = []
-        prep_pool = TPE(max_workers=4)
-
-        def _preprocess_and_enqueue(fi, img_bgr, center, scale, is_right, img_wh):
-            img_tensor, bbox_size = _preprocess_hand_crop(
-                img_bgr, center, scale, bbox_shape, img_size_cfg, is_right, mean, std,
-            )
-            crop_queue.put((
-                torch.from_numpy(img_tensor).half(),
-                (fi, center.copy(), bbox_size, img_wh, is_right),
-            ))
-
-        def _flush_yolo():
-            nonlocal total_crops
-            if not yolo_batch:
-                return
-            fis = [x[0] for x in yolo_batch]
-            imgs = [x[1] for x in yolo_batch]
-            with torch.cuda.stream(hand_stream):
-                results = detector(imgs, conf=det_conf, verbose=False)
-            for i, (det_fi, dets) in enumerate(zip(fis, results)):
-                bboxes, is_right_list = [], []
-                for det in dets:
-                    bbox = det.boxes.data.cpu().detach().squeeze().numpy()
-                    is_right_list.append(det.boxes.cls.cpu().detach().squeeze().item())
-                    bboxes.append(bbox[:4].tolist())
-                if bboxes:
-                    boxes = np.stack(bboxes).astype(np.float32)
-                    right_arr = np.stack(is_right_list).astype(np.float32)
-                    img_bgr = imgs[i]
-                    img_h, img_w = img_bgr.shape[:2]
-                    centers = (boxes[:, 2:4] + boxes[:, 0:2]) / 2.0
-                    scales = rescale_factor * (boxes[:, 2:4] - boxes[:, 0:2]) / 200.0
-                    img_wh = np.array([img_w, img_h], dtype=np.float32)
-                    for k in range(len(boxes)):
-                        prep_pool.submit(
-                            _preprocess_and_enqueue,
-                            det_fi, img_bgr, centers[k], scales[k],
-                            right_arr[k], img_wh,
-                        )
-                    total_crops += len(bboxes)
-
-        cap = cv2.VideoCapture(video_path)
-        fi = 0
-        while True:
-            ret, img_bgr = cap.read()
-            if not ret:
-                break
-            if stride <= 1 or fi % stride == 0:
-                sampled_indices.append(fi)
-                yolo_batch.append((fi, img_bgr))
-                if len(yolo_batch) >= YOLO_BATCH:
-                    _flush_yolo()
-                    yolo_batch = []
-            fi += 1
-        cap.release()
-        _flush_yolo()
-        yolo_batch = []
-
-        prep_pool.shutdown(wait=True)
-        crop_queue.put(_SENTINEL)
-
-        num_frames = fi
-        t_yolo = time.perf_counter() - t_yolo_start
-        print(
-            f"  [Hand service] Decode+YOLO: {t_yolo:.1f}s "
-            f"({num_frames/max(t_yolo,0.001):.0f} fps), {total_crops} crops",
-            flush=True,
-        )
-
-        wilor_thread.join()
-        if wilor_error:
-            raise RuntimeError(f"WiLoR failed:\n{wilor_error[0]}")
-
-        # Trim
-        left_kp3d = left_kp3d[:num_frames]
-        right_kp3d = right_kp3d[:num_frames]
-        left_kp2d = left_kp2d[:num_frames]
-        right_kp2d = right_kp2d[:num_frames]
-        left_detected = left_detected[:num_frames]
-        right_detected = right_detected[:num_frames]
-
-        # Interpolate if strided
-        if stride > 1 and len(sampled_indices) > 1:
-            if sampled_indices[-1] != num_frames - 1:
-                sampled_indices.append(num_frames - 1)
-            for arr in [left_kp3d, right_kp3d, left_kp2d, right_kp2d]:
-                _interpolate_hand_keypoints(arr, sampled_indices, num_frames)
-            for det_arr in [left_detected, right_detected]:
-                full = np.zeros(num_frames, dtype=bool)
-                full[sampled_indices] = det_arr[sampled_indices]
-                for i in range(len(sampled_indices) - 1):
-                    a, b = sampled_indices[i], sampled_indices[i + 1]
-                    mid = (a + b) // 2
-                    full[a:mid+1] = det_arr[a]
-                    full[mid+1:b] = det_arr[b]
-                det_arr[:] = full
-
-        left_rate = left_detected.sum() / num_frames * 100
-        right_rate = right_detected.sum() / num_frames * 100
-        t_total = time.perf_counter() - t_yolo_start
-        print(
-            f"  [Hand service] Done: {t_total:.1f}s, {n_hands_done[0]} hands, "
-            f"left={left_rate:.1f}% right={right_rate:.1f}%",
-            flush=True,
-        )
-
-        np.savez(
-            result_path,
-            left_kp3d=left_kp3d, right_kp3d=right_kp3d,
-            left_kp2d=left_kp2d, right_kp2d=right_kp2d,
-            left_detected=left_detected, right_detected=right_detected,
-            num_frames=np.array([num_frames]),
-        )
+        os.remove(cuda_output)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -394,11 +129,10 @@ def _process_one_video(
 # ---------------------------------------------------------------------------
 
 class PipelineService:
-    """Persistent annotation pipeline. Models loaded once, reused per video.
+    """Persistent annotation pipeline. SLAM stays warm, hands use persistent CUDA binary.
 
     Usage:
-        service = PipelineService(droid_weights="/path/to/droid.pth",
-                                  wilor_dir="/path/to/WiLoR")
+        service = PipelineService(droid_weights="/path/to/droid.pth")
         result = service.process_video("/path/to/video.mov", "/path/to/output")
         service.shutdown()
     """
@@ -406,61 +140,51 @@ class PipelineService:
     def __init__(
         self,
         droid_weights="/workspace/DROID-SLAM/checkpoints/droid.pth",
-        wilor_dir="/workspace/WiLoR",
+        wilor_dir="/workspace/WiLoR",  # kept for API compat, unused
         device="cuda",
         asr_model="parakeet-tdt_ctc-110m",
     ):
-        self.wilor_dir = wilor_dir
         self.device = device
         self.asr_model = asr_model
-        self.hand_sock = None
-        self.hand_proc = None
         self._nd = None
         self._ready = False
+        self._hand_proc = None
 
         t_start = time.perf_counter()
-        self._pre_import()
         self._start_hand_worker()
         self._init_slam()
-        self._wait_hand_ready()
         t_total = time.perf_counter() - t_start
         print(f"[Service] Ready in {t_total:.1f}s", flush=True)
         self._ready = True
 
-    def _pre_import(self):
-        """Pre-import heavy modules so the forked child inherits them."""
-        _install_pytorch_lightning_stub()
-        import timm  # noqa: F401
-        sys.path.insert(0, self.wilor_dir)
-        from ultralytics import YOLO  # noqa: F401
-        import smplx  # noqa: F401
-        orig_cwd = os.getcwd()
-        os.chdir(self.wilor_dir)
-        try:
-            from wilor.configs import get_config  # noqa: F401
-            from wilor.models.wilor import WiLoR  # noqa: F401
-        finally:
-            os.chdir(orig_cwd)
-        print("[Service] Modules pre-imported", flush=True)
-
     def _start_hand_worker(self):
-        """Fork hand worker BEFORE any CUDA calls."""
-        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        mp_ctx = multiprocessing.get_context('fork')
-        self.hand_proc = mp_ctx.Process(
-            target=_hand_worker_service,
-            args=(self.wilor_dir, child_sock.fileno()),
-            daemon=True,
-        )
-        self.hand_proc.start()
-        child_sock.close()
-        self.hand_sock = parent_sock
+        """Start persistent cuda_hand binary in --listen mode."""
+        cuda_hand_dir = os.path.join(os.path.dirname(__file__), 'cuda_hand')
+        cuda_hand_bin = os.path.join(cuda_hand_dir, 'cuda_hand')
+        weights_dir = os.path.join(cuda_hand_dir, 'data', 'weights')
 
-    def _wait_hand_ready(self):
-        """Wait for child to finish loading models and signal ready."""
-        msg = _recv_msg(self.hand_sock)
-        if msg is None or msg.get("status") != "ready":
-            raise RuntimeError(f"Hand worker failed to start: {msg}")
+        if not os.path.exists(cuda_hand_bin):
+            raise FileNotFoundError(f"CUDA hand binary not found: {cuda_hand_bin}")
+
+        self._hand_proc = subprocess.Popen(
+            [cuda_hand_bin, '--weights-dir', weights_dir, '--listen'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        # Collect stderr in background
+        self._hand_stderr = []
+        def _read_stderr():
+            for line in self._hand_proc.stderr:
+                self._hand_stderr.append(line.decode().rstrip())
+                print(f"  [cuda_hand] {self._hand_stderr[-1]}", flush=True)
+        self._stderr_thread = Thread(target=_read_stderr, daemon=True)
+        self._stderr_thread.start()
+
+        # Wait for READY
+        ready_line = self._hand_proc.stdout.readline().decode().strip()
+        if ready_line != "READY":
+            raise RuntimeError(f"cuda_hand failed to start: {ready_line}")
+        print("[Service] CUDA hand worker started", flush=True)
 
     def _init_slam(self):
         """Initialize CUDA DROID-SLAM binary and native decoder."""
@@ -531,21 +255,22 @@ class PipelineService:
                 ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             t_vc = time.perf_counter()
 
-        # ── Dispatch hand processing to child ──
+        # ── Dispatch hand processing (persistent CUDA binary) ──
         hand_result = None
         result_path = f"/tmp/hand_result_svc_{os.getpid()}_{int(time.time())}.npz"
+        cuda_output = result_path.replace('.npz', '_cuda.bin')
         if not skip_hands:
-            _progress("Hands", "dispatching to worker...")
-            _send_msg(self.hand_sock, {
-                "cmd": "process",
-                "video_path": video_path,
+            _progress("Hands", "dispatching to CUDA hand worker...")
+            job = json.dumps({
+                "video": video_path,
+                "output": cuda_output,
                 "det_conf": hand_det_conf,
                 "stride": hand_stride,
-                "num_frames_est": nf_est,
-                "result_path": result_path,
-            })
+            }) + "\n"
+            self._hand_proc.stdin.write(job.encode())
+            self._hand_proc.stdin.flush()
 
-        # ── Run SLAM in parent (concurrently with child's hand processing) ──
+        # ── Run SLAM in parent (concurrently with hand processing) ──
         slam_result = None
         num_frames = 0
         if not skip_slam:
@@ -558,14 +283,15 @@ class PipelineService:
 
         # ── Collect hand result ──
         if not skip_hands:
-            _progress("Hands", "waiting for result...")
-            hand_msg = _recv_msg(self.hand_sock)
-            if hand_msg is None:
-                raise RuntimeError("Hand worker connection lost")
-            if hand_msg.get("status") == "error":
-                raise RuntimeError(f"Hand worker: {hand_msg.get('message')}")
-            if hand_msg.get("status") != "done":
-                raise RuntimeError(f"Unexpected hand status: {hand_msg}")
+            _progress("Hands", "waiting for CUDA hand result...")
+            # Read response line from cuda_hand stdout
+            resp_line = self._hand_proc.stdout.readline().decode().strip()
+            resp = json.loads(resp_line)
+            if resp.get("status") != "done":
+                raise RuntimeError(f"CUDA hand failed: {resp}")
+            t_hand = resp.get("time", "?")
+
+            _parse_cuda_hand_output(cuda_output, result_path)
 
             data = np.load(result_path)
             hand_num_frames = int(data["num_frames"][0]) if "num_frames" in data else num_frames
@@ -582,7 +308,7 @@ class PipelineService:
                 num_frames = hand_num_frames
             if os.path.exists(result_path):
                 os.remove(result_path)
-            _progress("Hands", f"done ({hand_msg.get('time', '?')}s)")
+            _progress("Hands", f"done ({t_hand}s)")
 
         if num_frames == 0:
             fps, _, _, num_frames = get_video_metadata(video_path)
@@ -737,36 +463,21 @@ class PipelineService:
         return slam_result, num_frames
 
     def health_check(self):
-        """Check if hand worker is alive. Returns dict with status."""
-        if not self.hand_proc or not self.hand_proc.is_alive():
-            return {"status": "dead"}
-        try:
-            _send_msg(self.hand_sock, {"cmd": "health"})
-            # Set a timeout for the response
-            self.hand_sock.settimeout(5.0)
-            try:
-                msg = _recv_msg(self.hand_sock)
-            finally:
-                self.hand_sock.settimeout(None)
-            return msg or {"status": "unresponsive"}
-        except (socket.timeout, OSError):
-            return {"status": "unresponsive"}
+        """Check service health."""
+        hand_alive = self._hand_proc is not None and self._hand_proc.poll() is None
+        return {"status": "alive" if hand_alive else "dead"}
 
     def shutdown(self):
-        """Gracefully shut down the hand worker."""
-        if self.hand_sock:
+        """Shut down the persistent cuda_hand worker."""
+        if self._hand_proc and self._hand_proc.poll() is None:
             try:
-                _send_msg(self.hand_sock, {"cmd": "shutdown"})
-            except OSError:
-                pass
-            self.hand_sock.close()
-            self.hand_sock = None
-        if self.hand_proc:
-            self.hand_proc.join(timeout=10)
-            if self.hand_proc.is_alive():
-                self.hand_proc.kill()
-                self.hand_proc.join(timeout=5)
-            self.hand_proc = None
+                self._hand_proc.stdin.write(b"SHUTDOWN\n")
+                self._hand_proc.stdin.flush()
+                self._hand_proc.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                self._hand_proc.kill()
+                self._hand_proc.wait(timeout=5)
+        self._hand_proc = None
         print("[Service] Shutdown complete", flush=True)
 
     def __del__(self):
