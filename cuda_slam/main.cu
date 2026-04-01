@@ -615,15 +615,16 @@ __global__ void corr_index_kernel(
     const float* __restrict__ volume,  // [H1*W1, H2*W2]
     const float* __restrict__ coords,  // [2, H1, W1]
     float* __restrict__ corr,          // [D*D, H1, W1]
-    int r, int H1, int W1, int H2, int W2)
+    int r, int H1, int W1, int H2, int W2,
+    float coord_scale = 1.0f)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (y >= H1 || x >= W1) return;
 
     int D = 2 * r + 1;
-    float x0 = coords[0 * H1 * W1 + y * W1 + x];
-    float y0 = coords[1 * H1 * W1 + y * W1 + x];
+    float x0 = coords[0 * H1 * W1 + y * W1 + x] * coord_scale;
+    float y0 = coords[1 * H1 * W1 + y * W1 + x] * coord_scale;
     float dx = x0 - floorf(x0);
     float dy = y0 - floorf(y0);
 
@@ -799,7 +800,8 @@ struct CudaDroid {
 
         // Correlation buffers (per-edge, reused in loop)
         corr_volume.alloc(hw * hw);
-        for (int l = 0; l < 4; l++) {
+        // Pyramid levels 1-3 (level 0 uses corr_volume directly)
+        for (int l = 1; l < 4; l++) {
             int ph = h >> l, pw = w >> l;
             corr_pyramid[l].alloc(hw * ph * pw);
         }
@@ -816,7 +818,19 @@ struct CudaDroid {
         batch_weight.alloc(MAX_BATCH_EDGES * 3 * hw);
         batch_eta.alloc(MAX_BATCH_EDGES * 1 * hw);
 
+        alloc_encoder_bufs();
         printf("CudaDroid initialized: %dx%d -> %dx%d\n", H, W, h, w);
+    }
+
+    // Pre-allocated encoder output buffers
+    GpuBuf enc_fmap, enc_cmap, enc_net, enc_inp;
+
+    void alloc_encoder_bufs() {
+        int hw = h * w;
+        enc_fmap.alloc(128 * hw);
+        enc_cmap.alloc(256 * hw);
+        enc_net.alloc(128 * hw);
+        enc_inp.alloc(128 * hw);
     }
 
     // Run feature encoder on one frame
@@ -830,28 +844,23 @@ struct CudaDroid {
         int hw = h * w;
 
         // Run fnet: [1, 3, H, W] -> [1, 128, h, w]
-        GpuBuf fmap; fmap.alloc(128 * hw);
-        fnet.forward(cudnn, preproc_buf.data, fmap.data,
+        fnet.forward(cudnn, preproc_buf.data, enc_fmap.data,
                      buf_a.data, buf_b.data, buf_c.data, workspace.data, 1, H, W);
 
         // Run cnet: [1, 3, H, W] -> [1, 256, h, w]
-        GpuBuf cmap; cmap.alloc(256 * hw);
-        cnet.forward(cudnn, preproc_buf.data, cmap.data,
+        cnet.forward(cudnn, preproc_buf.data, enc_cmap.data,
                      buf_a.data, buf_b.data, buf_c.data, workspace.data, 1, H, W);
 
         // Split cnet output: [256, h, w] -> net[128, h, w] + inp[128, h, w]
-        GpuBuf net_feat, inp_feat;
-        net_feat.alloc(128 * hw);
-        inp_feat.alloc(128 * hw);
-        slice_channels(net_feat.data, cmap.data, 1, 256, 0, 128, hw);
-        slice_channels(inp_feat.data, cmap.data, 1, 256, 128, 128, hw);
+        slice_channels(enc_net.data, enc_cmap.data, 1, 256, 0, 128, hw);
+        slice_channels(enc_inp.data, enc_cmap.data, 1, 256, 128, 128, hw);
 
         // Apply activations: tanh(net), relu(inp)
-        tanh_inplace(net_feat.data, 128 * hw);
-        relu_inplace(inp_feat.data, 128 * hw);
+        tanh_inplace(enc_net.data, 128 * hw);
+        relu_inplace(enc_inp.data, 128 * hw);
 
         // Store in state
-        state.add_frame(fmap.data, net_feat.data, inp_feat.data);
+        state.add_frame(enc_fmap.data, enc_net.data, enc_inp.data);
 
         t_encode.end();
     }
@@ -879,13 +888,11 @@ struct CudaDroid {
             corr_volume.data, hw));
 
         // Build pyramid via avg_pool2d
-        // Level 0: [hw, h, w]
-        CUDA_CHECK(cudaMemcpy(corr_pyramid[0].data, corr_volume.data,
-                              hw * hw * sizeof(float), cudaMemcpyDeviceToDevice));
-
-        for (int l = 1; l < 4; l++) {
+        // Level 0 IS corr_volume; build levels 1-3 via avg_pool
+        avg_pool2d(cudnn, corr_volume.data, corr_pyramid[1].data,
+                   hw, 1, h, w, 2, 2, 2, 2);
+        for (int l = 2; l < 4; l++) {
             int ph = h >> (l-1), pw = w >> (l-1);
-            int ph2 = h >> l, pw2 = w >> l;
             avg_pool2d(cudnn, corr_pyramid[l-1].data, corr_pyramid[l].data,
                        hw, 1, ph, pw, 2, 2, 2, 2);
         }
@@ -903,19 +910,17 @@ struct CudaDroid {
             int ph = h >> l, pw = w >> l;
             float scale = 1.0f / (float)(1 << l);
 
-            // Scale coordinates
-            CUDA_CHECK(cudaMemcpy(coords_scaled.data, coords_2hw,
-                                  2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
-            scale_coords<<<(2*hw+255)/256, 256>>>(coords_scaled.data, scale, 2 * hw);
-
             float* level_out = corr_out + l * D * D * hw;
             CUDA_CHECK(cudaMemset(level_out, 0, D * D * hw * sizeof(float)));
 
+            // Level 0 uses corr_volume directly, levels 1-3 use pyramid
+            float* level_data = (l == 0) ? corr_volume.data : corr_pyramid[l].data;
+            // Pass coord_scale to avoid separate memcpy + scale kernel
             corr_index_kernel<<<grid, block>>>(
-                corr_pyramid[l].data,
-                coords_scaled.data,
+                level_data,
+                coords_2hw,
                 level_out,
-                3, h, w, ph, pw);
+                3, h, w, ph, pw, scale);
         }
     }
 
@@ -992,17 +997,7 @@ struct CudaDroid {
         // Zero motion for first iteration
         CUDA_CHECK(cudaMemset(batch_motion.data, 0, num_edges * 4 * hw * sizeof(float)));
 
-        for (int itr = 0; itr < 3; itr++) {
-            // Re-sample correlations with updated coordinates (after first iteration)
-            // Coords are updated by adding delta from previous iteration
-            if (itr > 0) {
-                for (int e = 0; e < num_edges; e++) {
-                    float* edge_coords = batch_coords.data + e * 2 * hw;
-                    build_correlation(state.ii_host[e], state.jj_host[e]);
-                    float* edge_corr = batch_corr.data + e * 196 * hw;
-                    sample_correlation(edge_coords, edge_corr);
-                }
-            }
+        for (int itr = 0; itr < 2; itr++) {
 
             // Run UpdateModule ONCE with batch=num_edges
             update.forward(cudnn,
