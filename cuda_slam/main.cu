@@ -576,6 +576,36 @@ struct DroidState {
 
     int num_edges() const { return (int)ii_host.size(); }
 
+    // Remove edges where BOTH endpoints are older than min_kf.
+    // Keep any edge that has at least one endpoint >= min_kf.
+    void remove_old_edges(int min_kf, int hw) {
+        int n = (int)ii_host.size();
+        if (n == 0) return;
+        std::vector<int> new_ii, new_jj;
+        new_ii.reserve(n); new_jj.reserve(n);
+        for (int e = 0; e < n; e++) {
+            if (ii_host[e] >= min_kf || jj_host[e] >= min_kf) {
+                // Compact edge hidden state
+                int new_idx = (int)new_ii.size();
+                if (new_idx != e) {
+                    CUDA_CHECK(cudaMemcpy(edge_nets.data + new_idx * 128 * hw,
+                                          edge_nets.data + e * 128 * hw,
+                                          128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                    CUDA_CHECK(cudaMemcpy(target.data + new_idx * 2 * hw,
+                                          target.data + e * 2 * hw,
+                                          2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                    CUDA_CHECK(cudaMemcpy(weight.data + new_idx * 2 * hw,
+                                          weight.data + e * 2 * hw,
+                                          2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                }
+                new_ii.push_back(ii_host[e]);
+                new_jj.push_back(jj_host[e]);
+            }
+        }
+        ii_host = std::move(new_ii);
+        jj_host = std::move(new_jj);
+    }
+
     void sync_edges_to_gpu() {
         int n = ii_host.size();
         if (n == 0) return;
@@ -959,6 +989,8 @@ struct CudaDroid {
     float filter_thresh = 2.4f;
     int warmup = 8;
     int edge_radius = 2;
+    int frontend_window = 25;  // sliding window size (matches PyTorch DROID-SLAM)
+    int update_steps = 3;     // GRU update steps per keyframe
 
     // Buffers for GRU-based motion filter (single edge)
     GpuBuf mf_corr, mf_coords, mf_motion, mf_nets, mf_inps;
@@ -1065,6 +1097,12 @@ struct CudaDroid {
         // 6. Add edges connecting new keyframe to recent keyframes
         int prev_num_edges = state.num_edges();
         state.add_edges_for_keyframe(new_kf, edge_radius);
+
+        // Prune edges outside the frontend window
+        if (new_kf >= frontend_window) {
+            state.remove_old_edges(new_kf - frontend_window + 1, hw);
+        }
+
         state.sync_edges_to_gpu();
         int total_edges = state.num_edges();
 
@@ -1078,8 +1116,8 @@ struct CudaDroid {
 
         if (total_edges == 0) { t_total.end(); return; }
 
-        // 7. Run full DROID-SLAM update: 3 steps of [reproject + corr + GRU + BA]
-        run_update_pass(total_edges);
+        // 7. Run full DROID-SLAM update: N steps of [reproject + corr + GRU + BA]
+        run_update_pass(total_edges, update_steps);
 
         t_total.end();
     }
@@ -1309,6 +1347,10 @@ int main(int argc, char** argv) {
     int backend_iters1 = 0, backend_iters2 = 0;
     int backend_radius = 2;
     bool cam_to_world = false;
+    bool stdin_mode = false;
+    int stdin_h = 0, stdin_w = 0;
+    int frontend_window = 25;
+    int update_steps = 3;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--weights") == 0 && i+1 < argc) weight_dir = argv[++i];
@@ -1322,6 +1364,13 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--backend-radius") == 0 && i+1 < argc) backend_radius = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cam-to-world") == 0) cam_to_world = true;
+        else if (strcmp(argv[i], "--stdin") == 0 && i+2 < argc) {
+            stdin_mode = true;
+            stdin_h = atoi(argv[++i]);
+            stdin_w = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--frontend-window") == 0 && i+1 < argc) frontend_window = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--update-steps") == 0 && i+1 < argc) update_steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--debug-dump") == 0) {
             // After processing 2 frames, dump intermediate values
             // This is handled after the main loop
@@ -1342,9 +1391,13 @@ int main(int argc, char** argv) {
                calib[0], calib[1], calib[2], calib[3]);
     }
 
-    // Read frame metadata
-    int frameH, frameW, totalFrames, stride;
-    {
+    int frameH, frameW;
+    if (stdin_mode) {
+        frameH = stdin_h;
+        frameW = stdin_w;
+        printf("Stdin mode: %dx%d\n", frameH, frameW);
+    } else {
+        int totalFrames, stride;
         char meta_path[512];
         snprintf(meta_path, sizeof(meta_path), "%s/meta.txt", frame_dir);
         FILE* f = fopen(meta_path, "r");
@@ -1357,36 +1410,56 @@ int main(int argc, char** argv) {
     // Initialize CUDA DROID
     CudaDroid droid;
     droid.init(frameH, frameW, calib[0], calib[1], calib[2], calib[3], weight_dir);
+    droid.frontend_window = frontend_window;
+    droid.update_steps = update_steps;
     if (debug_dump) droid.verbose = true;
 
     // Allocate frame buffer on GPU
     GpuBuf frame_gpu;
-    frame_gpu.alloc(frameH * frameW * 3);
+    int frame_floats = frameH * frameW * 3;
+    frame_gpu.alloc(frame_floats);
 
     // Process frames
     int frames_processed = 0;
-    for (int i = 0; i < std::min(max_frames, totalFrames); i++) {
-        char frame_path[512];
-        snprintf(frame_path, sizeof(frame_path), "%s/frame_%05d.bin", frame_dir, i);
+    if (stdin_mode) {
+        // Read frames from stdin: raw float32 HWC BGR data, no per-frame header
+        float* pinned_buf;
+        CUDA_CHECK(cudaMallocHost(&pinned_buf, frame_floats * sizeof(float)));
+        size_t frame_bytes = (size_t)frame_floats * sizeof(float);
 
-        FILE* f = fopen(frame_path, "rb");
-        if (!f) { printf("Cannot open frame %d, stopping.\n", i); break; }
+        while (frames_processed < max_frames) {
+            size_t bytes_read = 0;
+            while (bytes_read < frame_bytes) {
+                size_t n = fread((char*)pinned_buf + bytes_read, 1,
+                                 frame_bytes - bytes_read, stdin);
+                if (n == 0) goto done_stdin;
+                bytes_read += n;
+            }
+            CUDA_CHECK(cudaMemcpy(frame_gpu.data, pinned_buf,
+                                  frame_bytes, cudaMemcpyHostToDevice));
+            droid.process_frame(frames_processed, frame_gpu.data);
+            frames_processed++;
+        }
+        done_stdin:
+        CUDA_CHECK(cudaFreeHost(pinned_buf));
+    } else {
+        std::vector<float> frame_data(frame_floats);
+        for (int i = 0; i < max_frames; i++) {
+            char frame_path[512];
+            snprintf(frame_path, sizeof(frame_path), "%s/frame_%05d.bin", frame_dir, i);
 
-        int fh, fw;
-        fread(&fh, sizeof(int), 1, f);
-        fread(&fw, sizeof(int), 1, f);
+            FILE* f = fopen(frame_path, "rb");
+            if (!f) break;
 
-        std::vector<float> frame_data(fh * fw * 3);
-        fread(frame_data.data(), sizeof(float), fh * fw * 3, f);
-        fclose(f);
+            int fh, fw;
+            fread(&fh, sizeof(int), 1, f);
+            fread(&fw, sizeof(int), 1, f);
+            fread(frame_data.data(), sizeof(float), frame_floats, f);
+            fclose(f);
 
-        frame_gpu.copyFrom(frame_data.data(), fh * fw * 3);
-        droid.process_frame(i, frame_gpu.data);
-        frames_processed++;
-
-        if (frames_processed % 10 == 0) {
-            printf("Processed %d/%d frames\r", frames_processed, max_frames);
-            fflush(stdout);
+            frame_gpu.copyFrom(frame_data.data(), frame_floats);
+            droid.process_frame(i, frame_gpu.data);
+            frames_processed++;
         }
     }
 
