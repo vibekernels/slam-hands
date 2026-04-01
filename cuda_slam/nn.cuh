@@ -145,6 +145,7 @@ struct ConvLayer {
         CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&convDesc));
         CUDNN_CHECK(cudnnSetConvolution2dDescriptor(convDesc, p, p, s, s, 1, 1,
             CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+        CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
 
         // Find best supported algorithm
         cudnnTensorDescriptor_t inDesc, outDesc;
