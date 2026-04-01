@@ -10,3 +10,5 @@ output_test/
 *.mp4
 *.MOV
 *.mov
+cuda_slam/cuda_droid
+cuda_slam/data/

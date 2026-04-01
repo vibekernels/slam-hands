@@ -123,9 +123,10 @@ struct ResBlock {
         if (has_norm) instance_norm(temp, batch, out_channels, outH, outW);
         relu_inplace(temp, outN);
 
-        // output = conv2(temp)
+        // output = relu(norm(conv2(temp)))
         conv2.forward(cudnn, temp, output, workspace, batch, outH, outW);
         if (has_norm) instance_norm(output, batch, out_channels, outH, outW);
+        relu_inplace(output, outN);
 
         // Residual connection
         if (has_downsample) {
@@ -303,17 +304,11 @@ struct ConvGRU {
         int total_inp = batch * (128 + 64) * HW;  // inp+corr+flow
         int total_cat = batch * 448 * HW;          // net+inp+corr+flow
 
-        // Concatenate inputs: [inp(128), corr(128), flow(64)] = 320 channels
-        // Then concatenate with net: [net(128), inp_cat(320)] = 448 channels
-        // For simplicity, build the full 448-channel tensor directly
-        concat3_kernel<<<(batch*320*HW+255)/256, 256>>>(
-            cat_buf.data + NC*HW,  // offset past first 128 channels
-            inp, corr, flow,
-            batch, 128, 128, 64, HW);
-
-        // Copy net to first 128 channels of cat_buf
-        CUDA_CHECK(cudaMemcpy(cat_buf.data, net, NC * HW * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
+        // Build cat_buf = [net(128), inp(128), corr(128), flow(64)] = 448 channels, NCHW
+        concat4_kernel<<<(batch*448*HW+255)/256, 256>>>(
+            cat_buf.data,
+            net, inp, corr, flow,
+            batch, 128, 128, 128, 64, HW);
 
         // Compute global context: sigmoid(w(net)) * net, then spatial mean
         w_conv.forward(cudnn, net, gate_buf.data, workspace, batch, h, w);
@@ -338,16 +333,16 @@ struct ConvGRU {
         broadcast_add_kernel<<<NC, 256>>>(r_buf.data, r_glo.data, NC, HW);
         sigmoid_inplace(r_buf.data, NC * HW);
 
-        // gru_input = cat(r*net, inp_cat)
+        // gru_input = cat(r*net, inp, corr, flow) = 448 channels
         // r*net -> rnet_buf
         CUDA_CHECK(cudaMemcpy(rnet_buf.data, net, NC * HW * sizeof(float),
                               cudaMemcpyDeviceToDevice));
         mul_kernel<<<(NC*HW+255)/256, 256>>>(rnet_buf.data, r_buf.data, NC * HW);
         // Build gru_input: [r*net(128), inp(128), corr(128), flow(64)] = 448
-        CUDA_CHECK(cudaMemcpy(gru_inp_buf.data, rnet_buf.data, NC * HW * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(gru_inp_buf.data + NC*HW, cat_buf.data + NC*HW,
-                              batch * 320 * HW * sizeof(float), cudaMemcpyDeviceToDevice));
+        concat4_kernel<<<(batch*448*HW+255)/256, 256>>>(
+            gru_inp_buf.data,
+            rnet_buf.data, inp, corr, flow,
+            batch, 128, 128, 128, 64, HW);
 
         // q = tanh(convq(gru_input) + convq_glo(glo))
         convq.forward(cudnn, gru_inp_buf.data, q_buf.data, workspace, batch, h, w);
@@ -457,6 +452,8 @@ struct UpdateModule {
         relu_inplace(temp1, batch * 128 * HW);
         delta_2.forward(cudnn, temp1, delta_out, workspace, batch, h, w);
 
+        // (debug output removed)
+
         // Weight head
         weight_0.forward(cudnn, net, temp1, workspace, batch, h, w);
         relu_inplace(temp1, batch * 128 * HW);
@@ -482,21 +479,24 @@ struct DroidState {
 
     int H, W;        // Full resolution
     int h, w;         // 1/8 resolution
-    int num_frames;   // Total frames added
+    int num_keyframes; // Number of keyframes stored
 
-    // Per-keyframe state (on GPU)
+    // Keyframe tracking: maps keyframe index -> original frame timestamp
+    std::vector<int> kf_timestamps;
+
+    // Per-keyframe state (on GPU), indexed by keyframe index
     GpuBuf poses;      // [MAX_KF, 7]
     GpuBuf disps;      // [MAX_KF, h, w]
     GpuBuf fmaps;      // [MAX_KF, 128, h, w]
-    GpuBuf nets;       // [MAX_KF, 128, h, w]
+    GpuBuf nets;       // [MAX_KF, 128, h, w]  (initial hidden state)
     GpuBuf inps;       // [MAX_KF, 128, h, w]
     GpuBuf intrinsics; // [4]
 
-    // Edge state
+    // Edge state (persistent across frames)
     std::vector<int> ii_host, jj_host;
     GpuIntBuf ii_gpu, jj_gpu;
 
-    // Per-edge target and weight
+    // Per-edge target, weight, and hidden state (persistent)
     GpuBuf target;     // [MAX_EDGES, 2, h, w]
     GpuBuf weight;     // [MAX_EDGES, 2, h, w]
     GpuBuf edge_nets;  // [MAX_EDGES, 128, h, w]
@@ -505,7 +505,7 @@ struct DroidState {
     void init(int fullH, int fullW, float fx, float fy, float cx, float cy) {
         H = fullH; W = fullW;
         h = fullH / 8; w = fullW / 8;
-        num_frames = 0;
+        num_keyframes = 0;
 
         int hw = h * w;
         poses.alloc(MAX_KEYFRAMES * 7);
@@ -529,8 +529,8 @@ struct DroidState {
             id_poses[i*7 + 6] = 1.0f;  // qw = 1
         poses.copyFrom(id_poses.data(), MAX_KEYFRAMES * 7);
 
-        // Initialize disparities to 0.5
-        std::vector<float> init_disps(MAX_KEYFRAMES * hw, 0.5f);
+        // Initialize disparities to 1.0 (matching PyTorch DROID-SLAM)
+        std::vector<float> init_disps(MAX_KEYFRAMES * hw, 1.0f);
         disps.copyFrom(init_disps.data(), MAX_KEYFRAMES * hw);
 
         // Edge buffers
@@ -541,9 +541,10 @@ struct DroidState {
         jj_gpu.alloc(MAX_EDGES);
     }
 
-    void add_frame(float* fmap, float* net, float* inp) {
+    // Add a keyframe: store features at keyframe index, record timestamp
+    void add_keyframe(int frame_timestamp, float* fmap, float* net, float* inp) {
         int hw = h * w;
-        int idx = num_frames;
+        int idx = num_keyframes;
         CUDA_CHECK(cudaMemcpy(fmaps.data + idx * 128 * hw, fmap,
                               128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(nets.data + idx * 128 * hw, net,
@@ -551,27 +552,29 @@ struct DroidState {
         CUDA_CHECK(cudaMemcpy(inps.data + idx * 128 * hw, inp,
                               128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
 
-        // Copy pose from previous frame
+        // Copy pose from previous keyframe
         if (idx > 0) {
             CUDA_CHECK(cudaMemcpy(poses.data + idx * 7, poses.data + (idx-1) * 7,
                                   7 * sizeof(float), cudaMemcpyDeviceToDevice));
         }
 
-        num_frames++;
+        kf_timestamps.push_back(frame_timestamp);
+        num_keyframes++;
     }
 
-    // Add edges between nearby keyframes
-    void add_neighborhood_edges(int start, int end, int radius = 3) {
-        for (int i = start; i < end; i++) {
-            for (int j = std::max(start, i - radius); j < std::min(end, i + radius + 1); j++) {
-                if (i != j) {
-                    ii_host.push_back(i);
-                    jj_host.push_back(j);
-                }
-            }
+    // Add edges connecting new keyframe to nearby ones
+    void add_edges_for_keyframe(int kf_idx, int radius) {
+        int start = std::max(0, kf_idx - radius);
+        for (int j = start; j < kf_idx; j++) {
+            // Bidirectional edges
+            ii_host.push_back(kf_idx);
+            jj_host.push_back(j);
+            ii_host.push_back(j);
+            jj_host.push_back(kf_idx);
         }
-        sync_edges_to_gpu();
     }
+
+    int num_edges() const { return (int)ii_host.size(); }
 
     void sync_edges_to_gpu() {
         int n = ii_host.size();
@@ -581,8 +584,6 @@ struct DroidState {
         ii_gpu.copyFrom(ii_host.data(), n);
         jj_gpu.copyFrom(jj_host.data(), n);
     }
-
-    int num_edges() const { return ii_host.size(); }
 };
 
 // ============ Image preprocessing kernel ============
@@ -691,6 +692,33 @@ __global__ void gather_features_kernel(
 // Scatter batch results back to per-edge storage (just a copy, edges are already indexed)
 // dst[e, :, :, :] = src[e, :, :, :]  (identity, used when edge_nets is the batch buffer itself)
 
+// Compute motion features: [flow_x, flow_y, resd_x, resd_y]
+// flow = coords1 - coords0, residual = target - coords1
+__global__ void compute_motion_kernel(
+    float* __restrict__ motion,       // [batch, 4, h, w] output
+    const float* __restrict__ coords1,  // [batch, 2, h, w]
+    const float* __restrict__ coords0,  // [batch, 2, h, w] identity grid
+    const float* __restrict__ target,   // [batch, 2, h, w] previous target (or coords1 for step 0)
+    int batch, int HW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * HW) return;
+    int e = idx / HW, k = idx % HW;
+
+    float c1x = coords1[e * 2 * HW + 0 * HW + k];
+    float c1y = coords1[e * 2 * HW + 1 * HW + k];
+    float c0x = coords0[e * 2 * HW + 0 * HW + k];
+    float c0y = coords0[e * 2 * HW + 1 * HW + k];
+    float tx = target[e * 2 * HW + 0 * HW + k];
+    float ty = target[e * 2 * HW + 1 * HW + k];
+
+    // Clamp to [-64, 64] like PyTorch
+    motion[e * 4 * HW + 0 * HW + k] = fminf(fmaxf(c1x - c0x, -64.0f), 64.0f);
+    motion[e * 4 * HW + 1 * HW + k] = fminf(fmaxf(c1y - c0y, -64.0f), 64.0f);
+    motion[e * 4 * HW + 2 * HW + k] = fminf(fmaxf(tx - c1x, -64.0f), 64.0f);
+    motion[e * 4 * HW + 3 * HW + k] = fminf(fmaxf(ty - c1y, -64.0f), 64.0f);
+}
+
 // Compute target = coords + delta (first 2 channels of delta)
 // Also extract weight (first 2 channels of weight output)
 __global__ void compute_target_kernel(
@@ -758,6 +786,7 @@ struct CudaDroid {
     CudaTimer t_total{"total"};
 
     int H, W, h, w;
+    bool verbose = false;
 
     void init(int fullH, int fullW, float fx, float fy, float cx, float cy,
               const char* weight_dir) {
@@ -819,6 +848,8 @@ struct CudaDroid {
         batch_eta.alloc(MAX_BATCH_EDGES * 1 * hw);
 
         alloc_encoder_bufs();
+        alloc_motion_filter_bufs();
+        alloc_coords0();
         printf("CudaDroid initialized: %dx%d -> %dx%d\n", H, W, h, w);
     }
 
@@ -859,8 +890,8 @@ struct CudaDroid {
         tanh_inplace(enc_net.data, 128 * hw);
         relu_inplace(enc_inp.data, 128 * hw);
 
-        // Store in state
-        state.add_frame(enc_fmap.data, enc_net.data, enc_inp.data);
+        // Note: features stored in enc_fmap/enc_net/enc_inp
+        // Caller decides whether to add as keyframe
 
         t_encode.end();
     }
@@ -871,19 +902,19 @@ struct CudaDroid {
         float* f1 = state.fmaps.data + i * 128 * hw;
         float* f2 = state.fmaps.data + j * 128 * hw;
 
-        // All-pairs correlation: fmap1^T @ fmap2 / C
-        // fmap1: [128, hw], fmap2: [128, hw]
-        // result: [hw, hw]
-        float alpha = 1.0f / 128.0f;
+        // All-pairs correlation: corr[src, tgt] = dot(fmap1[src], fmap2[tgt]) / C
+        // cuBLAS stores column-major but corr_index_kernel reads row-major.
+        // Row-major read: data[src*hw + tgt] = col-major C[tgt, src].
+        // So we compute C[i,j] = dot(f2[i], f1[j]) which makes
+        // data[src*hw + tgt] = C[tgt, src] = dot(f2[tgt], f1[src]) = corr(src, tgt) ✓
+        // PyTorch DROID-SLAM divides each fmap by 4.0 before matmul, giving 1/16 total scaling.
+        float alpha = 1.0f / 16.0f;
         float beta = 0.0f;
-
-        // In col-major (cuBLAS): f1 is [hw, 128], f2 is [hw, 128]
-        // result = f1 @ f2^T = [hw, hw]
         CUBLAS_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             hw, hw, 128,
             &alpha,
-            f1, hw,
-            f2, hw,
+            f2, hw,  // swapped: was f1
+            f1, hw,  // swapped: was f2
             &beta,
             corr_volume.data, hw));
 
@@ -924,116 +955,324 @@ struct CudaDroid {
         }
     }
 
-    // Process one frame - BATCHED edge processing
-    void process_frame(float* bgr_hwc_gpu) {
-        t_total.begin();
+    // Motion filter parameters (matching DROID-SLAM defaults)
+    float filter_thresh = 2.4f;
+    int warmup = 8;
+    int edge_radius = 2;
 
-        // 1. Encode features
-        encode_frame(bgr_hwc_gpu);
+    // Buffers for GRU-based motion filter (single edge)
+    GpuBuf mf_corr, mf_coords, mf_motion, mf_nets, mf_inps;
+    GpuBuf mf_delta, mf_weight, mf_eta;
 
-        int n = state.num_frames;
-        if (n < 2) { t_total.end(); return; }
+    void alloc_motion_filter_bufs() {
+        int hw = h * w;
+        mf_corr.alloc(196 * hw);
+        mf_coords.alloc(2 * hw);
+        mf_motion.alloc(4 * hw);
+        mf_nets.alloc(128 * hw);
+        mf_inps.alloc(128 * hw);
+        mf_delta.alloc(3 * hw);
+        mf_weight.alloc(3 * hw);
+        mf_eta.alloc(hw);
+    }
 
+    // Compute GRU-predicted optical flow between last keyframe and current frame
+    // Returns mean flow magnitude
+    float compute_motion_gru(int last_kf_idx) {
         int hw = h * w;
 
-        // 2. Add edges to nearby frames (limited window like DROID-SLAM motion filter)
-        // Only add edges for the newest frame to recent frames
-        int start = std::max(0, n - 3);
-        state.ii_host.clear();
-        state.jj_host.clear();
-        for (int j = start; j < n - 1; j++) {
-            state.ii_host.push_back(n - 1);
-            state.jj_host.push_back(j);
-            state.jj_host.push_back(n - 1);
-            state.ii_host.push_back(j);
-        }
-        state.sync_edges_to_gpu();
+        // Build correlation between last keyframe and current frame (in temp slot)
+        int temp_slot = state.num_keyframes;
+        build_correlation(last_kf_idx, temp_slot);
 
-        int num_edges = std::min(state.num_edges(), MAX_BATCH_EDGES);
-        if (num_edges == 0) { t_total.end(); return; }
-
-        // 3. Build correlations ONCE for all edges (correlation volumes don't change between GRU iterations)
-        t_corr.begin();
-        for (int e = 0; e < num_edges; e++) {
-            int ii_val = state.ii_host[e];
-            int jj_val = state.jj_host[e];
-
-            // Reproject: get initial coordinates for this edge (outputs [H,W,2] interleaved)
-            projmap_kernel<<<1, 256>>>(
-                state.poses.data, state.disps.data, state.intrinsics.data,
-                (const int*)state.ii_gpu.data + e, (const int*)state.jj_gpu.data + e,
-                coords_hw2.data, buf_a.data, 1, h, w);
-
-            // Convert from [H,W,2] to [2,H,W] channel-first format
-            float* edge_coords = batch_coords.data + e * 2 * hw;
-            coords_hw2_to_2hw<<<(hw+255)/256, 256>>>(coords_hw2.data, edge_coords, hw);
-
-            // Build correlation volume and sample
-            build_correlation(ii_val, jj_val);
-            float* edge_corr = batch_corr.data + e * 196 * hw;
-            sample_correlation(edge_coords, edge_corr);
-        }
-        t_corr.end();
-
-        // 4. GRU update iterations (BATCHED)
-        t_update.begin();
-
-        // Initialize edge nets from keyframe nets (gather by ii index)
-        {
-            int total = num_edges * 128 * hw;
-            gather_features_kernel<<<(total+255)/256, 256>>>(
-                batch_nets.data, state.nets.data,
-                state.ii_gpu.data, num_edges, 128, hw);
-        }
-
-        // Gather inp features for all edges (constant across iterations)
-        {
-            int total = num_edges * 128 * hw;
-            gather_features_kernel<<<(total+255)/256, 256>>>(
-                batch_inps.data, state.inps.data,
-                state.ii_gpu.data, num_edges, 128, hw);
-        }
-
-        // Zero motion for first iteration
-        CUDA_CHECK(cudaMemset(batch_motion.data, 0, num_edges * 4 * hw * sizeof(float)));
-
-        for (int itr = 0; itr < 2; itr++) {
-
-            // Run UpdateModule ONCE with batch=num_edges
-            update.forward(cudnn,
-                batch_corr.data, batch_motion.data,
-                batch_nets.data, batch_inps.data,
-                batch_delta.data, batch_weight.data, batch_eta.data,
-                buf_a.data, buf_b.data, workspace.data,
-                num_edges, h, w);
-
-            // Compute targets: target = coords + delta, extract weights
-            {
-                int total = num_edges * 2 * hw;
-                compute_target_kernel<<<(total+255)/256, 256>>>(
-                    state.target.data, state.weight.data,
-                    batch_coords.data, batch_delta.data, batch_weight.data,
-                    num_edges, hw);
+        // Initialize coordinates as identity grid (pixel coordinates at 1/8 res)
+        std::vector<float> grid(2 * hw);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                grid[0 * h * w + y * w + x] = (float)x;  // x channel
+                grid[1 * h * w + y * w + x] = (float)y;  // y channel
             }
-        }
-        t_update.end();
+        mf_coords.copyFrom(grid.data(), 2 * hw);
 
-        // 5. Bundle adjustment with computed targets and weights
-        t_ba.begin();
-        if (num_edges > 0) {
-            int t0 = 1;  // Don't optimize first pose
-            int t1 = n;
-            ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
-                       state.target.data, state.weight.data,
-                       state.disps.data,  // eta placeholder
-                       state.ii_gpu.data, state.jj_gpu.data,
-                       state.ii_host.data(), state.jj_host.data(),
-                       num_edges, t0, t1,
-                       1e-4f, 0.1f, true);
+        // Sample correlation at identity coords
+        sample_correlation(mf_coords.data, mf_corr.data);
+
+        // Initialize nets from last keyframe, inps from last keyframe
+        CUDA_CHECK(cudaMemcpy(mf_nets.data, state.nets.data + last_kf_idx * 128 * hw,
+                              128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(mf_inps.data, state.inps.data + last_kf_idx * 128 * hw,
+                              128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        // Zero motion
+        CUDA_CHECK(cudaMemset(mf_motion.data, 0, 4 * hw * sizeof(float)));
+
+        // Run single GRU iteration with batch=1
+        update.forward(cudnn,
+            mf_corr.data, mf_motion.data,
+            mf_nets.data, mf_inps.data,
+            mf_delta.data, mf_weight.data, mf_eta.data,
+            buf_a.data, buf_b.data, workspace.data,
+            1, h, w);
+
+        // Compute mean flow magnitude from delta [3, h, w] (first 2 channels are dx, dy)
+        std::vector<float> delta_host(3 * hw);
+        CUDA_CHECK(cudaMemcpy(delta_host.data(), mf_delta.data,
+                              3 * hw * sizeof(float), cudaMemcpyDeviceToHost));
+
+        float sum_mag = 0;
+        for (int k = 0; k < hw; k++) {
+            float dx = delta_host[0 * hw + k];
+            float dy = delta_host[1 * hw + k];
+            sum_mag += sqrtf(dx * dx + dy * dy);
         }
-        t_ba.end();
+        return sum_mag / hw;
+    }
+
+    // Process one frame with motion filtering and persistent edges
+    void process_frame(int frame_t, float* bgr_hwc_gpu) {
+        t_total.begin();
+
+        // 1. Always encode features
+        encode_frame(bgr_hwc_gpu);
+
+        int hw = h * w;
+        int nk = state.num_keyframes;
+
+        // 2. First frame: always a keyframe
+        if (nk == 0) {
+            state.add_keyframe(frame_t, enc_fmap.data, enc_net.data, enc_inp.data);
+            t_total.end();
+            return;
+        }
+
+        // 3. Store fmap temporarily at slot num_keyframes for correlation computation
+        CUDA_CHECK(cudaMemcpy(state.fmaps.data + nk * 128 * hw, enc_fmap.data,
+                              128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        // 4. Motion filter: use GRU-predicted flow relative to last keyframe
+        float flow = compute_motion_gru(nk - 1);
+
+        // During warmup or if flow exceeds threshold, add as keyframe
+        if (flow < filter_thresh && nk >= warmup) {
+            t_total.end();
+            return;  // Not enough motion, skip
+        }
+
+        // 5. Accept as keyframe
+        state.add_keyframe(frame_t, enc_fmap.data, enc_net.data, enc_inp.data);
+        int new_kf = state.num_keyframes - 1;
+
+        // 6. Add edges connecting new keyframe to recent keyframes
+        int prev_num_edges = state.num_edges();
+        state.add_edges_for_keyframe(new_kf, edge_radius);
+        state.sync_edges_to_gpu();
+        int total_edges = state.num_edges();
+
+        // Initialize hidden states for new edges from keyframe nets
+        for (int e = prev_num_edges; e < total_edges; e++) {
+            int ii_val = state.ii_host[e];
+            CUDA_CHECK(cudaMemcpy(state.edge_nets.data + e * 128 * hw,
+                                  state.nets.data + ii_val * 128 * hw,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+
+        if (total_edges == 0) { t_total.end(); return; }
+
+        // 7. Run full DROID-SLAM update: 3 steps of [reproject + corr + GRU + BA]
+        run_update_pass(total_edges);
 
         t_total.end();
+    }
+
+    // Persistent coords0 buffer (identity grid) for computing flow
+    GpuBuf coords0_buf;  // [MAX_BATCH, 2, h, w]
+
+    void alloc_coords0() {
+        int hw = h * w;
+        coords0_buf.alloc(MAX_BATCH_EDGES * 2 * hw);
+        // Fill with identity grid (pixel coordinates)
+        std::vector<float> grid(MAX_BATCH_EDGES * 2 * hw);
+        for (int e = 0; e < MAX_BATCH_EDGES; e++) {
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++) {
+                    grid[e * 2 * hw + 0 * hw + y * w + x] = (float)x;
+                    grid[e * 2 * hw + 1 * hw + y * w + x] = (float)y;
+                }
+        }
+        coords0_buf.copyFrom(grid.data(), MAX_BATCH_EDGES * 2 * hw);
+    }
+
+    // Run full DROID-SLAM update: 3 steps of [reproject + corr + GRU + BA]
+    void run_update_pass(int total_edges, int num_steps = 3) {
+        int hw = h * w;
+
+        // Load persistent edge hidden states into batch buffers (for all edges, batched)
+        // First, load inps (constant across steps)
+        for (int bs = 0; bs < total_edges; bs += MAX_BATCH_EDGES) {
+            int batch_size = std::min(MAX_BATCH_EDGES, total_edges - bs);
+            for (int e = 0; e < batch_size; e++) {
+                int ii_val = state.ii_host[bs + e];
+                CUDA_CHECK(cudaMemcpy(batch_inps.data + e * 128 * hw,
+                                      state.inps.data + ii_val * 128 * hw,
+                                      128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            }
+            // Store inp batch back to a persistent location (we'll re-load it each step)
+            // Actually, let's just re-gather inps each batch. They don't change.
+        }
+
+        for (int step = 0; step < num_steps; step++) {
+            t_corr.begin();
+            t_update.begin();
+
+            // Process all edges in batches: reproject, correlate, GRU
+            for (int bs = 0; bs < total_edges; bs += MAX_BATCH_EDGES) {
+                int batch_size = std::min(MAX_BATCH_EDGES, total_edges - bs);
+
+                // 1. Reproject using current poses -> coords1
+                for (int e = 0; e < batch_size; e++) {
+                    int ii_val = state.ii_host[bs + e];
+                    int jj_val = state.jj_host[bs + e];
+
+                    projmap_kernel<<<1, 256>>>(
+                        state.poses.data, state.disps.data, state.intrinsics.data,
+                        (const int*)state.ii_gpu.data + bs + e,
+                        (const int*)state.jj_gpu.data + bs + e,
+                        coords_hw2.data, buf_a.data, 1, h, w);
+
+                    float* edge_coords = batch_coords.data + e * 2 * hw;
+                    coords_hw2_to_2hw<<<(hw+255)/256, 256>>>(coords_hw2.data, edge_coords, hw);
+
+                    // 2. Correlation
+                    build_correlation(ii_val, jj_val);
+                    sample_correlation(edge_coords, batch_corr.data + e * 196 * hw);
+                }
+
+                // 3. Compute motion: [flow, residual] = [coords1 - coords0, target - coords1]
+                // For step 0: target = coords1, so residual = 0, flow = coords1 - identity
+                // For step > 0: target was set in previous step, residual = target - coords1
+                {
+                    // flow channels 0,1: coords1 - coords0
+                    // flow channels 2,3: target - coords1 (zero for first step)
+                    int total = batch_size * hw;
+                    // Compute on CPU for clarity (small data transfer)
+                    CUDA_CHECK(cudaMemset(batch_motion.data, 0, batch_size * 4 * hw * sizeof(float)));
+
+                    // flow_x = coords1_x - pixel_x, flow_y = coords1_y - pixel_y
+                    // These are batched, and we already have batch_coords (coords1) and coords0_buf
+                    // Let's launch a kernel for this
+                    compute_motion_kernel<<<(total+255)/256, 256>>>(
+                        batch_motion.data,
+                        batch_coords.data,
+                        coords0_buf.data,
+                        (step > 0) ? (state.target.data + bs * 2 * hw) : batch_coords.data,
+                        batch_size, hw);
+                }
+
+                // 4. Load hidden states and inps
+                for (int e = 0; e < batch_size; e++) {
+                    CUDA_CHECK(cudaMemcpy(batch_nets.data + e * 128 * hw,
+                                          state.edge_nets.data + (bs + e) * 128 * hw,
+                                          128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                    int ii_val = state.ii_host[bs + e];
+                    CUDA_CHECK(cudaMemcpy(batch_inps.data + e * 128 * hw,
+                                          state.inps.data + ii_val * 128 * hw,
+                                          128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                }
+
+                // 5. GRU update
+                update.forward(cudnn,
+                    batch_corr.data, batch_motion.data,
+                    batch_nets.data, batch_inps.data,
+                    batch_delta.data, batch_weight.data, batch_eta.data,
+                    buf_a.data, buf_b.data, workspace.data,
+                    batch_size, h, w);
+
+                // 6. target = coords1 + delta
+                {
+                    int total = batch_size * 2 * hw;
+                    compute_target_kernel<<<(total+255)/256, 256>>>(
+                        state.target.data + bs * 2 * hw,
+                        state.weight.data + bs * 2 * hw,
+                        batch_coords.data, batch_delta.data, batch_weight.data,
+                        batch_size, hw);
+                }
+
+
+                // 7. Save hidden states
+                for (int e = 0; e < batch_size; e++) {
+                    CUDA_CHECK(cudaMemcpy(state.edge_nets.data + (bs + e) * 128 * hw,
+                                          batch_nets.data + e * 128 * hw,
+                                          128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                }
+            }
+
+            t_corr.end();
+            t_update.end();
+
+
+            // 8. BA with all edges (2 iterations like PyTorch)
+            t_ba.begin();
+            int t0 = 1;
+            int t1 = state.num_keyframes;
+            for (int ba_iter = 0; ba_iter < 2; ba_iter++) {
+                ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
+                           state.target.data, state.weight.data,
+                           state.disps.data,
+                           state.ii_gpu.data, state.jj_gpu.data,
+                           state.ii_host.data(), state.jj_host.data(),
+                           total_edges, t0, t1,
+                           1e-4f, 0.1f, true);
+            }
+            t_ba.end();
+
+            // (verbose pose output removed)
+        }
+    }
+
+    // Backend optimization: rebuild dense edges and run multiple update+BA iterations
+    void backend(int iters, int radius = 2) {
+        int N = state.num_keyframes;
+        int hw = h * w;
+        if (N < 3) return;
+
+        printf("Backend: %d iterations, radius %d, %d keyframes\n", iters, radius, N);
+
+        // Build dense proximity edges (replacing frontend edges)
+        state.ii_host.clear();
+        state.jj_host.clear();
+        for (int i = 0; i < N; i++) {
+            for (int j = std::max(0, i - radius); j < std::min(N, i + radius + 1); j++) {
+                if (i != j) {
+                    state.ii_host.push_back(i);
+                    state.jj_host.push_back(j);
+                }
+            }
+        }
+        state.sync_edges_to_gpu();
+        int total_edges = state.num_edges();
+
+        // Initialize edge hidden states from keyframe nets
+        for (int e = 0; e < total_edges; e++) {
+            int ii_val = state.ii_host[e];
+            CUDA_CHECK(cudaMemcpy(state.edge_nets.data + e * 128 * hw,
+                                  state.nets.data + ii_val * 128 * hw,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+
+        for (int iter = 0; iter < iters; iter++) {
+            // Run update pass: corr + GRU on all edges (batched)
+            run_update_pass(total_edges);
+
+            // BA with ALL edges
+            ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
+                       state.target.data, state.weight.data,
+                       state.disps.data,
+                       state.ii_gpu.data, state.jj_gpu.data,
+                       state.ii_host.data(), state.jj_host.data(),
+                       total_edges, 1, N,
+                       1e-4f, 0.1f, true);
+        }
+        printf("Backend done\n");
     }
 
     void print_timing(int num_frames) {
@@ -1065,14 +1304,32 @@ int main(int argc, char** argv) {
     const char* weight_dir = "data/weights";
     const char* frame_dir = "data/frames";
     const char* calib_file = "data/calib.bin";
+    const char* pose_output = nullptr;
     int max_frames = 100;
+    int backend_iters1 = 0, backend_iters2 = 0;
+    int backend_radius = 2;
+    bool cam_to_world = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--weights") == 0 && i+1 < argc) weight_dir = argv[++i];
         else if (strcmp(argv[i], "--frames") == 0 && i+1 < argc) frame_dir = argv[++i];
         else if (strcmp(argv[i], "--calib") == 0 && i+1 < argc) calib_file = argv[++i];
         else if (strcmp(argv[i], "--max-frames") == 0 && i+1 < argc) max_frames = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--pose-output") == 0 && i+1 < argc) pose_output = argv[++i];
+        else if (strcmp(argv[i], "--backend") == 0 && i+2 < argc) {
+            backend_iters1 = atoi(argv[++i]);
+            backend_iters2 = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--backend-radius") == 0 && i+1 < argc) backend_radius = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--cam-to-world") == 0) cam_to_world = true;
+        else if (strcmp(argv[i], "--debug-dump") == 0) {
+            // After processing 2 frames, dump intermediate values
+            // This is handled after the main loop
+        }
     }
+    bool debug_dump = false;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--debug-dump") == 0) debug_dump = true;
 
     // Load calibration
     float calib[4];
@@ -1100,6 +1357,7 @@ int main(int argc, char** argv) {
     // Initialize CUDA DROID
     CudaDroid droid;
     droid.init(frameH, frameW, calib[0], calib[1], calib[2], calib[3], weight_dir);
+    if (debug_dump) droid.verbose = true;
 
     // Allocate frame buffer on GPU
     GpuBuf frame_gpu;
@@ -1123,7 +1381,7 @@ int main(int argc, char** argv) {
         fclose(f);
 
         frame_gpu.copyFrom(frame_data.data(), fh * fw * 3);
-        droid.process_frame(frame_gpu.data);
+        droid.process_frame(i, frame_gpu.data);
         frames_processed++;
 
         if (frames_processed % 10 == 0) {
@@ -1135,14 +1393,125 @@ int main(int argc, char** argv) {
     printf("\n");
     droid.print_timing(frames_processed);
 
+    // Debug dump intermediate values
+    if (debug_dump && droid.state.num_keyframes >= 2) {
+        int hw = droid.h * droid.w;
+        int nk = droid.state.num_keyframes;
+        printf("\n=== Debug Dump ===\n");
+
+        // Dump fmap stats for first 2 keyframes
+        for (int kf = 0; kf < std::min(2, nk); kf++) {
+            std::vector<float> fmap(128 * hw);
+            CUDA_CHECK(cudaMemcpy(fmap.data(), droid.state.fmaps.data + kf * 128 * hw,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToHost));
+            float fmin = 1e9, fmax = -1e9, fsum = 0;
+            for (auto v : fmap) { fmin = std::min(fmin, v); fmax = std::max(fmax, v); fsum += v; }
+            printf("KF%d fmap: mean=%.6f range=[%.4f, %.4f]\n", kf, fsum/(128*hw), fmin, fmax);
+
+            // Save to file
+            char path[256];
+            snprintf(path, sizeof(path), "/tmp/cuda_fmap%d.bin", kf);
+            FILE* f = fopen(path, "wb");
+            int shape[3] = {128, droid.h, droid.w};
+            fwrite(shape, sizeof(int), 3, f);
+            fwrite(fmap.data(), sizeof(float), 128 * hw, f);
+            fclose(f);
+        }
+
+        // Dump net and inp for kf 0
+        {
+            std::vector<float> net(128 * hw), inp(128 * hw);
+            CUDA_CHECK(cudaMemcpy(net.data(), droid.state.nets.data,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(inp.data(), droid.state.inps.data,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToHost));
+            float nmin=1e9, nmax=-1e9, nsum=0;
+            for (auto v : net) { nmin=std::min(nmin,v); nmax=std::max(nmax,v); nsum+=v; }
+            printf("KF0 net: mean=%.6f range=[%.4f, %.4f]\n", nsum/(128*hw), nmin, nmax);
+            float imin=1e9, imax=-1e9, isum=0;
+            for (auto v : inp) { imin=std::min(imin,v); imax=std::max(imax,v); isum+=v; }
+            printf("KF0 inp: mean=%.6f range=[%.4f, %.4f]\n", isum/(128*hw), imin, imax);
+        }
+
+        // Build correlation between kf 0 and kf 1, dump stats
+        droid.build_correlation(0, 1);
+        std::vector<float> corr_vol(hw * hw);
+        CUDA_CHECK(cudaMemcpy(corr_vol.data(), droid.corr_volume.data,
+                              hw * hw * sizeof(float), cudaMemcpyDeviceToHost));
+        float cmin=1e9, cmax=-1e9, csum=0;
+        for (auto v : corr_vol) { cmin=std::min(cmin,v); cmax=std::max(cmax,v); csum+=v; }
+        printf("Corr(0,1): mean=%.6f range=[%.4f, %.4f]\n", csum/(hw*hw), cmin, cmax);
+        printf("  corr[0,0]=%.6f corr[0,1]=%.6f corr[1,0]=%.6f corr[100,100]=%.6f\n",
+               corr_vol[0*hw+0], corr_vol[0*hw+1], corr_vol[1*hw+0], corr_vol[100*hw+100]);
+        // Diagonal
+        float diag_sum = 0;
+        for (int i = 0; i < hw; i++) diag_sum += corr_vol[i*hw+i];
+        printf("  diagonal mean=%.6f\n", diag_sum / hw);
+    }
+
+    // Backend optimization
+    if (backend_iters1 > 0) {
+        auto t_be = std::chrono::high_resolution_clock::now();
+        droid.backend(backend_iters1, backend_radius);
+        if (backend_iters2 > 0)
+            droid.backend(backend_iters2, backend_radius);
+        auto t_be_end = std::chrono::high_resolution_clock::now();
+        float be_ms = std::chrono::duration<float, std::milli>(t_be_end - t_be).count();
+        printf("Backend total: %.1f ms\n", be_ms);
+    }
+
     // Output final poses
-    printf("\n=== Final Poses ===\n");
-    std::vector<float> poses(droid.state.num_frames * 7);
-    droid.state.poses.copyTo(poses.data(), droid.state.num_frames * 7);
-    for (int i = 0; i < std::min(10, droid.state.num_frames); i++) {
+    int nk = droid.state.num_keyframes;
+    printf("\n=== Final Poses (%d keyframes from %d frames) ===\n", nk, frames_processed);
+    printf("Keyframe timestamps:");
+    for (int i = 0; i < nk; i++) printf(" %d", droid.state.kf_timestamps[i]);
+    printf("\n");
+
+    int nf = nk;
+    std::vector<float> poses(nf * 7);
+    droid.state.poses.copyTo(poses.data(), nf * 7);
+
+    // Convert world-to-camera -> camera-to-world if requested
+    if (cam_to_world) {
+        for (int i = 0; i < nf; i++) {
+            float* p = &poses[i * 7];
+            // SE3 inverse: q_inv = conjugate, t_inv = -R_inv * t
+            float qx = p[3], qy = p[4], qz = p[5], qw = p[6];
+            // q_inv = [-qx, -qy, -qz, qw]
+            float qi[4] = {-qx, -qy, -qz, qw};
+            // t_inv = -rotate(t, q_inv)
+            float t[3] = {-p[0], -p[1], -p[2]};
+            // Apply rotation: actSO3(qi, t, t_inv) on CPU
+            float uv[3];
+            uv[0] = 2.0f * (qi[1]*t[2] - qi[2]*t[1]);
+            uv[1] = 2.0f * (qi[2]*t[0] - qi[0]*t[2]);
+            uv[2] = 2.0f * (qi[0]*t[1] - qi[1]*t[0]);
+            p[0] = t[0] + qi[3]*uv[0] + (qi[1]*uv[2] - qi[2]*uv[1]);
+            p[1] = t[1] + qi[3]*uv[1] + (qi[2]*uv[0] - qi[0]*uv[2]);
+            p[2] = t[2] + qi[3]*uv[2] + (qi[0]*uv[1] - qi[1]*uv[0]);
+            p[3] = qi[0]; p[4] = qi[1]; p[5] = qi[2]; p[6] = qi[3];
+        }
+    }
+
+    for (int i = 0; i < std::min(10, nf); i++) {
         printf("Frame %3d: t=[%7.3f %7.3f %7.3f] q=[%6.3f %6.3f %6.3f %6.3f]\n",
                i, poses[i*7], poses[i*7+1], poses[i*7+2],
                poses[i*7+3], poses[i*7+4], poses[i*7+5], poses[i*7+6]);
+    }
+
+    // Save poses and keyframe timestamps to binary file if requested
+    // Format: [num_keyframes:i32] [timestamps:i32*nk] [poses:f32*nk*7]
+    if (pose_output) {
+        FILE* f = fopen(pose_output, "wb");
+        if (f) {
+            fwrite(&nk, sizeof(int), 1, f);
+            // Write keyframe timestamps
+            std::vector<int> ts(droid.state.kf_timestamps.begin(), droid.state.kf_timestamps.end());
+            fwrite(ts.data(), sizeof(int), nk, f);
+            fwrite(poses.data(), sizeof(float), nk * 7, f);
+            fclose(f);
+            printf("Saved %d keyframe poses to %s\n", nk, pose_output);
+        }
     }
 
     droid.destroy();

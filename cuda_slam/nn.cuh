@@ -492,6 +492,30 @@ __global__ void concat3_kernel(float* output, const float* a, const float* b, co
     }
 }
 
+// Concatenate 4 tensors along channel dim: [N,C1,HW] + [N,C2,HW] + [N,C3,HW] + [N,C4,HW] -> [N,C1+C2+C3+C4,HW]
+__global__ void concat4_kernel(float* output,
+                               const float* a, const float* b, const float* c, const float* d,
+                               int N, int C1, int C2, int C3, int C4, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int CT = C1 + C2 + C3 + C4;
+    int total = N * CT * HW;
+    if (idx >= total) return;
+
+    int hw = idx % HW;
+    int ch = (idx / HW) % CT;
+    int n = idx / (HW * CT);
+
+    if (ch < C1) {
+        output[idx] = a[n * C1 * HW + ch * HW + hw];
+    } else if (ch < C1 + C2) {
+        output[idx] = b[n * C2 * HW + (ch - C1) * HW + hw];
+    } else if (ch < C1 + C2 + C3) {
+        output[idx] = c[n * C3 * HW + (ch - C1 - C2) * HW + hw];
+    } else {
+        output[idx] = d[n * C4 * HW + (ch - C1 - C2 - C3) * HW + hw];
+    }
+}
+
 // ============ Copy / Slice ============
 
 __global__ void slice_channels_kernel(float* output, const float* input,

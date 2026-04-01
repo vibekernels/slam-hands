@@ -441,37 +441,48 @@ struct BundleAdjustment {
         vs_buf.copyTo(vs_host.data(), 2 * M * 6);
 
         // Scatter Hessian blocks into global matrix
+        // Edges may reference fixed poses (index < t0), which are out of range.
+        // Like PyTorch, we skip contributions where the index is out-of-range,
+        // but keep contributions where only one endpoint is out-of-range.
         for (int e = 0; e < M; e++) {
             int i_idx = ii_host[e] - t0;
             int j_idx = jj_host[e] - t0;
-            if (i_idx < 0 || i_idx >= P || j_idx < 0 || j_idx >= P) continue;
+            bool i_valid = (i_idx >= 0 && i_idx < P);
+            bool j_valid = (j_idx >= 0 && j_idx < P);
+            if (!i_valid && !j_valid) continue;
 
             // H[ii,ii] += Hs[0, e]
-            for (int r = 0; r < 6; r++)
-                for (int c = 0; c < 6; c++)
-                    S_host[(i_idx*6+r)*S_size + (i_idx*6+c)] += Hs_host[0*M*36 + e*36 + r*6 + c];
+            if (i_valid)
+                for (int r = 0; r < 6; r++)
+                    for (int c = 0; c < 6; c++)
+                        S_host[(i_idx*6+r)*S_size + (i_idx*6+c)] += Hs_host[0*M*36 + e*36 + r*6 + c];
 
             // H[ii,jj] += Hs[1, e]
-            for (int r = 0; r < 6; r++)
-                for (int c = 0; c < 6; c++)
-                    S_host[(i_idx*6+r)*S_size + (j_idx*6+c)] += Hs_host[1*M*36 + e*36 + r*6 + c];
+            if (i_valid && j_valid)
+                for (int r = 0; r < 6; r++)
+                    for (int c = 0; c < 6; c++)
+                        S_host[(i_idx*6+r)*S_size + (j_idx*6+c)] += Hs_host[1*M*36 + e*36 + r*6 + c];
 
             // H[jj,ii] += Hs[2, e]
-            for (int r = 0; r < 6; r++)
-                for (int c = 0; c < 6; c++)
-                    S_host[(j_idx*6+r)*S_size + (i_idx*6+c)] += Hs_host[2*M*36 + e*36 + r*6 + c];
+            if (i_valid && j_valid)
+                for (int r = 0; r < 6; r++)
+                    for (int c = 0; c < 6; c++)
+                        S_host[(j_idx*6+r)*S_size + (i_idx*6+c)] += Hs_host[2*M*36 + e*36 + r*6 + c];
 
             // H[jj,jj] += Hs[3, e]
-            for (int r = 0; r < 6; r++)
-                for (int c = 0; c < 6; c++)
-                    S_host[(j_idx*6+r)*S_size + (j_idx*6+c)] += Hs_host[3*M*36 + e*36 + r*6 + c];
+            if (j_valid)
+                for (int r = 0; r < 6; r++)
+                    for (int c = 0; c < 6; c++)
+                        S_host[(j_idx*6+r)*S_size + (j_idx*6+c)] += Hs_host[3*M*36 + e*36 + r*6 + c];
 
             // b[ii] += vs[0, e]
-            for (int n = 0; n < 6; n++)
-                b_host[i_idx*6+n] += vs_host[0*M*6 + e*6 + n];
+            if (i_valid)
+                for (int n = 0; n < 6; n++)
+                    b_host[i_idx*6+n] += vs_host[0*M*6 + e*6 + n];
             // b[jj] += vs[1, e]
-            for (int n = 0; n < 6; n++)
-                b_host[j_idx*6+n] += vs_host[1*M*6 + e*6 + n];
+            if (j_valid)
+                for (int n = 0; n < 6; n++)
+                    b_host[j_idx*6+n] += vs_host[1*M*6 + e*6 + n];
         }
 
         if (!motion_only) {

@@ -410,13 +410,11 @@ class PipelineService:
         device="cuda",
         asr_model="parakeet-tdt_ctc-110m",
     ):
-        self.droid_weights = droid_weights
         self.wilor_dir = wilor_dir
         self.device = device
         self.asr_model = asr_model
         self.hand_sock = None
         self.hand_proc = None
-        self.Droid = None
         self._nd = None
         self._ready = False
 
@@ -465,15 +463,15 @@ class PipelineService:
             raise RuntimeError(f"Hand worker failed to start: {msg}")
 
     def _init_slam(self):
-        """Import DROID-SLAM (loads CUDA backend). Done after fork."""
-        droid_slam_path = os.path.join(
-            os.path.dirname(self.droid_weights), "..", "droid_slam"
-        )
-        sys.path.insert(0, droid_slam_path)
-        from droid import Droid
-        self.Droid = Droid
+        """Initialize CUDA DROID-SLAM binary and native decoder."""
         self._nd = _get_native_decode()
-        print("[Service] DROID-SLAM initialized", flush=True)
+        # Locate the CUDA DROID-SLAM binary and weights
+        self._cuda_slam_dir = os.path.join(os.path.dirname(__file__), "cuda_slam")
+        self._cuda_slam_bin = os.path.join(self._cuda_slam_dir, "cuda_droid")
+        self._cuda_slam_weights = os.path.join(self._cuda_slam_dir, "data", "weights")
+        if not os.path.isfile(self._cuda_slam_bin):
+            raise RuntimeError(f"CUDA DROID-SLAM binary not found: {self._cuda_slam_bin}")
+        print("[Service] CUDA DROID-SLAM initialized", flush=True)
 
     def process_video(
         self,
@@ -621,89 +619,97 @@ class PipelineService:
         return dataset_path
 
     def _run_slam(self, video_path, fps, width, height, fast_traj=True, backend_steps=(7, 12)):
-        """Run DROID-SLAM on a single video. Fresh Droid instance each time."""
+        """Run CUDA DROID-SLAM on a single video."""
+        import tempfile
+
         h0, w0 = height, width
         scale = np.sqrt((384 * 512) / (h0 * w0))
         h1 = int(h0 * scale) // 8 * 8
         w1 = int(w0 * scale) // 8 * 8
 
         fx, fy, cx, cy = get_iphone_intrinsics(width, height)
-        intrinsics_scaled = torch.as_tensor([
-            fx * (w1 / w0), fy * (h1 / h0), cx * (w1 / w0), cy * (h1 / h0),
-        ])
+        fx_s = fx * (w1 / w0)
+        fy_s = fy * (h1 / h0)
+        cx_s = cx * (w1 / w0)
+        cy_s = cy * (h1 / h0)
+        intrinsics_scaled = np.array([fx_s, fy_s, cx_s, cy_s], dtype=np.float32)
 
-        slam_args = argparse.Namespace(
-            weights=self.droid_weights, buffer=512, image_size=[h1, w1],
-            disable_vis=True, stereo=False, beta=0.3, filter_thresh=2.4,
-            warmup=8, keyframe_thresh=4.0,
-            frontend_thresh=16.0, frontend_window=25, frontend_radius=2, frontend_nms=1,
-            backend_thresh=22.0, backend_radius=2, backend_nms=3,
-            upsample=False, frontend_device=self.device, backend_device=self.device,
-        )
-
-        decoder = self._nd.AsyncVideoDecoder()
-        decoder.start(video_path, w1, h1, slam_only=True, queue_depth=128)
-
-        droid = self.Droid(slam_args)
         print(f"  SLAM resolution: {w1}x{h1}", flush=True)
 
-        # ── Tracking ──
-        t_track_start = time.perf_counter()
-        slam_tensors = [] if not fast_traj else None
-        t = 0
-        while True:
-            result = decoder.get_next()
-            if result is None:
-                break
-            _, slam_bgr = result
-            tensor = torch.from_numpy(slam_bgr).permute(2, 0, 1).unsqueeze(0).cuda()
-            if slam_tensors is not None:
-                slam_tensors.append(tensor)
-            droid.track(t, tensor, intrinsics=intrinsics_scaled)
-            t += 1
-        decoder.stop()
-        num_frames = t
+        with tempfile.TemporaryDirectory(prefix="cuda_slam_") as tmpdir:
+            frame_dir = os.path.join(tmpdir, "frames")
+            os.makedirs(frame_dir)
+            calib_path = os.path.join(tmpdir, "calib.bin")
+            pose_path = os.path.join(tmpdir, "poses.bin")
 
-        t_track = time.perf_counter() - t_track_start
-        print(f"  SLAM tracking: {t_track:.1f}s ({num_frames/t_track:.0f} fps)", flush=True)
+            # Write calibration
+            with open(calib_path, "wb") as f:
+                f.write(struct.pack("4f", fx_s, fy_s, cx_s, cy_s))
 
-        # ── Backend ──
-        del droid.frontend
-        torch.cuda.empty_cache()
-        t_be = time.perf_counter()
-        droid.backend(backend_steps[0])
-        torch.cuda.empty_cache()
-        droid.backend(backend_steps[1])
-        print(f"  Backend: {time.perf_counter()-t_be:.1f}s", flush=True)
+            # Decode video and export frames as binary
+            t_export_start = time.perf_counter()
+            decoder = self._nd.AsyncVideoDecoder()
+            decoder.start(video_path, w1, h1, slam_only=True, queue_depth=128)
 
-        # ── Trajectory ──
-        if fast_traj:
-            torch.cuda.empty_cache()
-            N = droid.video.counter.value
-            kf_tstamps = droid.video.tstamp[:N].cpu().numpy().astype(np.int64)
-            import lietorch
-            kf_poses_se3 = lietorch.SE3(droid.video.poses[:N])
-            kf_poses_raw = kf_poses_se3.inv().data.cpu().numpy()
-            all_poses = _interpolate_poses_simple(kf_tstamps, kf_poses_raw, num_frames)
-            print(f"  Trajectory: {N} keyframes -> {num_frames} frames", flush=True)
-        else:
-            def frame_stream():
-                for i, tensor_item in enumerate(slam_tensors):
-                    yield i, tensor_item, intrinsics_scaled
-            traj = droid.traj_filler(frame_stream())
-            all_poses = traj.inv().data.cpu().numpy()
-            del slam_tensors
-            print(f"  Trajectory: NN fill", flush=True)
+            num_frames = 0
+            while True:
+                result = decoder.get_next()
+                if result is None:
+                    break
+                _, slam_bgr = result  # uint8 HWC BGR
+                frame_f32 = slam_bgr.astype(np.float32)
+                fpath = os.path.join(frame_dir, f"frame_{num_frames:05d}.bin")
+                with open(fpath, "wb") as f:
+                    f.write(struct.pack("ii", h1, w1))
+                    f.write(frame_f32.tobytes())
+                num_frames += 1
+            decoder.stop()
+
+            # Write metadata
+            with open(os.path.join(frame_dir, "meta.txt"), "w") as f:
+                f.write(f"{h1} {w1} {num_frames} 1\n")
+
+            t_export = time.perf_counter() - t_export_start
+            print(f"  Frame export: {t_export:.1f}s ({num_frames} frames)", flush=True)
+
+            # Run CUDA DROID-SLAM
+            cmd = [
+                self._cuda_slam_bin,
+                "--weights", self._cuda_slam_weights,
+                "--frames", frame_dir,
+                "--calib", calib_path,
+                "--max-frames", str(num_frames),
+                "--cam-to-world",
+                "--pose-output", pose_path,
+            ]
+            if backend_steps and len(backend_steps) >= 2:
+                cmd += ["--backend", str(backend_steps[0]), str(backend_steps[1])]
+
+            t_slam_start = time.perf_counter()
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            t_slam = time.perf_counter() - t_slam_start
+
+            if result.returncode != 0:
+                print(f"  CUDA SLAM stderr: {result.stderr[-500:]}", flush=True)
+                raise RuntimeError(f"CUDA DROID-SLAM failed (code {result.returncode})")
+
+            print(f"  CUDA SLAM: {t_slam:.1f}s ({num_frames/t_slam:.0f} fps)", flush=True)
+
+            # Read keyframe poses
+            with open(pose_path, "rb") as f:
+                nk = struct.unpack("i", f.read(4))[0]
+                kf_timestamps = np.array(struct.unpack(f"{nk}i", f.read(nk * 4)), dtype=np.int64)
+                kf_poses = np.frombuffer(f.read(nk * 7 * 4), dtype=np.float32).reshape(nk, 7)
+
+        # Interpolate keyframe poses to all frames
+        all_poses = _interpolate_poses_simple(kf_timestamps, kf_poses, num_frames)
+        print(f"  Trajectory: {nk} keyframes -> {num_frames} frames", flush=True)
 
         slam_result = {
             "poses": all_poses,
-            "intrinsics": intrinsics_scaled.numpy(),
+            "intrinsics": intrinsics_scaled,
             "slam_resolution": (h1, w1),
         }
-
-        # Free DROID memory
-        del droid
-        torch.cuda.empty_cache()
 
         return slam_result, num_frames
 
