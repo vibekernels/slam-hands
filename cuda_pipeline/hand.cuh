@@ -1196,6 +1196,88 @@ __global__ void wilor_preprocess_kernel(
 // === YOLO and WiLoR models from main.cu ===
 
 // ============================================================================
+// GPU-side decode bias+init kernel for WiLoR ViT output
+// ============================================================================
+__global__ void decode_add_bias_init_kernel(
+    float* pose, float* betas, float* cam,
+    const float* pose_bias, const float* betas_bias, const float* cam_bias,
+    const float* init_pose, const float* init_betas, const float* init_cam,
+    int B)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Layout: first B*96 for pose, then B*10 for betas, then B*3 for cam
+    if (idx < B * 96) {
+        pose[idx] += pose_bias[idx % 6] + init_pose[idx % 96];
+    } else if (idx < B * 96 + B * 10) {
+        int i = idx - B * 96;
+        betas[i] += betas_bias[i % 10] + init_betas[i % 10];
+    } else if (idx < B * 96 + B * 10 + B * 3) {
+        int i = idx - B * 96 - B * 10;
+        cam[i] += cam_bias[i % 3] + init_cam[i % 3];
+    }
+}
+
+// Extract image tokens from ViT output [B, T, D] and transpose to NCHW [B, D, H, W]
+__global__ void extract_img_to_nchw_kernel(
+    const float* __restrict__ vit_out,  // [B, T, D]
+    float* __restrict__ nchw,           // [B, D, H, W]
+    int B, int T, int D, int img_start, int HW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D * HW) return;
+    int b = idx / (D * HW);
+    int rem = idx % (D * HW);
+    int c = rem / HW;
+    int hw = rem % HW;
+    nchw[idx] = vit_out[b * T * D + (img_start + hw) * D + c];
+}
+
+// Write max-pooled vertex features into a slice of a concatenated feature buffer
+__global__ void max_pool_points_to_slice_kernel(
+    const float* __restrict__ feat,  // [B, C, N_pts]
+    float* __restrict__ out,         // [B, total_dim] (write at feat_offset)
+    int B, int C, int N_pts, int total_dim, int feat_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * C) return;
+    int b = idx / C;
+    int c = idx % C;
+    const float* f = feat + ((size_t)b * C + c) * N_pts;
+    float mx = f[0];
+    for (int i = 1; i < N_pts; i++) mx = fmaxf(mx, f[i]);
+    out[b * total_dim + feat_offset + c] = mx;
+}
+
+// Project MANO vertices to 2D feature map coordinates (GPU version)
+__global__ void project_verts_gpu_kernel(
+    const float* __restrict__ verts,    // [B, 778, 3]
+    const float* __restrict__ pred_cam, // [B, 3]
+    float* __restrict__ grid_xy,        // [B, 778, 2]
+    int B, int N_verts, int featH, int featW, float focal)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * N_verts) return;
+    int b = idx / N_verts;
+    int v = idx % N_verts;
+
+    float s = pred_cam[b * 3 + 0];
+    float tx = pred_cam[b * 3 + 1];
+    float ty = pred_cam[b * 3 + 2];
+    float tz = 2.0f * focal / (featH * s + 1e-9f);
+
+    float vx = verts[b * N_verts * 3 + v * 3 + 0];
+    float vy = verts[b * N_verts * 3 + v * 3 + 1];
+    float vz = verts[b * N_verts * 3 + v * 3 + 2];
+
+    float px = focal * (vx + tx) / (vz + tz + 1e-9f);
+    float py = focal * (vy + ty) / (vz + tz + 1e-9f);
+
+    // Normalize to [-1, 1] for grid_sample
+    grid_xy[idx * 2 + 0] = px / (featW * 0.5f);
+    grid_xy[idx * 2 + 1] = py / (featH * 0.5f);
+}
+
+// ============================================================================
 // YOLO preprocessing: resize + normalize + HWC->CHW
 // ============================================================================
 
@@ -1801,6 +1883,34 @@ struct WilorModel {
     GpuHalfBuf vit_tmp1, vit_tmp2, vit_tmp3, vit_qkv, vit_attn;
     GpuBuf fp32_tmp1, fp32_tmp2, fp32_tmp3, fp32_tmp4;
 
+    // GPU decode output buffers
+    GpuBuf d_decode_pred_pose;   // [B, 96]
+    GpuBuf d_decode_pred_betas;  // [B, 10]
+    GpuBuf d_decode_pred_cam;    // [B, 3]
+
+    // Pre-allocated RefineNet buffers (avoid per-forward cudaMalloc)
+    GpuBuf d_refine_img_nchw;   // [B, 1280, 16, 12]
+    GpuBuf d_refine_fc_out;     // [B, 640, 16, 12]
+    GpuBuf d_refine_br0;        // [B, 320, 32, 24]
+    GpuBuf d_refine_br1a;       // [B, 320, 32, 24]
+    GpuBuf d_refine_br1b;       // [B, 160, 64, 48]
+    GpuBuf d_refine_verts;      // [B, 778, 3]
+    GpuBuf d_refine_grid_xy;    // [B, 778, 2]
+    GpuBuf d_refine_vert_feat;  // [B, max_C, 778]
+    GpuBuf d_refine_vert_max;   // [B, max_C]
+    GpuBuf d_refine_all_feat;   // [B, 1120]
+
+    // Host-cached constant data (loaded once in init, not per-forward)
+    std::vector<float> h_decpose_w_cache, h_decpose_b_cache;
+    std::vector<float> h_decshape_w_cache, h_decshape_b_cache;
+    std::vector<float> h_deccam_w_cache, h_deccam_b_cache;
+    std::vector<float> h_init_pose_cache, h_init_betas_cache, h_init_cam_cache;
+    std::vector<float> h_mano_v_template_cache, h_mano_shapedirs_cache;
+    std::vector<float> h_mano_posedirs_cache, h_mano_J_reg_cache, h_mano_lbs_w_cache;
+    std::vector<float> h_refine_dec_pose_w_cache, h_refine_dec_pose_b_cache;
+    std::vector<float> h_refine_dec_shape_w_cache, h_refine_dec_shape_b_cache;
+    std::vector<float> h_refine_dec_cam_w_cache, h_refine_dec_cam_b_cache;
+
     int max_batch;
 
     void load_buf(GpuBuf& buf, const std::string& path) {
@@ -1976,6 +2086,48 @@ struct WilorModel {
         fp32_tmp2.alloc(B * std::max({T * D, MANO_N_VERTS * 3 * 4, 1120}));
         fp32_tmp3.alloc(B * std::max({T * D, MANO_N_VERTS * 3, 1120}));
         fp32_tmp4.alloc(B * std::max({96, MANO_N_VERTS * 3, T * D}));
+
+        // GPU decode output buffers
+        d_decode_pred_pose.alloc(B * 96);
+        d_decode_pred_betas.alloc(B * 10);
+        d_decode_pred_cam.alloc(B * 3);
+
+        // Pre-allocate RefineNet buffers
+        int pH = VIT_PATCH_H, pW = VIT_PATCH_W;
+        d_refine_img_nchw.alloc(B * D * pH * pW);
+        d_refine_fc_out.alloc(B * 640 * pH * pW);
+        d_refine_br0.alloc(B * 320 * pH * 2 * pW * 2);
+        d_refine_br1a.alloc(B * 320 * pH * 2 * pW * 2);
+        d_refine_br1b.alloc(B * 160 * pH * 4 * pW * 4);
+        d_refine_verts.alloc(B * MANO_N_VERTS * 3);
+        d_refine_grid_xy.alloc(B * MANO_N_VERTS * 2);
+        d_refine_vert_feat.alloc(B * 640 * MANO_N_VERTS);  // max C = 640
+        d_refine_vert_max.alloc(B * 640);
+        d_refine_all_feat.alloc(B * 1120);
+
+        // Cache constant data on host
+        h_decpose_w_cache.resize(6 * D); decpose_weight.copyTo(h_decpose_w_cache.data(), 6 * D);
+        h_decpose_b_cache.resize(6); decpose_bias.copyTo(h_decpose_b_cache.data(), 6);
+        h_decshape_w_cache.resize(10 * D); decshape_weight.copyTo(h_decshape_w_cache.data(), 10 * D);
+        h_decshape_b_cache.resize(10); decshape_bias.copyTo(h_decshape_b_cache.data(), 10);
+        h_deccam_w_cache.resize(3 * D); deccam_weight.copyTo(h_deccam_w_cache.data(), 3 * D);
+        h_deccam_b_cache.resize(3); deccam_bias.copyTo(h_deccam_b_cache.data(), 3);
+        h_init_pose_cache.resize(96); init_hand_pose.copyTo(h_init_pose_cache.data(), 96);
+        h_init_betas_cache.resize(10); init_betas.copyTo(h_init_betas_cache.data(), 10);
+        h_init_cam_cache.resize(3); init_cam.copyTo(h_init_cam_cache.data(), 3);
+
+        h_mano_v_template_cache.resize(778 * 3); mano_v_template.copyTo(h_mano_v_template_cache.data(), 778 * 3);
+        h_mano_shapedirs_cache.resize(778 * 3 * 10); mano_shapedirs.copyTo(h_mano_shapedirs_cache.data(), 778 * 3 * 10);
+        h_mano_posedirs_cache.resize(135 * 2334); mano_posedirs.copyTo(h_mano_posedirs_cache.data(), 135 * 2334);
+        h_mano_J_reg_cache.resize(16 * 778); mano_J_regressor.copyTo(h_mano_J_reg_cache.data(), 16 * 778);
+        h_mano_lbs_w_cache.resize(778 * 16); mano_lbs_weights.copyTo(h_mano_lbs_w_cache.data(), 778 * 16);
+
+        h_refine_dec_pose_w_cache.resize(96 * 1120); refine_dec_pose_w.copyTo(h_refine_dec_pose_w_cache.data(), 96 * 1120);
+        h_refine_dec_pose_b_cache.resize(96); refine_dec_pose_b.copyTo(h_refine_dec_pose_b_cache.data(), 96);
+        h_refine_dec_shape_w_cache.resize(10 * 1120); refine_dec_shape_w.copyTo(h_refine_dec_shape_w_cache.data(), 10 * 1120);
+        h_refine_dec_shape_b_cache.resize(10); refine_dec_shape_b.copyTo(h_refine_dec_shape_b_cache.data(), 10);
+        h_refine_dec_cam_w_cache.resize(3 * 1120); refine_dec_cam_w.copyTo(h_refine_dec_cam_w_cache.data(), 3 * 1120);
+        h_refine_dec_cam_b_cache.resize(3); refine_dec_cam_b.copyTo(h_refine_dec_cam_b_cache.data(), 3);
     }
 
     // Run ViT + RefineNet + MANO forward pass on preprocessed crops
@@ -2048,49 +2200,76 @@ struct WilorModel {
             transformer_block(bi, B, T, D);
         }
 
-        // ── Step 4: Last norm + decode ──
+        // ── Step 4: Last norm + GPU decode ──
         layernorm_half(vit_tokens.data, vit_tmp1.data,
                        last_norm_weight.data, last_norm_bias.data, B * T, D);
 
         // Convert output to FP32 for decode
         half_to_float(vit_tmp1.data, fp32_tmp1.data, B * T * D);
 
-        // Decode pose: tokens 0..15 -> decpose [1280, 6] per token
-        // Shape: tokens 16 -> decshape [1280, 10]
-        // Cam: tokens 17 -> deccam [1280, 3]
+        // GPU-side decode: pose/shape/cam via cuBLAS strided batched GEMMs
+        // Pose: [B×16, D] @ decpose_weight^T → [B×16, 6], strided across batches
+        {
+            float alpha = 1.0f, beta = 0.0f;
+            CUBLAS_CHECK(cublasGemmStridedBatchedEx(cublas,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                6, 16, D, &alpha,
+                decpose_weight.data, CUDA_R_32F, D, 0,        // same weight all batches
+                fp32_tmp1.data, CUDA_R_32F, D, (long long)T*D, // stride between batches
+                &beta,
+                d_decode_pred_pose.data, CUDA_R_32F, 6, 96,    // stride = 16*6 = 96
+                B, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 
-        // Allocate output arrays
+            // Shape: token 16 → [B, D] @ decshape_weight^T → [B, 10]
+            CUBLAS_CHECK(cublasGemmStridedBatchedEx(cublas,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                10, 1, D, &alpha,
+                decshape_weight.data, CUDA_R_32F, D, 0,
+                fp32_tmp1.data + 16*D, CUDA_R_32F, D, (long long)T*D,
+                &beta,
+                d_decode_pred_betas.data, CUDA_R_32F, 10, 10,
+                B, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+            // Cam: token 17 → [B, D] @ deccam_weight^T → [B, 3]
+            CUBLAS_CHECK(cublasGemmStridedBatchedEx(cublas,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                3, 1, D, &alpha,
+                deccam_weight.data, CUDA_R_32F, D, 0,
+                fp32_tmp1.data + 17*D, CUDA_R_32F, D, (long long)T*D,
+                &beta,
+                d_decode_pred_cam.data, CUDA_R_32F, 3, 3,
+                B, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+            // Add bias + init values
+            int total_elems = B * 96 + B * 10 + B * 3;
+            decode_add_bias_init_kernel<<<(total_elems+255)/256, 256>>>(
+                d_decode_pred_pose.data, d_decode_pred_betas.data, d_decode_pred_cam.data,
+                decpose_bias.data, decshape_bias.data, deccam_bias.data,
+                init_hand_pose.data, init_betas.data, init_cam.data, B);
+        }
+
+        // Download decoded values (tiny: ~42KB for B=96 vs 103MB before)
         std::vector<float> h_pred_pose(B * 96);
         std::vector<float> h_pred_betas(B * 10);
         std::vector<float> h_pred_cam(B * 3);
-        std::vector<float> h_img_feat(B * num_patches * D);
+        d_decode_pred_pose.copyTo(h_pred_pose.data(), B * 96);
+        d_decode_pred_betas.copyTo(h_pred_betas.data(), B * 10);
+        d_decode_pred_cam.copyTo(h_pred_cam.data(), B * 3);
 
-        decode_vit_output(fp32_tmp1.data, B, T, D,
-                          h_pred_pose.data(), h_pred_betas.data(), h_pred_cam.data(),
-                          h_img_feat.data(), num_patches);
-
-        // ── Step 5: First MANO pass (temp) ──
+        // ── Step 5: First MANO pass (temp, cached constants) ──
         std::vector<float> h_temp_verts(B * 778 * 3);
         run_mano(h_pred_pose.data(), h_pred_betas.data(), B, h_temp_verts.data(), nullptr);
 
-        // ── Step 6: RefineNet ──
-        // img_feat [B, 192, 1280] -> [B, 1280, 16, 12]
-        // first_conv -> deconv branches -> sample vertices -> decode deltas
+        // ── Step 6: RefineNet (img_feat stays on GPU) ──
         std::vector<float> h_delta_pose(B * 96);
         std::vector<float> h_delta_betas(B * 10);
         std::vector<float> h_delta_cam(B * 3);
 
-        run_refine_net(h_img_feat.data(), h_temp_verts.data(),
-                       h_pred_cam.data(), B,
-                       h_delta_pose.data(), h_delta_betas.data(), h_delta_cam.data());
+        run_refine_net_gpu(fp32_tmp1.data, h_temp_verts.data(),
+                           h_pred_cam.data(), B,
+                           h_delta_pose.data(), h_delta_betas.data(), h_delta_cam.data());
 
         // Add deltas to predictions
-        // Read back init values
-        std::vector<float> h_init_pose(96), h_init_betas(10), h_init_cam(3);
-        init_hand_pose.copyTo(h_init_pose.data(), 96);
-        init_betas.copyTo(h_init_betas.data(), 10);
-        init_cam.copyTo(h_init_cam.data(), 3);
-
         for (int b = 0; b < B; b++) {
             for (int i = 0; i < 96; i++)
                 h_pred_pose[b * 96 + i] += h_delta_pose[b * 96 + i];
@@ -2100,7 +2279,7 @@ struct WilorModel {
                 h_pred_cam[b * 3 + i] += h_delta_cam[b * 3 + i];
         }
 
-        // ── Step 7: Final MANO pass ──
+        // ── Step 7: Final MANO pass (cached constants) ──
         std::vector<float> h_final_verts(B * 778 * 3);
         std::vector<float> h_final_joints(B * 21 * 3);
         run_mano(h_pred_pose.data(), h_pred_betas.data(), B,
@@ -2390,70 +2569,6 @@ struct WilorModel {
             tokens, pos_embed.data, B, T, D, VIT_POSE_TOKENS + 2);
     }
 
-    // Decode ViT output to pose/shape/cam
-    void decode_vit_output(const float* vit_out, int B, int T, int D,
-                           float* pred_pose, float* pred_betas, float* pred_cam,
-                           float* img_feat, int num_patches) {
-        // pose: tokens 0..15 -> decpose [1280, 6] -> 16*6=96
-        // shape: token 16 -> decshape [1280, 10] -> 10
-        // cam: token 17 -> deccam [1280, 3] -> 3
-        // img: tokens 18..209 -> img_feat [B, 192, 1280]
-
-        // Download to CPU for decode (small tensors)
-        std::vector<float> h_vit(B * T * D);
-        CUDA_CHECK(cudaMemcpy(h_vit.data(), vit_out, B * T * D * sizeof(float), cudaMemcpyDeviceToHost));
-
-        std::vector<float> h_decpose_w(6 * D), h_decpose_b(6);
-        std::vector<float> h_decshape_w(10 * D), h_decshape_b(10);
-        std::vector<float> h_deccam_w(3 * D), h_deccam_b(3);
-        decpose_weight.copyTo(h_decpose_w.data(), 6 * D);
-        decpose_bias.copyTo(h_decpose_b.data(), 6);
-        decshape_weight.copyTo(h_decshape_w.data(), 10 * D);
-        decshape_bias.copyTo(h_decshape_b.data(), 10);
-        deccam_weight.copyTo(h_deccam_w.data(), 3 * D);
-        deccam_bias.copyTo(h_deccam_b.data(), 3);
-
-        std::vector<float> h_init_pose(96), h_init_betas(10), h_init_cam(3);
-        init_hand_pose.copyTo(h_init_pose.data(), 96);
-        init_betas.copyTo(h_init_betas.data(), 10);
-        init_cam.copyTo(h_init_cam.data(), 3);
-
-        for (int b = 0; b < B; b++) {
-            // Pose tokens: 0..15, each decoded with decpose [6, 1280]
-            for (int t = 0; t < 16; t++) {
-                const float* tok = &h_vit[(b * T + t) * D];
-                for (int o = 0; o < 6; o++) {
-                    float val = h_decpose_b[o];
-                    for (int d = 0; d < D; d++) val += tok[d] * h_decpose_w[o * D + d];
-                    pred_pose[b * 96 + t * 6 + o] = val + h_init_pose[t * 6 + o];
-                }
-            }
-            // Shape token: index 16
-            {
-                const float* tok = &h_vit[(b * T + 16) * D];
-                for (int o = 0; o < 10; o++) {
-                    float val = h_decshape_b[o];
-                    for (int d = 0; d < D; d++) val += tok[d] * h_decshape_w[o * D + d];
-                    pred_betas[b * 10 + o] = val + h_init_betas[o];
-                }
-            }
-            // Cam token: index 17
-            {
-                const float* tok = &h_vit[(b * T + 17) * D];
-                for (int o = 0; o < 3; o++) {
-                    float val = h_deccam_b[o];
-                    for (int d = 0; d < D; d++) val += tok[d] * h_deccam_w[o * D + d];
-                    pred_cam[b * 3 + o] = val + h_init_cam[o];
-                }
-            }
-            // Image features: tokens 18..209
-            for (int t = 0; t < num_patches; t++) {
-                memcpy(&img_feat[(b * num_patches + t) * D],
-                       &h_vit[(b * T + 18 + t) * D], D * sizeof(float));
-            }
-        }
-    }
-
     // Run MANO forward pass
     void run_mano(const float* pred_pose_6d, const float* pred_betas, int B,
                   float* out_verts, float* out_joints) {
@@ -2467,21 +2582,18 @@ struct WilorModel {
             }
         }
 
-        // Download MANO constants
-        std::vector<float> h_v_template(778 * 3), h_shapedirs(778 * 3 * 10);
-        std::vector<float> h_posedirs(135 * 2334), h_J_reg(16 * 778), h_lbs_w(778 * 16);
-        mano_v_template.copyTo(h_v_template.data(), 778 * 3);
-        mano_shapedirs.copyTo(h_shapedirs.data(), 778 * 3 * 10);
-        mano_posedirs.copyTo(h_posedirs.data(), 135 * 2334);
-        mano_J_regressor.copyTo(h_J_reg.data(), 16 * 778);
-        mano_lbs_weights.copyTo(h_lbs_w.data(), 778 * 16);
+        // Use cached MANO constants (no GPU download per call)
+        const float* h_v_template = h_mano_v_template_cache.data();
+        const float* h_shapedirs = h_mano_shapedirs_cache.data();
+        const float* h_posedirs = h_mano_posedirs_cache.data();
+        const float* h_J_reg = h_mano_J_reg_cache.data();
+        const float* h_lbs_w = h_mano_lbs_w_cache.data();
 
         for (int b = 0; b < B; b++) {
             const float* betas = &pred_betas[b * 10];
             const float* rots = &rotmats[b * 16 * 9];
 
             // v_shaped = v_template + shapedirs @ betas
-            // shapedirs: [778, 3, 10], betas: [10]
             float v_shaped[778 * 3];
             for (int v = 0; v < 778; v++) {
                 for (int d = 0; d < 3; d++) {
@@ -2506,12 +2618,10 @@ struct WilorModel {
             }
 
             // Pose offsets: posedirs @ pose_feature
-            // pose_feature = (rotmats[:, 1:] - I).flatten() -> [135]
-            // posedirs: [135, 2334] -> [2334] = [778*3]
             float pose_feat[135];
             for (int j = 1; j < 16; j++) {
                 for (int r = 0; r < 9; r++) {
-                    float I_val = (r % 4 == 0) ? 1.0f : 0.0f;  // identity diagonal
+                    float I_val = (r % 4 == 0) ? 1.0f : 0.0f;
                     pose_feat[(j - 1) * 9 + r] = rots[j * 9 + r] - I_val;
                 }
             }
@@ -2528,10 +2638,10 @@ struct WilorModel {
             }
 
             // Forward kinematics
-            float transforms[16 * 16];  // 16 joints x 4x4 transform
+            float transforms[16 * 16];
             batch_rigid_transform(rots, J, transforms);
 
-            // Skinning: T = W @ A, vertices = T @ v_posed_homo
+            // Skinning
             for (int v = 0; v < 778; v++) {
                 float T[16] = {0};
                 for (int j = 0; j < 16; j++) {
@@ -2540,7 +2650,6 @@ struct WilorModel {
                         T[k] += w * transforms[j * 16 + k];
                     }
                 }
-                // Apply transform to v_posed
                 float vx = v_posed[v * 3 + 0];
                 float vy = v_posed[v * 3 + 1];
                 float vz = v_posed[v * 3 + 2];
@@ -2549,7 +2658,7 @@ struct WilorModel {
                 out_verts[b * 778 * 3 + v * 3 + 2] = T[8]*vx + T[9]*vy + T[10]*vz + T[11];
             }
 
-            // Extract joints: J_regressor @ vertices + extra finger tips
+            // Extract joints
             if (out_joints) {
                 float base_joints[16 * 3];
                 for (int j = 0; j < 16; j++) {
@@ -2687,166 +2796,102 @@ struct WilorModel {
         }
     }
 
-    // RefineNet forward
-    void run_refine_net(const float* h_img_feat, const float* h_temp_verts,
-                        const float* h_pred_cam, int B,
-                        float* h_delta_pose, float* h_delta_betas, float* h_delta_cam) {
+    // RefineNet forward (GPU-optimized: pre-allocated buffers, GPU vertex projection, cached weights)
+    void run_refine_net_gpu(const float* d_vit_out, const float* h_temp_verts,
+                            const float* h_pred_cam, int B,
+                            float* h_delta_pose, float* h_delta_betas, float* h_delta_cam) {
         int H = VIT_PATCH_H, W = VIT_PATCH_W, D = VIT_EMBED;
+        int T = VIT_TOTAL_TOKENS;
+        int img_start = 18;  // image tokens start at index 18
 
-        // Upload img_feat to GPU: [B, 192, 1280] -> transpose to [B, 1280, 16, 12]
-        GpuBuf d_img_feat, d_img_feat_nchw;
-        d_img_feat.alloc(B * 192 * D);
-        d_img_feat.copyFrom(h_img_feat, B * 192 * D);
-        d_img_feat_nchw.alloc(B * D * H * W);
-        // Transpose [B, HW, C] -> [B, C, H, W]
-        transpose_nhwc_to_nchw_kernel<<<(B * D * H * W + 255) / 256, 256>>>(
-            d_img_feat.data, d_img_feat_nchw.data, B, D, H * W);
+        // Extract image tokens from GPU-resident ViT output [B, T, D] -> [B, D, H, W]
+        int n_img = B * D * H * W;
+        extract_img_to_nchw_kernel<<<(n_img + 255) / 256, 256>>>(
+            d_vit_out, d_refine_img_nchw.data, B, T, D, img_start, H * W);
 
         // first_conv: [B, 1280, 16, 12] -> [B, 640, 16, 12]
-        GpuBuf d_fc_out;
-        d_fc_out.alloc(B * 640 * H * W);
-        refine_first_conv.forward(cudnn, d_img_feat_nchw.data, d_fc_out.data, workspace.data, B, H, W);
-        // No activation (bnrelu_final=False in first_conv)
+        refine_first_conv.forward(cudnn, d_refine_img_nchw.data, d_refine_fc_out.data,
+                                  workspace.data, B, H, W);
 
         // Branch 0: ConvTranspose(640->320) + ReLU -> [B, 320, 32, 24]
-        GpuBuf d_br0;
-        d_br0.alloc(B * 320 * H * 2 * W * 2);
-        refine_branch0_0.forward(cudnn, d_fc_out.data, d_br0.data, workspace.data, B, H, W);
-        relu_inplace(d_br0.data, B * 320 * H * 2 * W * 2);
+        refine_branch0_0.forward(cudnn, d_refine_fc_out.data, d_refine_br0.data,
+                                 workspace.data, B, H, W);
+        relu_inplace(d_refine_br0.data, B * 320 * H * 2 * W * 2);
 
-        // Branch 1: ConvTranspose(640->320) + ReLU -> ConvTranspose(320->160) + ReLU -> [B, 160, 64, 48]
-        GpuBuf d_br1a, d_br1b;
-        d_br1a.alloc(B * 320 * H * 2 * W * 2);
-        refine_branch1_0.forward(cudnn, d_fc_out.data, d_br1a.data, workspace.data, B, H, W);
-        relu_inplace(d_br1a.data, B * 320 * H * 2 * W * 2);
+        // Branch 1: ConvTranspose(640->320) + ReLU -> ConvTranspose(320->160) + ReLU
+        refine_branch1_0.forward(cudnn, d_refine_fc_out.data, d_refine_br1a.data,
+                                 workspace.data, B, H, W);
+        relu_inplace(d_refine_br1a.data, B * 320 * H * 2 * W * 2);
 
-        d_br1b.alloc(B * 160 * H * 4 * W * 4);
-        refine_branch1_1.forward(cudnn, d_br1a.data, d_br1b.data, workspace.data, B, H * 2, W * 2);
-        relu_inplace(d_br1b.data, B * 160 * H * 4 * W * 4);
+        refine_branch1_1.forward(cudnn, d_refine_br1a.data, d_refine_br1b.data,
+                                 workspace.data, B, H * 2, W * 2);
+        relu_inplace(d_refine_br1b.data, B * 160 * H * 4 * W * 4);
 
-        // Feature maps (high-res to low-res as in DeConvNet output[::-1]):
-        // feat0: d_br1b [B, 160, 64, 48]
-        // feat1: d_br0  [B, 320, 32, 24]
-        // feat2: d_fc_out [B, 640, 16, 12]
-        struct FeatInfo { float* data; int C, H, W; };
+        // Upload vertices to GPU for projection
+        d_refine_verts.copyFrom(h_temp_verts, B * 778 * 3);
+
+        // Upload pred_cam to GPU for projection kernel
+        // Reuse d_decode_pred_cam as temp (it's already allocated for B*3)
+        d_decode_pred_cam.copyFrom(h_pred_cam, B * 3);
+
+        // Zero out the feature accumulation buffer
+        d_refine_all_feat.zero();
+
+        // Feature maps (high-res to low-res, as DeConvNet output[::-1])
+        struct FeatInfo { float* data; int C, fH, fW; };
         FeatInfo feats[] = {
-            {d_br1b.data, 160, H * 4, W * 4},
-            {d_br0.data, 320, H * 2, W * 2},
-            {d_fc_out.data, 640, H, W},
+            {d_refine_br1b.data, 160, H * 4, W * 4},
+            {d_refine_br0.data, 320, H * 2, W * 2},
+            {d_refine_fc_out.data, 640, H, W},
         };
 
-        // Sample vertex features at projected MANO vertices
-        // For each scale: project verts -> grid_sample -> max_pool -> concat
-        GpuBuf d_verts, d_verts_2d, d_vert_feat, d_vert_max;
-        d_verts.alloc(B * 778 * 3);
-        d_verts.copyFrom(h_temp_verts, B * 778 * 3);
-
-        std::vector<float> h_vert_feats_all; // [B, 1120]
-
-        // Collect all vertex features on CPU
-        int total_feat_dim = 160 + 320 + 640;  // 1120
-        std::vector<float> h_all_feat(B * total_feat_dim, 0);
-
+        int total_feat_dim = 1120;
         int feat_offset = 0;
         for (int fi = 0; fi < 3; fi++) {
-            int fC = feats[fi].C, fH = feats[fi].H, fW = feats[fi].W;
+            int fC = feats[fi].C, fH = feats[fi].fH, fW = feats[fi].fW;
 
-            // Compute camera for this scale
-            // cam_t = [pred_cam[:, 1], pred_cam[:, 2], 2*focal/(fH * pred_cam[:, 0] + 1e-9)]
-            GpuBuf d_grid_xy;
-            d_grid_xy.alloc(B * 778 * 2);
+            // Project vertices to 2D on GPU
+            int n_proj = B * MANO_N_VERTS;
+            project_verts_gpu_kernel<<<(n_proj + 255) / 256, 256>>>(
+                d_refine_verts.data, d_decode_pred_cam.data, d_refine_grid_xy.data,
+                B, MANO_N_VERTS, fH, fW, FOCAL_LENGTH);
 
-            // Project vertices to 2D for this feature map scale
-            project_verts_to_feat(d_verts.data, h_pred_cam, B, fH, fW, d_grid_xy.data);
-
-            // grid_sample
-            d_vert_feat.alloc(B * fC * 778);
+            // grid_sample: [B, C, fH, fW] sampled at [B, 778, 2] -> [B, C, 778]
             grid_sample_kernel<<<(B * 778 + 255) / 256, 256>>>(
-                feats[fi].data, d_grid_xy.data, d_vert_feat.data, B, fC, fH, fW, 778);
+                feats[fi].data, d_refine_grid_xy.data, d_refine_vert_feat.data,
+                B, fC, fH, fW, 778);
 
-            // max_pool over 778 vertices -> [B, C]
-            d_vert_max.alloc(B * fC);
-            max_pool_points_kernel<<<(B * fC + 255) / 256, 256>>>(
-                d_vert_feat.data, d_vert_max.data, B, fC, 778);
+            // Max-pool over 778 vertices and write directly into concatenated buffer
+            max_pool_points_to_slice_kernel<<<(B * fC + 255) / 256, 256>>>(
+                d_refine_vert_feat.data, d_refine_all_feat.data,
+                B, fC, 778, total_feat_dim, feat_offset);
 
-            // Download
-            std::vector<float> h_feat(B * fC);
-            d_vert_max.copyTo(h_feat.data(), B * fC);
-
-            for (int b = 0; b < B; b++) {
-                for (int c = 0; c < fC; c++) {
-                    h_all_feat[b * total_feat_dim + feat_offset + c] = h_feat[b * fC + c];
-                }
-            }
             feat_offset += fC;
-
-            d_grid_xy.free(); d_vert_feat.free(); d_vert_max.free();
         }
 
-        d_verts.free(); d_fc_out.free(); d_br0.free(); d_br1a.free(); d_br1b.free();
-        d_img_feat.free(); d_img_feat_nchw.free();
+        // Download concatenated features [B, 1120]
+        std::vector<float> h_all_feat(B * total_feat_dim);
+        d_refine_all_feat.copyTo(h_all_feat.data(), B * total_feat_dim);
 
-        // Decode deltas
-        std::vector<float> h_dec_pose_w(96 * 1120), h_dec_pose_b(96);
-        std::vector<float> h_dec_shape_w(10 * 1120), h_dec_shape_b(10);
-        std::vector<float> h_dec_cam_w(3 * 1120), h_dec_cam_b(3);
-        refine_dec_pose_w.copyTo(h_dec_pose_w.data(), 96 * 1120);
-        refine_dec_pose_b.copyTo(h_dec_pose_b.data(), 96);
-        refine_dec_shape_w.copyTo(h_dec_shape_w.data(), 10 * 1120);
-        refine_dec_shape_b.copyTo(h_dec_shape_b.data(), 10);
-        refine_dec_cam_w.copyTo(h_dec_cam_w.data(), 3 * 1120);
-        refine_dec_cam_b.copyTo(h_dec_cam_b.data(), 3);
-
+        // Decode deltas using cached weights (no GPU download needed)
         for (int b = 0; b < B; b++) {
             const float* feat = &h_all_feat[b * 1120];
             for (int o = 0; o < 96; o++) {
-                float val = h_dec_pose_b[o];
-                for (int d = 0; d < 1120; d++) val += feat[d] * h_dec_pose_w[o * 1120 + d];
+                float val = h_refine_dec_pose_b_cache[o];
+                for (int d = 0; d < 1120; d++) val += feat[d] * h_refine_dec_pose_w_cache[o * 1120 + d];
                 h_delta_pose[b * 96 + o] = val;
             }
             for (int o = 0; o < 10; o++) {
-                float val = h_dec_shape_b[o];
-                for (int d = 0; d < 1120; d++) val += feat[d] * h_dec_shape_w[o * 1120 + d];
+                float val = h_refine_dec_shape_b_cache[o];
+                for (int d = 0; d < 1120; d++) val += feat[d] * h_refine_dec_shape_w_cache[o * 1120 + d];
                 h_delta_betas[b * 10 + o] = val;
             }
             for (int o = 0; o < 3; o++) {
-                float val = h_dec_cam_b[o];
-                for (int d = 0; d < 1120; d++) val += feat[d] * h_dec_cam_w[o * 1120 + d];
+                float val = h_refine_dec_cam_b_cache[o];
+                for (int d = 0; d < 1120; d++) val += feat[d] * h_refine_dec_cam_w_cache[o * 1120 + d];
                 h_delta_cam[b * 3 + o] = val;
             }
         }
-    }
-
-    void project_verts_to_feat(float* d_verts, const float* h_pred_cam, int B,
-                               int featH, int featW, float* d_grid_xy) {
-        // Perspective projection of 3D vertices onto feature map
-        // cam_t = [cam_x, cam_y, 2*focal/(featH * cam_s + 1e-9)]
-        std::vector<float> h_grid(B * 778 * 2);
-        std::vector<float> h_verts(B * 778 * 3);
-        CUDA_CHECK(cudaMemcpy(h_verts.data(), d_verts, B * 778 * 3 * sizeof(float), cudaMemcpyDeviceToHost));
-
-        for (int b = 0; b < B; b++) {
-            float cam_s = h_pred_cam[b * 3 + 0];
-            float cam_x = h_pred_cam[b * 3 + 1];
-            float cam_y = h_pred_cam[b * 3 + 2];
-            float fl = FOCAL_LENGTH;
-            float tz = 2.0f * fl / ((float)featH * cam_s + 1e-9f);
-            float cam_t[3] = {cam_x, cam_y, tz};
-            float fl_scaled = fl / (float)featH;
-
-            for (int v = 0; v < 778; v++) {
-                float vx = h_verts[b * 778 * 3 + v * 3 + 0] + cam_t[0];
-                float vy = h_verts[b * 778 * 3 + v * 3 + 1] + cam_t[1];
-                float vz = h_verts[b * 778 * 3 + v * 3 + 2] + cam_t[2];
-
-                float px = fl_scaled * vx / vz;
-                float py = fl_scaled * vy / vz;
-
-                h_grid[(b * 778 + v) * 2 + 0] = px;
-                h_grid[(b * 778 + v) * 2 + 1] = py;
-            }
-        }
-        CUDA_CHECK(cudaMemcpy(d_grid_xy, h_grid.data(), B * 778 * 2 * sizeof(float), cudaMemcpyHostToDevice));
     }
 };
 

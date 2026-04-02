@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
     int update_steps = 2;
     float hand_det_conf = 0.3f;
     int hand_stride = 1;
-    int hand_wilor_batch = 48;
+    int hand_wilor_batch = 96;
     bool skip_slam = false, skip_hands = false;
     bool listen_mode = false;
 
@@ -510,13 +510,19 @@ int main(int argc, char** argv) {
             std::vector<float> pending_centers, pending_sizes, pending_img_sizes, pending_rights;
             std::vector<int> pending_result_idx;
 
+            double t_yolo_ms = 0, t_wilor_ms = 0;
+            auto tnow = [](){ return std::chrono::high_resolution_clock::now(); };
+            auto tms = [](auto a, auto b){ return std::chrono::duration<double,std::milli>(b-a).count(); };
+
             // WiLoR flush helper
             auto flush_wilor = [&]() {
                 int n = pending_sizes.size();
                 if (n == 0) return;
+                auto tw0 = tnow();
                 std::vector<hand::WilorModel::HandResult> results(n);
                 wilor.forward(d_crops_buf, n, pending_centers.data(), pending_sizes.data(),
                               pending_img_sizes.data(), pending_rights.data(), results.data());
+                t_wilor_ms += tms(tw0, tnow());
                 for (int i = 0; i < n; i++) {
                     int ri = pending_result_idx[i];
                     if (pending_rights[i] > 0.5f) {
@@ -560,118 +566,34 @@ int main(int argc, char** argv) {
                 return avcodec_receive_frame(dec_ctx, av_frame) == 0;
             };
 
-            // Pass 1: SLAM
-            while (total_frames < job_max_frames && decode_next()) {
-                if (nvdec_is_p010) {
-                    p010_to_bgr_resize_kernel<<<slam_grid, slam_block>>>(
-                        (const uint16_t*)av_frame->data[0], (const uint16_t*)av_frame->data[1],
-                        slam_frame_buf.data, srcW, srcH,
-                        av_frame->linesize[0], av_frame->linesize[1], slamW, slamH);
-                } else {
-                    nv12_to_bgr_resize_kernel<<<slam_grid, slam_block>>>(
-                        av_frame->data[0], av_frame->data[1],
-                        slam_frame_buf.data, srcW, srcH,
-                        av_frame->linesize[0], av_frame->linesize[1], slamW, slamH);
-                }
+            auto t_phase = std::chrono::high_resolution_clock::now();
+            auto t_mark = [&](const char* label) {
                 cudaDeviceSynchronize();
-                droid.process_frame(total_frames, slam_frame_buf.data);
-                total_frames++;
-            }
-
-            // Pass 2: Hand processing (re-seek)
-            avcodec_flush_buffers(dec_ctx);
-            av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
-            avcodec_flush_buffers(dec_ctx);
-
-            int hand_frame_count = 0;
-            while (hand_frame_count < total_frames && decode_next()) {
-                int frame_idx = hand_frame_count;
-                bool hand_this_frame = (frame_idx % job_hand_stride == 0);
-                if (hand_this_frame) {
-                    uint8_t* dst = (uint8_t*)hand_frame_buf.data + hand_n_in_batch * hand_single_frame;
-                    int bgr_stride = srcW * 3;
-                    if (nvdec_is_p010) {
-                        p010_to_bgr_kernel<<<hand_grid, hand_block>>>(
-                            (const uint16_t*)av_frame->data[0], (const uint16_t*)av_frame->data[1],
-                            dst, srcW, srcH,
-                            av_frame->linesize[0], av_frame->linesize[1], bgr_stride);
-                    } else {
-                        nv12_to_bgr_kernel<<<hand_grid, hand_block>>>(
-                            av_frame->data[0], av_frame->data[1],
-                            dst, srcW, srcH,
-                            av_frame->linesize[0], av_frame->linesize[1], bgr_stride);
-                    }
-                    cudaDeviceSynchronize();
-
-                    FrameResult fr;
-                    fr.frame_idx = frame_idx;
-                    hand_results.push_back(fr);
-
-                    hand_batch_frame_indices[hand_n_in_batch] = frame_idx;
-                    hand_n_in_batch++;
-                    hand_n_frames++;
-
-                    if (hand_n_in_batch == YOLO_BATCH) {
-                        auto dets = yolo.forward((const uint8_t*)hand_frame_buf.data,
-                                                 hand_n_in_batch, srcH, srcW);
-                        total_dets += dets.size();
-                        if (!dets.empty()) {
-                            float yolo_scale_x = (float)yolo.yolo_w / srcW;
-                            float yolo_scale_y = (float)yolo.yolo_h / srcH;
-                            int result_base = hand_results.size() - hand_n_in_batch;
-                            for (auto& det : dets) {
-                                if ((int)pending_sizes.size() >= hand_wilor_batch) flush_wilor();
-                                int ri = result_base + det.batch_idx;
-                                float x1 = det.x1 / yolo_scale_x, y1 = det.y1 / yolo_scale_y;
-                                float x2 = det.x2 / yolo_scale_x, y2 = det.y2 / yolo_scale_y;
-                                float cx = (x1+x2)/2, cy = (y1+y2)/2;
-                                float bw = (x2-x1)*2, bh = (y2-y1)*2;
-                                if (bh/bw < 256.0f/192.0f) bh = bw * 256.0f/192.0f;
-                                else bw = bh * 192.0f/256.0f;
-                                float bbox_size = std::max(bw, bh);
-                                bool is_right = det.cls == 1;
-                                pending_centers.push_back(cx); pending_centers.push_back(cy);
-                                pending_sizes.push_back(bbox_size);
-                                pending_img_sizes.push_back((float)srcW);
-                                pending_img_sizes.push_back((float)srcH);
-                                pending_rights.push_back(is_right ? 1.0f : 0.0f);
-                                pending_result_idx.push_back(ri);
-                                int ci = pending_sizes.size() - 1;
-                                const uint8_t* fptr = (const uint8_t*)hand_frame_buf.data
-                                                      + det.batch_idx * hand_single_frame;
-                                int total_px = 3 * VIT_IMG_H * VIT_IMG_W;
-                                hand::wilor_preprocess_kernel<<<(total_px+255)/256, 256>>>(
-                                    fptr, d_crops_buf, srcH, srcW,
-                                    cx, cy, bbox_size, !is_right,
-                                    VIT_IMG_H, VIT_IMG_W, ci,
-                                    IMAGE_MEAN[0], IMAGE_MEAN[1], IMAGE_MEAN[2],
-                                    IMAGE_STD[0], IMAGE_STD[1], IMAGE_STD[2]);
-                            }
-                        }
-                        hand_n_in_batch = 0;
-                    }
-                }
-                hand_frame_count++;
-            }
-
-            // Flush partial YOLO batch
-            if (hand_n_in_batch > 0) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(now - t_phase).count();
+                fprintf(stderr, "[timing] %-20s %7.1f ms\n", label, ms);
+                t_phase = now;
+            };
+            // YOLO detection processing helper (reused for full and partial batches)
+            auto process_yolo_dets = [&](int n_in_batch) {
+                auto ty0 = tnow();
                 auto dets = yolo.forward((const uint8_t*)hand_frame_buf.data,
-                                         hand_n_in_batch, srcH, srcW);
+                                         n_in_batch, srcH, srcW);
+                t_yolo_ms += tms(ty0, tnow());
                 total_dets += dets.size();
                 if (!dets.empty()) {
                     float yolo_scale_x = (float)yolo.yolo_w / srcW;
                     float yolo_scale_y = (float)yolo.yolo_h / srcH;
-                    int result_base = hand_results.size() - hand_n_in_batch;
+                    int result_base = hand_results.size() - n_in_batch;
                     for (auto& det : dets) {
                         if ((int)pending_sizes.size() >= hand_wilor_batch) flush_wilor();
                         int ri = result_base + det.batch_idx;
-                        float x1 = det.x1/yolo_scale_x, y1 = det.y1/yolo_scale_y;
-                        float x2 = det.x2/yolo_scale_x, y2 = det.y2/yolo_scale_y;
+                        float x1 = det.x1 / yolo_scale_x, y1 = det.y1 / yolo_scale_y;
+                        float x2 = det.x2 / yolo_scale_x, y2 = det.y2 / yolo_scale_y;
                         float cx = (x1+x2)/2, cy = (y1+y2)/2;
                         float bw = (x2-x1)*2, bh = (y2-y1)*2;
-                        if (bh/bw < 256.0f/192.0f) bh = bw*256.0f/192.0f;
-                        else bw = bh*192.0f/256.0f;
+                        if (bh/bw < 256.0f/192.0f) bh = bw * 256.0f/192.0f;
+                        else bw = bh * 192.0f/256.0f;
                         float bbox_size = std::max(bw, bh);
                         bool is_right = det.cls == 1;
                         pending_centers.push_back(cx); pending_centers.push_back(cy);
@@ -692,14 +614,82 @@ int main(int argc, char** argv) {
                             IMAGE_STD[0], IMAGE_STD[1], IMAGE_STD[2]);
                     }
                 }
+            };
+
+            // Single-pass: decode each frame once, process SLAM + hands together
+            droid.disable_timers();  // avoid per-frame cudaEventSynchronize overhead
+
+            while (total_frames < job_max_frames && decode_next()) {
+                // SLAM: downscale and process
+                if (nvdec_is_p010) {
+                    p010_to_bgr_resize_kernel<<<slam_grid, slam_block>>>(
+                        (const uint16_t*)av_frame->data[0], (const uint16_t*)av_frame->data[1],
+                        slam_frame_buf.data, srcW, srcH,
+                        av_frame->linesize[0], av_frame->linesize[1], slamW, slamH);
+                } else {
+                    nv12_to_bgr_resize_kernel<<<slam_grid, slam_block>>>(
+                        av_frame->data[0], av_frame->data[1],
+                        slam_frame_buf.data, srcW, srcH,
+                        av_frame->linesize[0], av_frame->linesize[1], slamW, slamH);
+                }
+
+                // Hand: convert full-res frame (on same decode, no re-seek)
+                bool hand_this_frame = (total_frames % job_hand_stride == 0);
+                if (hand_this_frame) {
+                    uint8_t* dst = (uint8_t*)hand_frame_buf.data + hand_n_in_batch * hand_single_frame;
+                    int bgr_stride = srcW * 3;
+                    if (nvdec_is_p010) {
+                        p010_to_bgr_kernel<<<hand_grid, hand_block>>>(
+                            (const uint16_t*)av_frame->data[0], (const uint16_t*)av_frame->data[1],
+                            dst, srcW, srcH,
+                            av_frame->linesize[0], av_frame->linesize[1], bgr_stride);
+                    } else {
+                        nv12_to_bgr_kernel<<<hand_grid, hand_block>>>(
+                            av_frame->data[0], av_frame->data[1],
+                            dst, srcW, srcH,
+                            av_frame->linesize[0], av_frame->linesize[1], bgr_stride);
+                    }
+                }
+
+                cudaDeviceSynchronize();
+                droid.process_frame(total_frames, slam_frame_buf.data);
+
+                // Accumulate hand batch (frame data already converted above)
+                if (hand_this_frame) {
+                    FrameResult fr;
+                    fr.frame_idx = total_frames;
+                    hand_results.push_back(fr);
+                    hand_batch_frame_indices[hand_n_in_batch] = total_frames;
+                    hand_n_in_batch++;
+                    hand_n_frames++;
+
+                    if (hand_n_in_batch == YOLO_BATCH) {
+                        process_yolo_dets(hand_n_in_batch);
+                        hand_n_in_batch = 0;
+                    }
+                }
+                total_frames++;
+            }
+
+            // Flush partial YOLO batch
+            if (hand_n_in_batch > 0) {
+                process_yolo_dets(hand_n_in_batch);
             }
             flush_wilor();
+
+            t_mark("slam+hands");
+            {
+                fprintf(stderr, "[timing]   yolo:            %7.1f ms\n", t_yolo_ms);
+                fprintf(stderr, "[timing]   wilor:           %7.1f ms\n", t_wilor_ms);
+            }
 
             // Backend optimization
             if (job_backend_iters1 > 0) {
                 droid.backend(job_backend_iters1, job_backend_radius);
                 if (job_backend_iters2 > 0) droid.backend(job_backend_iters2, job_backend_radius);
             }
+
+            t_mark("slam_backend");
 
             // Output SLAM poses
             int nk = droid.state.num_keyframes;

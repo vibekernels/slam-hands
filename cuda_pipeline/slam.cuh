@@ -572,6 +572,28 @@ inline void half_to_float(const __half* in, float* out, int n) {
     half_to_float_kernel<<<(n+255)/256, 256>>>(in, out, n);
 }
 
+// Compute sum of flow magnitudes: sqrt(dx^2 + dy^2) for each pixel, reduce to single float
+// delta: [3, HW] (dx channel, dy channel, ...), output: single float sum
+__global__ void flow_magnitude_sum_kernel(const float* __restrict__ delta, float* __restrict__ out,
+                                           int hw) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    float val = 0;
+    if (i < hw) {
+        float dx = delta[i];
+        float dy = delta[hw + i];
+        val = sqrtf(dx * dx + dy * dy);
+    }
+    sdata[tid] = val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(out, sdata[0]);
+}
+
 // FP16 activation kernels
 __global__ void relu_half_kernel(__half* data, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1582,14 +1604,16 @@ struct CudaTimer {
     cudaEvent_t start, stop;
     const char* name;
     float elapsed_ms;
+    bool enabled;
 
-    CudaTimer(const char* n) : name(n), elapsed_ms(0) {
+    CudaTimer(const char* n) : name(n), elapsed_ms(0), enabled(true) {
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
     }
     void reset() { elapsed_ms = 0; }
-    void begin() { cudaEventRecord(start); }
+    void begin() { if (enabled) cudaEventRecord(start); }
     void end() {
+        if (!enabled) return;
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
         float ms;
@@ -2894,6 +2918,8 @@ struct CudaDroid {
     // Buffers for GRU-based motion filter (single edge)
     GpuBuf mf_corr, mf_coords, mf_motion, mf_nets, mf_inps;
     GpuBuf mf_delta, mf_weight, mf_eta;
+    GpuBuf mf_flow_sum;  // single float for GPU reduction
+    bool mf_coords_inited = false;
 
     void alloc_motion_filter_bufs() {
         int hw = h * w;
@@ -2905,6 +2931,16 @@ struct CudaDroid {
         mf_delta.alloc(3 * hw);
         mf_weight.alloc(3 * hw);
         mf_eta.alloc(hw);
+        mf_flow_sum.alloc(1);
+        // Pre-fill identity grid
+        std::vector<float> grid(2 * hw);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                grid[0 * h * w + y * w + x] = (float)x;
+                grid[1 * h * w + y * w + x] = (float)y;
+            }
+        mf_coords.copyFrom(grid.data(), 2 * hw);
+        mf_coords_inited = true;
     }
 
     // Compute GRU-predicted optical flow between last keyframe and current frame
@@ -2916,15 +2952,7 @@ struct CudaDroid {
         int temp_slot = state.num_keyframes;
         build_correlation(last_kf_idx, temp_slot);
 
-        // Initialize coordinates as identity grid (pixel coordinates at 1/8 res)
-        std::vector<float> grid(2 * hw);
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++) {
-                grid[0 * h * w + y * w + x] = (float)x;  // x channel
-                grid[1 * h * w + y * w + x] = (float)y;  // y channel
-            }
-        mf_coords.copyFrom(grid.data(), 2 * hw);
-
+        // Identity grid is pre-filled in alloc_motion_filter_bufs()
         // Sample correlation at identity coords
         sample_correlation(mf_coords.data, mf_corr.data);
 
@@ -3217,6 +3245,14 @@ struct CudaDroid {
         t_update.reset();
         t_ba.reset();
         t_total.reset();
+    }
+
+    void disable_timers() {
+        t_encode.enabled = false;
+        t_corr.enabled = false;
+        t_update.enabled = false;
+        t_ba.enabled = false;
+        t_total.enabled = false;
     }
 
     void print_timing(int num_frames) {

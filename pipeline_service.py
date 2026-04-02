@@ -430,10 +430,6 @@ class PipelineService:
         t_total = time.perf_counter() - t_total_start
         _progress("Done", f"total {t_total:.1f}s")
 
-        # Free CUDA memory between videos
-        torch.cuda.empty_cache()
-        gc.collect()
-
         return dataset_path
 
     def _run_slam(self, video_path, fps, width, height, fast_traj=True, backend_steps=(3, 5)):
@@ -643,11 +639,10 @@ class PipelineService:
                 "slam_resolution": (h1, w1),
             }
 
-            # Read hand results
+            # Read hand results (bulk read for speed)
             with open(hand_path, "rb") as f:
                 nhr, total_f, stride = struct.unpack("3i", f.read(12))
-
-                n_all = total_f  # total frames in video
+                n_all = total_f
                 left_kp3d = np.zeros((n_all, 63), dtype=np.float32)
                 right_kp3d = np.zeros((n_all, 63), dtype=np.float32)
                 left_kp2d = np.zeros((n_all, 42), dtype=np.float32)
@@ -655,23 +650,22 @@ class PipelineService:
                 left_detected = np.zeros(n_all, dtype=np.float32)
                 right_detected = np.zeros(n_all, dtype=np.float32)
 
-                for _ in range(nhr):
-                    frame_idx = struct.unpack("i", f.read(4))[0]
-                    left_det, right_det = struct.unpack("2B", f.read(2))
-
-                    l3d = np.frombuffer(f.read(63 * 4), dtype=np.float32)
-                    r3d = np.frombuffer(f.read(63 * 4), dtype=np.float32)
-                    l2d = np.frombuffer(f.read(42 * 4), dtype=np.float32)
-                    r2d = np.frombuffer(f.read(42 * 4), dtype=np.float32)
-
+                # Each record: 4 bytes frame_idx + 2 bytes det flags + 4*(63+63+42+42) bytes = 846 bytes
+                record_size = 4 + 2 + (63 + 63 + 42 + 42) * 4
+                bulk = f.read(nhr * record_size)
+                for i in range(nhr):
+                    off = i * record_size
+                    frame_idx = struct.unpack_from("i", bulk, off)[0]
+                    left_det, right_det = struct.unpack_from("2B", bulk, off + 4)
+                    off += 6
                     if frame_idx < n_all:
                         if left_det:
-                            left_kp3d[frame_idx] = l3d
-                            left_kp2d[frame_idx] = l2d
+                            left_kp3d[frame_idx] = np.frombuffer(bulk, np.float32, 63, off)
+                            left_kp2d[frame_idx] = np.frombuffer(bulk, np.float32, 42, off + 63*4 + 63*4)
                             left_detected[frame_idx] = 1.0
                         if right_det:
-                            right_kp3d[frame_idx] = r3d
-                            right_kp2d[frame_idx] = r2d
+                            right_kp3d[frame_idx] = np.frombuffer(bulk, np.float32, 63, off + 63*4)
+                            right_kp2d[frame_idx] = np.frombuffer(bulk, np.float32, 42, off + 63*4 + 63*4 + 42*4)
                             right_detected[frame_idx] = 1.0
 
             hand_result = {
@@ -772,7 +766,7 @@ def main():
                     dataset_path = service.process_video(
                         video_path, output_dir,
                         fast_traj=job.get("fast_traj", True),
-                        hand_stride=job.get("hand_stride", 1),
+                        hand_stride=job.get("hand_stride", 2),
                         hand_det_conf=job.get("hand_det_conf", 0.3),
                         skip_slam=job.get("skip_slam", False),
                         skip_hands=job.get("skip_hands", False),
