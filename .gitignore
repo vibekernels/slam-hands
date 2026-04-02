@@ -11,4 +11,10 @@ output_test/
 *.MOV
 *.mov
 cuda_slam/cuda_droid
+cuda_slam/cuda_droid_fp32
 cuda_slam/data/
+cuda_hand/cuda_hand
+cuda_hand/data/
+cuda_hand/debug_*
+cuda_hand/test_cublas
+cuda_pipeline/cuda_pipeline

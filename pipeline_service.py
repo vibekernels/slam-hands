@@ -151,11 +151,15 @@ class PipelineService:
         self._hand_proc = None
 
         self._mps_active = False
+        self._combined_proc = None
 
         t_start = time.perf_counter()
-        self._start_mps()
-        self._start_hand_worker()
-        self._init_slam()
+        self._init_slam()  # also detects combined pipeline binary
+        if self._use_combined:
+            self._start_combined_worker()
+        else:
+            self._start_mps()
+            self._start_hand_worker()
         t_total = time.perf_counter() - t_start
         print(f"[Service] Ready in {t_total:.1f}s", flush=True)
         self._ready = True
@@ -193,6 +197,29 @@ class PipelineService:
         except Exception:
             pass
 
+    def _start_combined_worker(self):
+        """Start persistent cuda_pipeline binary in --listen mode."""
+        self._combined_proc = subprocess.Popen(
+            [self._cuda_pipeline_bin,
+             '--slam-weights', self._cuda_slam_weights,
+             '--hand-weights', self._cuda_hand_weights,
+             '--listen'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        # Collect stderr in background
+        self._combined_stderr = []
+        def _read_stderr():
+            for line in self._combined_proc.stderr:
+                self._combined_stderr.append(line.decode().rstrip())
+                print(f"  [cuda_pipeline] {self._combined_stderr[-1]}", flush=True)
+        self._combined_stderr_thread = Thread(target=_read_stderr, daemon=True)
+        self._combined_stderr_thread.start()
+
+        ready_line = self._combined_proc.stdout.readline().decode().strip()
+        if ready_line != "READY":
+            raise RuntimeError(f"cuda_pipeline failed to start: {ready_line}")
+        print("[Service] Combined CUDA pipeline worker started", flush=True)
+
     def _start_hand_worker(self):
         """Start persistent cuda_hand binary in --listen mode."""
         cuda_hand_dir = os.path.join(os.path.dirname(__file__), 'cuda_hand')
@@ -225,12 +252,20 @@ class PipelineService:
     def _init_slam(self):
         """Initialize CUDA DROID-SLAM binary and native decoder."""
         self._nd = _get_native_decode()
+        base_dir = os.path.dirname(__file__)
         # Locate the CUDA DROID-SLAM binary and weights
-        self._cuda_slam_dir = os.path.join(os.path.dirname(__file__), "cuda_slam")
+        self._cuda_slam_dir = os.path.join(base_dir, "cuda_slam")
         self._cuda_slam_bin = os.path.join(self._cuda_slam_dir, "cuda_droid")
         self._cuda_slam_weights = os.path.join(self._cuda_slam_dir, "data", "weights")
         if not os.path.isfile(self._cuda_slam_bin):
             raise RuntimeError(f"CUDA DROID-SLAM binary not found: {self._cuda_slam_bin}")
+
+        # Combined pipeline binary (SLAM + hands in one process)
+        self._cuda_pipeline_bin = os.path.join(base_dir, "cuda_pipeline", "cuda_pipeline")
+        self._cuda_hand_weights = os.path.join(base_dir, "cuda_hand", "data", "weights")
+        self._use_combined = os.path.isfile(self._cuda_pipeline_bin)
+        if self._use_combined:
+            print("[Service] Combined CUDA pipeline available", flush=True)
         print("[Service] CUDA DROID-SLAM initialized", flush=True)
 
     def process_video(
@@ -291,60 +326,71 @@ class PipelineService:
                 ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             t_vc = time.perf_counter()
 
-        # ── Dispatch hand processing (persistent CUDA binary) ──
-        hand_result = None
-        result_path = f"/tmp/hand_result_svc_{os.getpid()}_{int(time.time())}.npz"
-        cuda_output = result_path.replace('.npz', '_cuda.bin')
-        if not skip_hands:
-            _progress("Hands", "dispatching to CUDA hand worker...")
-            job = json.dumps({
-                "video": video_path,
-                "output": cuda_output,
-                "det_conf": hand_det_conf,
-                "stride": hand_stride,
-            }) + "\n"
-            self._hand_proc.stdin.write(job.encode())
-            self._hand_proc.stdin.flush()
-
-        # ── Run SLAM in parent (concurrently with hand processing) ──
+        # ── Run SLAM + hands ──
         slam_result = None
+        hand_result = None
         num_frames = 0
-        if not skip_slam:
-            _progress("SLAM", "tracking...")
-            slam_result, num_frames = self._run_slam(
+
+        use_combined = (self._use_combined and not skip_slam and not skip_hands)
+
+        if use_combined:
+            # Combined binary: SLAM + hands in one process, shared NVDEC decode
+            _progress("Pipeline", "running combined SLAM + hands...")
+            slam_result, hand_result, num_frames = self._run_combined(
                 video_path, fps, width, height,
                 fast_traj=fast_traj, backend_steps=backend_steps,
+                hand_stride=hand_stride, hand_det_conf=hand_det_conf,
             )
-            _progress("SLAM", f"done ({num_frames} frames)")
+            _progress("Pipeline", f"done ({num_frames} frames)")
+        else:
+            # Separate binaries with MPS
+            result_path = f"/tmp/hand_result_svc_{os.getpid()}_{int(time.time())}.npz"
+            cuda_output = result_path.replace('.npz', '_cuda.bin')
+            if not skip_hands:
+                _progress("Hands", "dispatching to CUDA hand worker...")
+                job = json.dumps({
+                    "video": video_path,
+                    "output": cuda_output,
+                    "det_conf": hand_det_conf,
+                    "stride": hand_stride,
+                }) + "\n"
+                self._hand_proc.stdin.write(job.encode())
+                self._hand_proc.stdin.flush()
 
-        # ── Collect hand result ──
-        if not skip_hands:
-            _progress("Hands", "waiting for CUDA hand result...")
-            # Read response line from cuda_hand stdout
-            resp_line = self._hand_proc.stdout.readline().decode().strip()
-            resp = json.loads(resp_line)
-            if resp.get("status") != "done":
-                raise RuntimeError(f"CUDA hand failed: {resp}")
-            t_hand = resp.get("time", "?")
+            if not skip_slam:
+                _progress("SLAM", "tracking...")
+                slam_result, num_frames = self._run_slam(
+                    video_path, fps, width, height,
+                    fast_traj=fast_traj, backend_steps=backend_steps,
+                )
+                _progress("SLAM", f"done ({num_frames} frames)")
 
-            _parse_cuda_hand_output(cuda_output, result_path)
+            if not skip_hands:
+                _progress("Hands", "waiting for CUDA hand result...")
+                resp_line = self._hand_proc.stdout.readline().decode().strip()
+                resp = json.loads(resp_line)
+                if resp.get("status") != "done":
+                    raise RuntimeError(f"CUDA hand failed: {resp}")
+                t_hand = resp.get("time", "?")
 
-            data = np.load(result_path)
-            hand_num_frames = int(data["num_frames"][0]) if "num_frames" in data else num_frames
-            hand_result = {
-                "_model": "wilor", "_done": True,
-                "left_hand_keypoints_3d": data["left_kp3d"],
-                "right_hand_keypoints_3d": data["right_kp3d"],
-                "left_hand_keypoints_2d": data["left_kp2d"],
-                "right_hand_keypoints_2d": data["right_kp2d"],
-                "left_hand_detected": data["left_detected"],
-                "right_hand_detected": data["right_detected"],
-            }
-            if num_frames == 0:
-                num_frames = hand_num_frames
-            if os.path.exists(result_path):
-                os.remove(result_path)
-            _progress("Hands", f"done ({t_hand}s)")
+                _parse_cuda_hand_output(cuda_output, result_path)
+
+                data = np.load(result_path)
+                hand_num_frames = int(data["num_frames"][0]) if "num_frames" in data else num_frames
+                hand_result = {
+                    "_model": "wilor", "_done": True,
+                    "left_hand_keypoints_3d": data["left_kp3d"],
+                    "right_hand_keypoints_3d": data["right_kp3d"],
+                    "left_hand_keypoints_2d": data["left_kp2d"],
+                    "right_hand_keypoints_2d": data["right_kp2d"],
+                    "left_hand_detected": data["left_detected"],
+                    "right_hand_detected": data["right_detected"],
+                }
+                if num_frames == 0:
+                    num_frames = hand_num_frames
+                if os.path.exists(result_path):
+                    os.remove(result_path)
+                _progress("Hands", f"done ({t_hand}s)")
 
         if num_frames == 0:
             fps, _, _, num_frames = get_video_metadata(video_path)
@@ -478,13 +524,186 @@ class PipelineService:
 
         return slam_result, num_frames
 
+    def _run_combined(self, video_path, fps, width, height,
+                      fast_traj=True, backend_steps=(3, 5),
+                      hand_stride=2, hand_det_conf=0.3):
+        """Run SLAM + hand processing in a single CUDA binary (shared NVDEC decode).
+
+        Uses the persistent --listen worker if available.
+        Returns (slam_result, hand_result, num_frames).
+        """
+        import tempfile
+
+        h0, w0 = height, width
+        scale = np.sqrt((384 * 512) / (h0 * w0))
+        h1 = int(h0 * scale) // 8 * 8
+        w1 = int(w0 * scale) // 8 * 8
+
+        fx, fy, cx, cy = get_iphone_intrinsics(width, height)
+        fx_s = fx * (w1 / w0)
+        fy_s = fy * (h1 / h0)
+        cx_s = cx * (w1 / w0)
+        cy_s = cy * (h1 / h0)
+        intrinsics_scaled = np.array([fx_s, fy_s, cx_s, cy_s], dtype=np.float32)
+
+        with tempfile.TemporaryDirectory(prefix="cuda_pipeline_") as tmpdir:
+            calib_path = os.path.join(tmpdir, "calib.bin")
+            pose_path = os.path.join(tmpdir, "poses.bin")
+            hand_path = os.path.join(tmpdir, "hands.bin")
+
+            with open(calib_path, "wb") as f:
+                f.write(struct.pack("4f", fx_s, fy_s, cx_s, cy_s))
+
+            t0 = time.perf_counter()
+
+            if self._combined_proc and self._combined_proc.poll() is None:
+                # Use persistent worker
+                job = json.dumps({
+                    "video": video_path,
+                    "calib": calib_path,
+                    "resize_h": h1, "resize_w": w1,
+                    "pose_output": pose_path,
+                    "hand_output": hand_path,
+                    "hand_stride": hand_stride,
+                    "hand_det_conf": hand_det_conf,
+                    "max_frames": 99999,
+                    "backend_iters1": backend_steps[0] if backend_steps else 3,
+                    "backend_iters2": backend_steps[1] if backend_steps and len(backend_steps) > 1 else 5,
+                    "backend_radius": 1,
+                    "frontend_window": 15,
+                    "update_steps": 2,
+                }) + "\n"
+                self._combined_proc.stdin.write(job.encode())
+                self._combined_proc.stdin.flush()
+                # Read lines until we get a JSON response (skip SLAM progress output)
+                resp = None
+                while True:
+                    resp_line = self._combined_proc.stdout.readline().decode().strip()
+                    if not resp_line:
+                        raise RuntimeError("cuda_pipeline: unexpected EOF")
+                    if resp_line.startswith("{"):
+                        resp = json.loads(resp_line)
+                        break
+                if resp.get("status") != "done":
+                    raise RuntimeError(f"cuda_pipeline failed: {resp}")
+                num_frames = resp.get("frames", 0)
+            else:
+                # Fallback: one-shot mode
+                cmd = [
+                    self._cuda_pipeline_bin,
+                    "--video", video_path,
+                    "--slam-weights", self._cuda_slam_weights,
+                    "--hand-weights", self._cuda_hand_weights,
+                    "--calib", calib_path,
+                    "--resize", str(h1), str(w1),
+                    "--pose-output", pose_path,
+                    "--hand-output", hand_path,
+                    "--hand-stride", str(hand_stride),
+                    "--det-conf", str(hand_det_conf),
+                    "--max-frames", "99999",
+                    "--frontend-window", "15",
+                    "--update-steps", "2",
+                    "--backend-radius", "1",
+                ]
+                if backend_steps and len(backend_steps) >= 2:
+                    cmd += ["--backend", str(backend_steps[0]), str(backend_steps[1])]
+
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout_bytes = proc.stdout.read()
+                proc.wait()
+
+                if proc.returncode != 0:
+                    stderr_text = proc.stderr.read().decode(errors="replace")
+                    print(f"  cuda_pipeline stderr: {stderr_text[-500:]}", flush=True)
+                    raise RuntimeError(f"cuda_pipeline failed (code {proc.returncode})")
+
+                stdout_text = stdout_bytes.decode(errors="replace")
+                num_frames = 0
+                for line in stdout_text.split("\n"):
+                    if "keyframes from" in line:
+                        try:
+                            num_frames = int(line.split("from")[1].split("frames")[0].strip())
+                        except (ValueError, IndexError):
+                            pass
+
+            t_total = time.perf_counter() - t0
+            print(f"  Combined pipeline: {t_total:.1f}s ({num_frames} frames)", flush=True)
+
+            # Read SLAM poses
+            with open(pose_path, "rb") as f:
+                nk = struct.unpack("i", f.read(4))[0]
+                kf_timestamps = np.array(struct.unpack(f"{nk}i", f.read(nk * 4)), dtype=np.int64)
+                kf_poses = np.frombuffer(f.read(nk * 7 * 4), dtype=np.float32).reshape(nk, 7)
+
+            all_poses = _interpolate_poses_simple(kf_timestamps, kf_poses, num_frames)
+            slam_result = {
+                "poses": all_poses,
+                "intrinsics": intrinsics_scaled,
+                "slam_resolution": (h1, w1),
+            }
+
+            # Read hand results
+            with open(hand_path, "rb") as f:
+                nhr, total_f, stride = struct.unpack("3i", f.read(12))
+
+                n_all = total_f  # total frames in video
+                left_kp3d = np.zeros((n_all, 63), dtype=np.float32)
+                right_kp3d = np.zeros((n_all, 63), dtype=np.float32)
+                left_kp2d = np.zeros((n_all, 42), dtype=np.float32)
+                right_kp2d = np.zeros((n_all, 42), dtype=np.float32)
+                left_detected = np.zeros(n_all, dtype=np.float32)
+                right_detected = np.zeros(n_all, dtype=np.float32)
+
+                for _ in range(nhr):
+                    frame_idx = struct.unpack("i", f.read(4))[0]
+                    left_det, right_det = struct.unpack("2B", f.read(2))
+
+                    l3d = np.frombuffer(f.read(63 * 4), dtype=np.float32)
+                    r3d = np.frombuffer(f.read(63 * 4), dtype=np.float32)
+                    l2d = np.frombuffer(f.read(42 * 4), dtype=np.float32)
+                    r2d = np.frombuffer(f.read(42 * 4), dtype=np.float32)
+
+                    if frame_idx < n_all:
+                        if left_det:
+                            left_kp3d[frame_idx] = l3d
+                            left_kp2d[frame_idx] = l2d
+                            left_detected[frame_idx] = 1.0
+                        if right_det:
+                            right_kp3d[frame_idx] = r3d
+                            right_kp2d[frame_idx] = r2d
+                            right_detected[frame_idx] = 1.0
+
+            hand_result = {
+                "_model": "wilor", "_done": True,
+                "left_hand_keypoints_3d": left_kp3d,
+                "right_hand_keypoints_3d": right_kp3d,
+                "left_hand_keypoints_2d": left_kp2d,
+                "right_hand_keypoints_2d": right_kp2d,
+                "left_hand_detected": left_detected,
+                "right_hand_detected": right_detected,
+            }
+
+        return slam_result, hand_result, num_frames
+
     def health_check(self):
         """Check service health."""
+        if self._use_combined:
+            return {"status": "alive"}
         hand_alive = self._hand_proc is not None and self._hand_proc.poll() is None
         return {"status": "alive" if hand_alive else "dead"}
 
     def shutdown(self):
-        """Shut down the persistent cuda_hand worker."""
+        """Shut down persistent workers."""
+        if self._combined_proc and self._combined_proc.poll() is None:
+            try:
+                self._combined_proc.stdin.close()
+                self._combined_proc.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                self._combined_proc.kill()
+                self._combined_proc.wait(timeout=5)
+        self._combined_proc = None
+
         if self._hand_proc and self._hand_proc.poll() is None:
             try:
                 self._hand_proc.stdin.write(b"SHUTDOWN\n")

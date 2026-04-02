@@ -10,7 +10,7 @@ Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0
 ## Quick start
 
 ```bash
-# Recommended: uses optimized settings (~25s for 62s of 1080p30 on RTX 5090)
+# Recommended: uses optimized settings (~21s for 62s of 1080p30 on RTX 5090)
 ./annotate.sh /path/to/video.mov
 
 # Or with explicit output directory:
@@ -26,7 +26,7 @@ python3 visualizer.py --port 8888
 
 # Service mode: keep models warm for fast repeated processing
 python3 visualizer.py --service --port 8888
-# First video: ~25s, subsequent: ~25s (vs ~39s cold start each time)
+# First video: ~24s, subsequent: ~21s (vs ~39s cold start each time)
 
 # Or use the service programmatically:
 python3 pipeline_service.py --listen
@@ -159,6 +159,17 @@ cp /path/to/MANO_RIGHT.pkl mano_data/
 
 Weights are exported to `cuda_hand/data/weights/` as raw binary tensors. After export, PyTorch is only needed for SLAM weight export — the hand pipeline runs entirely in CUDA.
 
+### Combined Pipeline (optional, faster)
+
+A single CUDA binary that runs both SLAM and hand processing with shared NVDEC decode, eliminating GPU context switching and process overhead:
+
+```bash
+cd robot-video/cuda_pipeline
+make
+```
+
+Requires the same weights as the individual SLAM and hand binaries above. The combined pipeline is automatically detected and used by `pipeline_service.py` when present. Falls back to separate binaries if not built.
+
 ### NeMo (Parakeet ASR)
 
 ```bash
@@ -183,6 +194,7 @@ Requires the FFmpeg dev headers installed above. Falls back to OpenCV if not ava
 ```bash
 ./cuda_slam/cuda_droid --help 2>&1 | head -1 && echo "CUDA DROID-SLAM OK"
 ./cuda_hand/cuda_hand --help 2>&1 | head -1 && echo "CUDA Hand Pose OK"
+./cuda_pipeline/cuda_pipeline --help 2>&1 | head -1 && echo "Combined Pipeline OK"
 python3 -c "import nemo.collections.asr; print('NeMo ASR OK')"
 python3 -c "import native_decode; print('native_decode OK')"
 ```
@@ -213,22 +225,20 @@ Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| CUDA SLAM | 14s standalone, ~23s concurrent | 130 fps, FP16 encoders + correlation, NVDEC decode + GPU resize |
-| CUDA hand pose (stride=1) | 13s | Parallel with SLAM, NVDEC decode, FP16 YOLO, batched WiLoR ViT |
+| SLAM + hand pose (combined) | ~19.5s | Single CUDA binary, two-pass: SLAM then hands, shared NVDEC decode |
 | Audio transcription | ~8s | Parakeet on CPU, fully overlapped |
 | Video conversion (h264_nvenc) | ~3s | NVENC runs concurrently (dedicated HW encoder) |
 | Dataset assembly | <1s | Parquet + info.json |
-| **Total** | **~25s** | Service mode (warm), CUDA MPS enabled, all outputs included |
+| **Total** | **~21s** | Service mode (warm), combined binary, all outputs included |
 
 Key optimizations:
 
-1. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. FP16 tensor core encoders (fnet/cnet) and FP16 correlation via `cublasGemmEx`/`cublasGemmBatchedEx` with FP32 accumulation — 2× faster than FP32 standalone (130 fps vs 70 fps). NVDEC hardware video decode with GPU resize eliminates CPU decode entirely. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos.
-2. **CUDA hand pose** — Pure CUDA reimplementation of the full hand pose pipeline: YOLOv8m detection, WiLoR ViT-H, MANO skinning, and RefineNet. No PyTorch dependency at inference. YOLO runs in FP16 with tensor cores and 8-frame batching (3.5x faster). WiLoR ViT uses FP16 GEMMs with FP32 accumulation via `cublasGemmEx`. All GPU buffers pre-allocated at startup.
-3. **NVDEC hardware video decode** — Hand processing uses NVIDIA's dedicated video decode hardware (`hevc_cuvid`) via FFmpeg. Decoded frames arrive directly in GPU memory (P010/NV12 format), converted to BGR by a custom CUDA kernel. Eliminates CPU decode (5.7s→0.6s) and host-to-device transfer (1.0s→0s).
-4. **Dual NVDEC streams** — Both SLAM and hand processing decode the same video independently via separate NVDEC hardware sessions. SLAM decodes at reduced resolution (584x328) with GPU resize, hands decode at full 1080p. No CPU decode, no Python piping, no shared memory needed.
-6. **Concurrent NVENC video conversion** — NVENC uses a dedicated hardware encoder separate from CUDA cores, so it runs concurrently with SLAM and hand detection. Started at the beginning of the pipeline rather than waiting for inference to complete.
-7. **CUDA MPS** — NVIDIA Multi-Process Service lets SLAM and hand processing share one GPU context, eliminating context-switch overhead between the two CUDA processes (~27s→~25s).
-8. **Service mode** — `pipeline_service.py` keeps models loaded across videos. One-time ~2s startup, then each video skips model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
+1. **Combined CUDA binary** (`cuda_pipeline`) — SLAM and hand processing run in a single process with shared NVDEC video decode. Two-pass architecture: Pass 1 runs SLAM at reduced resolution (584x328), Pass 2 re-seeks and runs hand detection + pose at full 1080p. Eliminates GPU context switching and process overhead vs. separate binaries (~25s MPS → ~21s combined). In service mode, SLAM state resets between videos without reloading weights (~2s savings per video).
+2. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. FP16 tensor core encoders (fnet/cnet) and FP16 correlation via `cublasGemmEx`/`cublasGemmBatchedEx` with FP32 accumulation — 2× faster than FP32 standalone (130 fps vs 70 fps). NVDEC hardware video decode with GPU resize eliminates CPU decode entirely. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos.
+3. **CUDA hand pose** — Pure CUDA reimplementation of the full hand pose pipeline: YOLOv8m detection, WiLoR ViT-H, MANO skinning, and RefineNet. No PyTorch dependency at inference. YOLO runs in FP16 with tensor cores and 8-frame batching (3.5x faster). WiLoR ViT uses FP16 GEMMs with FP32 accumulation via `cublasGemmEx`. All GPU buffers pre-allocated at startup.
+4. **NVDEC hardware video decode** — Both SLAM and hand processing use NVIDIA's dedicated video decode hardware (`hevc_cuvid`) via FFmpeg. Decoded frames arrive directly in GPU memory (P010/NV12 format), converted to BGR by custom CUDA kernels. Eliminates CPU decode and host-to-device transfer entirely.
+5. **Concurrent NVENC video conversion** — NVENC uses a dedicated hardware encoder separate from CUDA cores, so it runs concurrently with SLAM and hand detection. Started at the beginning of the pipeline rather than waiting for inference to complete.
+6. **Service mode** — `pipeline_service.py` keeps models loaded across videos via a persistent `cuda_pipeline --listen` worker. One-time ~9s startup (WiLoR weight loading), then each video reuses warm GPU buffers. SLAM state resets in-place without reallocating memory or reloading weights. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
 ---
 
