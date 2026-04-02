@@ -2360,8 +2360,17 @@ struct WilorModel {
                 results[b].kp2d[j * 2 + 1] = results[b].kp2d[j * 2 + 1] * bs + cy;
             }
 
-            // 3D keypoints: joints + cam_t in camera frame
-            // Already computed above as kp3d
+            // Recompute 3D keypoints using full-image camera translation
+            // (matches PyTorch cam_crop_to_full: joints + cam_t_full)
+            for (int j = 0; j < 21; j++) {
+                float jx = h_final_joints[b * 63 + j * 3 + 0];
+                float jy = h_final_joints[b * 63 + j * 3 + 1];
+                float jz = h_final_joints[b * 63 + j * 3 + 2];
+                jx = multiplier * jx;
+                results[b].kp3d[j * 3 + 0] = jx + full_tx;
+                results[b].kp3d[j * 3 + 1] = jy + full_ty;
+                results[b].kp3d[j * 3 + 2] = jz + full_tz;
+            }
         }
     }
 
