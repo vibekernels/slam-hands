@@ -537,3 +537,246 @@ inline void slice_channels(float* output, const float* input,
     int total = N * C_out * HW;
     slice_channels_kernel<<<(total+255)/256, 256>>>(output, input, N, C_total, C_start, C_out, HW);
 }
+
+// ============ FP16 Infrastructure ============
+
+#include <cuda_fp16.h>
+
+struct GpuHalfBuf {
+    __half* data = nullptr;
+    size_t count = 0;
+
+    void alloc(size_t n) {
+        if (data && count >= n) return;
+        free();
+        count = n;
+        CUDA_CHECK(cudaMalloc(&data, n * sizeof(__half)));
+    }
+    void free() {
+        if (data) { cudaFree(data); data = nullptr; count = 0; }
+    }
+    void zero() { if (data) CUDA_CHECK(cudaMemset(data, 0, count * sizeof(__half))); }
+    ~GpuHalfBuf() { free(); }
+};
+
+// FP32 ↔ FP16 conversion kernels
+__global__ void float_to_half_kernel(const float* __restrict__ in, __half* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(in[i]);
+}
+__global__ void half_to_float_kernel(const __half* __restrict__ in, float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(in[i]);
+}
+inline void float_to_half(const float* in, __half* out, int n) {
+    float_to_half_kernel<<<(n+255)/256, 256>>>(in, out, n);
+}
+inline void half_to_float(const __half* in, float* out, int n) {
+    half_to_float_kernel<<<(n+255)/256, 256>>>(in, out, n);
+}
+
+// FP16 activation kernels
+__global__ void relu_half_kernel(__half* data, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(data[i]);
+        data[i] = __float2half(fmaxf(v, 0.0f));
+    }
+}
+inline void relu_half_inplace(__half* data, int n) {
+    relu_half_kernel<<<(n+255)/256, 256>>>(data, n);
+}
+
+__global__ void add_half_kernel(__half* a, const __half* b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float va = __half2float(a[i]);
+        float vb = __half2float(b[i]);
+        a[i] = __float2half(va + vb);
+    }
+}
+
+// Instance norm on FP16 data (accumulates in FP32 for precision)
+__global__ void instance_norm_half_kernel(__half* data, int N, int C, int HW) {
+    int nc = blockIdx.x;
+    if (nc >= N * C) return;
+
+    __half* slice = data + nc * HW;
+    extern __shared__ float sdata[];
+
+    // Compute mean in FP32
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < HW; i += blockDim.x)
+        sum += __half2float(slice[i]);
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / HW;
+    __syncthreads();
+
+    // Compute variance in FP32
+    float var_sum = 0.0f;
+    for (int i = threadIdx.x; i < HW; i += blockDim.x) {
+        float diff = __half2float(slice[i]) - mean;
+        var_sum += diff * diff;
+    }
+    sdata[threadIdx.x] = var_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(sdata[0] / HW + 1e-5f);
+    __syncthreads();
+
+    // Normalize and write back as FP16
+    for (int i = threadIdx.x; i < HW; i += blockDim.x)
+        slice[i] = __float2half((__half2float(slice[i]) - mean) * inv_std);
+}
+
+inline void instance_norm_half(__half* data, int N, int C, int H, int W) {
+    int HW = H * W;
+    int threads = min(256, HW);
+    int t = 1; while (t < threads) t <<= 1; threads = t;
+    instance_norm_half_kernel<<<N*C, threads, threads*sizeof(float)>>>(data, N, C, HW);
+}
+
+// Bias add for FP16 output with FP32 bias: out[n,c,h,w] += bias[c]
+__global__ void bias_add_half_kernel(__half* output, const float* bias, int N, int C, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * HW;
+    if (idx >= total) return;
+    int c = (idx / HW) % C;
+    float val = __half2float(output[idx]) + bias[c];
+    output[idx] = __float2half(val);
+}
+
+// ============ FP16 Convolution Layer ============
+
+struct HalfConvLayer {
+    cudnnFilterDescriptor_t filterDesc;
+    cudnnConvolutionDescriptor_t convDesc;
+    cudnnConvolutionFwdAlgo_t algo;
+    size_t workspaceSize;
+
+    GpuHalfBuf weight;
+    GpuBuf bias;  // bias stays FP32 for cuDNN addTensor
+    int Ci, Co, kH, kW, stride, pad;
+    bool has_bias;
+
+    void init(cudnnHandle_t cudnn, int batch,
+              int ci, int co, int kh, int kw, int s, int p,
+              int inH, int inW,
+              const float* w_data, const float* b_data) {
+        Ci = ci; Co = co; kH = kh; kW = kw; stride = s; pad = p;
+        has_bias = (b_data != nullptr);
+
+        // Convert weights FP32 → FP16 on GPU
+        int w_count = co * ci * kh * kw;
+        weight.alloc(w_count);
+        {
+            GpuBuf tmp; tmp.alloc(w_count);
+            tmp.copyFrom(w_data, w_count);
+            float_to_half(tmp.data, weight.data, w_count);
+        }
+        if (has_bias) {
+            bias.alloc(co);
+            bias.copyFrom(b_data, co);
+        }
+
+        CUDNN_CHECK(cudnnCreateFilterDescriptor(&filterDesc));
+        CUDNN_CHECK(cudnnSetFilter4dDescriptor(filterDesc, CUDNN_DATA_HALF,
+            CUDNN_TENSOR_NCHW, co, ci, kh, kw));
+
+        CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&convDesc));
+        CUDNN_CHECK(cudnnSetConvolution2dDescriptor(convDesc, p, p, s, s, 1, 1,
+            CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));  // FP32 accumulation
+        CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
+
+        // Find best algorithm with HALF tensor descriptors
+        cudnnTensorDescriptor_t inDesc, outDesc;
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&inDesc));
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&outDesc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(inDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, ci, inH, inW));
+        int outH = (inH + 2*p - kh) / s + 1;
+        int outW = (inW + 2*p - kw) / s + 1;
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(outDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, co, outH, outW));
+
+        cudnnConvolutionFwdAlgo_t algos[] = {
+            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
+            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
+            CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED,
+        };
+        bool found = false;
+        for (auto a : algos) {
+            cudnnStatus_t st = cudnnGetConvolutionForwardWorkspaceSize(
+                cudnn, inDesc, filterDesc, convDesc, outDesc, a, &workspaceSize);
+            if (st == CUDNN_STATUS_SUCCESS) {
+                algo = a; found = true; break;
+            }
+        }
+        if (!found) {
+            int cnt;
+            cudnnConvolutionFwdAlgoPerf_t perf[1];
+            CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
+                cudnn, inDesc, filterDesc, convDesc, outDesc, 1, &cnt, perf));
+            algo = perf[0].algo;
+            workspaceSize = perf[0].memory;
+        }
+
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(inDesc));
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(outDesc));
+    }
+
+    // Forward: FP16 input → FP16 output, FP32 accumulation internally
+    void forward(cudnnHandle_t cudnn, __half* input, __half* output, float* workspace,
+                 int batch, int inH, int inW) {
+        cudnnTensorDescriptor_t inDesc, outDesc;
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&inDesc));
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&outDesc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(inDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, Ci, inH, inW));
+        int outH = (inH + 2*pad - kH) / stride + 1;
+        int outW = (inW + 2*pad - kW) / stride + 1;
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(outDesc, CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_HALF, batch, Co, outH, outW));
+
+        float alpha = 1.0f, beta = 0.0f;
+        CUDNN_CHECK(cudnnConvolutionForward(cudnn, &alpha, inDesc, input,
+            filterDesc, weight.data, convDesc, algo, workspace, workspaceSize,
+            &beta, outDesc, output));
+
+        if (has_bias) {
+            // Add bias: need FP32 bias descriptor, FP16 output descriptor
+            // cuDNN handles the mixed precision bias add
+            cudnnTensorDescriptor_t biasDesc;
+            CUDNN_CHECK(cudnnCreateTensorDescriptor(&biasDesc));
+            CUDNN_CHECK(cudnnSetTensor4dDescriptor(biasDesc, CUDNN_TENSOR_NCHW,
+                CUDNN_DATA_FLOAT, 1, Co, 1, 1));
+            // Convert output to FP32, add bias, convert back - but cuDNN can handle
+            // mixed types with CUDNN_DATA_HALF output + CUDNN_DATA_FLOAT bias
+            // Actually, cudnnAddTensor requires matching types. Use a FP16 bias instead.
+            // Simpler: broadcast-add bias in a custom kernel
+            CUDNN_CHECK(cudnnDestroyTensorDescriptor(biasDesc));
+            // Custom bias add for FP16 output + FP32 bias
+            int total = batch * Co * outH * outW;
+            int hw = outH * outW;
+            bias_add_half_kernel<<<(total+255)/256, 256>>>(output, bias.data, batch, Co, hw);
+        }
+
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(inDesc));
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(outDesc));
+    }
+
+    void destroy() {
+        cudnnDestroyFilterDescriptor(filterDesc);
+        cudnnDestroyConvolutionDescriptor(convDesc);
+        weight.free();
+        bias.free();
+    }
+};

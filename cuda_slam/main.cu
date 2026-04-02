@@ -237,6 +237,148 @@ struct BasicEncoder {
     }
 };
 
+// ============ FP16 Residual Block ============
+
+struct HalfResBlock {
+    HalfConvLayer conv1, conv2;
+    HalfConvLayer downsample_conv;
+    bool has_downsample;
+    bool has_norm;
+    int out_channels;
+
+    void init(cudnnHandle_t cudnn, WeightStore& ws, const char* prefix,
+              int batch, int ci, int co, int stride, int inH, int inW, bool use_norm) {
+        has_norm = use_norm;
+        has_downsample = (stride != 1 || ci != co);
+        out_channels = co;
+
+        char name[256];
+        GpuBuf w1, b1, w2, b2;
+
+        snprintf(name, sizeof(name), "%s_conv1", prefix);
+        ws.load_conv(name, w1, b1);
+        conv1.init(cudnn, batch, ci, co, 3, 3, stride, 1, inH, inW, w1.data, b1.data);
+
+        int outH = (inH + 2 - 3) / stride + 1;
+        int outW = (inW + 2 - 3) / stride + 1;
+
+        snprintf(name, sizeof(name), "%s_conv2", prefix);
+        ws.load_conv(name, w2, b2);
+        conv2.init(cudnn, batch, co, co, 3, 3, 1, 1, outH, outW, w2.data, b2.data);
+
+        if (has_downsample) {
+            GpuBuf dw, db;
+            snprintf(name, sizeof(name), "%s_downsample_0", prefix);
+            ws.load_conv(name, dw, db);
+            downsample_conv.init(cudnn, batch, ci, co, 1, 1, stride, 0, inH, inW, dw.data, db.data);
+        }
+    }
+
+    void forward(cudnnHandle_t cudnn, __half* input, __half* output, __half* temp,
+                 float* workspace, int batch, int ci, int inH, int inW) {
+        int outH = (inH + 2 - 3) / conv1.stride + 1;
+        int outW = (inW + 2 - 3) / conv1.stride + 1;
+        int outN = batch * out_channels * outH * outW;
+
+        conv1.forward(cudnn, input, temp, workspace, batch, inH, inW);
+        if (has_norm) instance_norm_half(temp, batch, out_channels, outH, outW);
+        relu_half_inplace(temp, outN);
+
+        conv2.forward(cudnn, temp, output, workspace, batch, outH, outW);
+        if (has_norm) instance_norm_half(output, batch, out_channels, outH, outW);
+        relu_half_inplace(output, outN);
+
+        if (has_downsample) {
+            downsample_conv.forward(cudnn, input, temp, workspace, batch, inH, inW);
+            if (has_norm) instance_norm_half(temp, batch, out_channels, outH, outW);
+            add_half_kernel<<<(outN+255)/256, 256>>>(output, temp, outN);
+        } else {
+            add_half_kernel<<<(outN+255)/256, 256>>>(output, input, outN);
+        }
+
+        relu_half_inplace(output, outN);
+    }
+};
+
+// ============ FP16 Basic Encoder ============
+
+struct HalfBasicEncoder {
+    HalfConvLayer conv1, conv2;
+    bool has_norm;
+    HalfResBlock layer1_0, layer1_1;
+    HalfResBlock layer2_0, layer2_1;
+    HalfResBlock layer3_0, layer3_1;
+    int output_dim;
+
+    GpuHalfBuf fp16_input;  // FP32 image → FP16
+
+    void init(cudnnHandle_t cudnn, WeightStore& ws, const char* prefix,
+              int batch, int inH, int inW, int out_dim, bool use_norm) {
+        output_dim = out_dim;
+        has_norm = use_norm;
+
+        char name[256];
+        GpuBuf w, b;
+
+        snprintf(name, sizeof(name), "%s_conv1", prefix);
+        ws.load_conv(name, w, b);
+        conv1.init(cudnn, batch, 3, 32, 7, 7, 2, 3, inH, inW, w.data, b.data);
+
+        int h2 = inH / 2, w2 = inW / 2;
+
+        snprintf(name, sizeof(name), "%s_layer1_0", prefix);
+        layer1_0.init(cudnn, ws, name, batch, 32, 32, 1, h2, w2, use_norm);
+        snprintf(name, sizeof(name), "%s_layer1_1", prefix);
+        layer1_1.init(cudnn, ws, name, batch, 32, 32, 1, h2, w2, use_norm);
+
+        snprintf(name, sizeof(name), "%s_layer2_0", prefix);
+        layer2_0.init(cudnn, ws, name, batch, 32, 64, 2, h2, w2, use_norm);
+        int h4 = h2 / 2, w4 = w2 / 2;
+        snprintf(name, sizeof(name), "%s_layer2_1", prefix);
+        layer2_1.init(cudnn, ws, name, batch, 64, 64, 1, h4, w4, use_norm);
+
+        snprintf(name, sizeof(name), "%s_layer3_0", prefix);
+        layer3_0.init(cudnn, ws, name, batch, 64, 128, 2, h4, w4, use_norm);
+        int h8 = h4 / 2, w8 = w4 / 2;
+        snprintf(name, sizeof(name), "%s_layer3_1", prefix);
+        layer3_1.init(cudnn, ws, name, batch, 128, 128, 1, h8, w8, use_norm);
+
+        snprintf(name, sizeof(name), "%s_conv2", prefix);
+        ws.load_conv(name, w, b);
+        conv2.init(cudnn, batch, 128, out_dim, 1, 1, 1, 0, h8, w8, w.data, b.data);
+
+        fp16_input.alloc(batch * 3 * inH * inW);
+    }
+
+    // Forward: FP32 input → FP16 output
+    void forward(cudnnHandle_t cudnn, float* input, __half* output,
+                 __half* buf_a, __half* buf_b, __half* buf_c, float* workspace,
+                 int batch, int inH, int inW) {
+        int h2 = inH / 2, w2 = inW / 2;
+        int h4 = h2 / 2, w4 = w2 / 2;
+        int h8 = h4 / 2, w8 = w4 / 2;
+
+        // Convert FP32 input to FP16
+        float_to_half(input, fp16_input.data, batch * 3 * inH * inW);
+
+        // conv1 + norm + relu
+        conv1.forward(cudnn, fp16_input.data, buf_a, workspace, batch, inH, inW);
+        if (has_norm) instance_norm_half(buf_a, batch, 32, h2, w2);
+        relu_half_inplace(buf_a, batch * 32 * h2 * w2);
+
+        layer1_0.forward(cudnn, buf_a, buf_b, buf_c, workspace, batch, 32, h2, w2);
+        layer1_1.forward(cudnn, buf_b, buf_a, buf_c, workspace, batch, 32, h2, w2);
+
+        layer2_0.forward(cudnn, buf_a, buf_b, buf_c, workspace, batch, 32, h2, w2);
+        layer2_1.forward(cudnn, buf_b, buf_a, buf_c, workspace, batch, 64, h4, w4);
+
+        layer3_0.forward(cudnn, buf_a, buf_b, buf_c, workspace, batch, 64, h4, w4);
+        layer3_1.forward(cudnn, buf_b, buf_a, buf_c, workspace, batch, 128, h8, w8);
+
+        conv2.forward(cudnn, buf_a, output, workspace, batch, h8, w8);
+    }
+};
+
 // ============ ConvGRU ============
 
 struct ConvGRU {
@@ -498,7 +640,7 @@ struct DroidState {
     // Per-keyframe state (on GPU), indexed by keyframe index
     GpuBuf poses;      // [MAX_KF, 7]
     GpuBuf disps;      // [MAX_KF, h, w]
-    GpuBuf fmaps;      // [MAX_KF, 128, h, w]
+    GpuHalfBuf fmaps;  // [MAX_KF, 128, h, w] FP16 for tensor-core correlation
     GpuBuf nets;       // [MAX_KF, 128, h, w]  (initial hidden state)
     GpuBuf inps;       // [MAX_KF, 128, h, w]
     GpuBuf intrinsics; // [4]
@@ -521,7 +663,7 @@ struct DroidState {
         int hw = h * w;
         poses.alloc(MAX_KEYFRAMES * 7);
         disps.alloc(MAX_KEYFRAMES * hw);
-        fmaps.alloc(MAX_KEYFRAMES * 128 * hw);
+        fmaps.alloc((size_t)MAX_KEYFRAMES * 128 * hw);
         nets.alloc(MAX_KEYFRAMES * 128 * hw);
         inps.alloc(MAX_KEYFRAMES * 128 * hw);
         intrinsics.alloc(4);
@@ -553,11 +695,11 @@ struct DroidState {
     }
 
     // Add a keyframe: store features at keyframe index, record timestamp
-    void add_keyframe(int frame_timestamp, float* fmap, float* net, float* inp) {
+    void add_keyframe(int frame_timestamp, __half* fmap, float* net, float* inp) {
         int hw = h * w;
         int idx = num_keyframes;
         CUDA_CHECK(cudaMemcpy(fmaps.data + idx * 128 * hw, fmap,
-                              128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                              128 * hw * sizeof(__half), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(nets.data + idx * 128 * hw, net,
                               128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(inps.data + idx * 128 * hw, inp,
@@ -986,16 +1128,19 @@ struct CudaDroid {
     cudnnHandle_t cudnn;
     cublasHandle_t cublas;
 
-    BasicEncoder fnet, cnet;
-    UpdateModule update;
+    HalfBasicEncoder fnet, cnet;  // FP16 encoders with tensor cores
+    UpdateModule update;           // stays FP32
     BundleAdjustment ba;
     DroidState state;
 
     static const int MAX_BATCH_EDGES = 48;
 
-    // Working buffers (3 buffers needed: input, output, temp)
+    // Working buffers — FP32 for update module
     GpuBuf buf_a, buf_b, buf_c, workspace;
-    GpuBuf preproc_buf;  // preprocessed image
+    GpuBuf preproc_buf;  // preprocessed image (FP32)
+
+    // FP16 working buffers for encoders
+    GpuHalfBuf half_buf_a, half_buf_b, half_buf_c;
 
     // Correlation buffers (per-edge, reused in loop)
     GpuBuf corr_volume;  // [H*W, H*W] for one edge (motion filter)
@@ -1005,8 +1150,9 @@ struct CudaDroid {
     // Batched correlation buffers
     GpuBuf batch_corr_vols;  // [CORR_BATCH, hw, hw]
     GpuBuf batch_corr_pyr[4]; // batched pyramid levels
-    float **d_Aptr, **d_Bptr, **d_Cptr;  // device pointer arrays
-    float **h_Aptr, **h_Bptr, **h_Cptr;  // host pointer arrays
+    __half **d_Aptr_h, **d_Bptr_h;  // FP16 fmap pointer arrays (device)
+    __half **h_Aptr_h, **h_Bptr_h;  // FP16 fmap pointer arrays (host)
+    float **d_Cptr, **h_Cptr;       // FP32 correlation output pointer arrays
 
     // Batched buffers for edge processing
     GpuBuf batch_corr;    // [MAX_BATCH, 196, h, w]
@@ -1043,9 +1189,9 @@ struct CudaDroid {
         WeightStore ws;
         ws.set_dir(weight_dir);
 
-        printf("Initializing encoders...\n");
-        fnet.init(cudnn, ws, "fnet", 1, H, W, 128, true);
-        cnet.init(cudnn, ws, "cnet", 1, H, W, 256, false);
+        printf("Initializing encoders (FP16)...\n");
+        fnet.init(cudnn, ws, "fnet", 1, H, W, 128, true);   // FP16 with instance norm
+        cnet.init(cudnn, ws, "cnet", 1, H, W, 256, false);  // FP16 without instance norm
 
         printf("Initializing update module...\n");
         update.init(cudnn, ws, MAX_BATCH_EDGES, h, w);
@@ -1069,6 +1215,12 @@ struct CudaDroid {
         workspace.alloc(64 * 1024 * 1024 / sizeof(float));  // 64MB workspace
         preproc_buf.alloc(3 * H * W);
 
+        // FP16 encoder buffers (must handle largest intermediate: 256 * H/2 * W/2)
+        size_t half_buf_size = std::max((size_t)(256 * H/2 * W/2), (size_t)(128 * hw));
+        half_buf_a.alloc(half_buf_size);
+        half_buf_b.alloc(half_buf_size);
+        half_buf_c.alloc(half_buf_size);
+
         // Correlation buffers — single-edge (for motion filter)
         corr_volume.alloc(hw * hw);
         for (int l = 1; l < 4; l++) {
@@ -1084,12 +1236,12 @@ struct CudaDroid {
             int ph = h >> l, pw = w >> l;
             batch_corr_pyr[l].alloc((size_t)CORR_BATCH * hw * ph * pw);
         }
-        // Device pointer arrays for cublasSgemmBatched
-        CUDA_CHECK(cudaMalloc(&d_Aptr, CORR_BATCH * sizeof(float*)));
-        CUDA_CHECK(cudaMalloc(&d_Bptr, CORR_BATCH * sizeof(float*)));
+        // Device pointer arrays for batched FP16 correlation GEMM
+        CUDA_CHECK(cudaMalloc(&d_Aptr_h, CORR_BATCH * sizeof(__half*)));
+        CUDA_CHECK(cudaMalloc(&d_Bptr_h, CORR_BATCH * sizeof(__half*)));
         CUDA_CHECK(cudaMalloc(&d_Cptr, CORR_BATCH * sizeof(float*)));
-        h_Aptr = new float*[CORR_BATCH];
-        h_Bptr = new float*[CORR_BATCH];
+        h_Aptr_h = new __half*[CORR_BATCH];
+        h_Bptr_h = new __half*[CORR_BATCH];
         h_Cptr = new float*[CORR_BATCH];
 
         // Batched edge buffers
@@ -1110,69 +1262,72 @@ struct CudaDroid {
     }
 
     // Pre-allocated encoder output buffers
-    GpuBuf enc_fmap, enc_cmap, enc_net, enc_inp;
+    GpuHalfBuf enc_fmap;  // FP16 [128, h, w] — stored directly in state.fmaps
+    GpuHalfBuf enc_cmap;  // FP16 [256, h, w] — converted to FP32 for update module
+    GpuBuf enc_cmap_f32;  // FP32 conversion of cnet output
+    GpuBuf enc_net, enc_inp;
 
     void alloc_encoder_bufs() {
         int hw = h * w;
         enc_fmap.alloc(128 * hw);
         enc_cmap.alloc(256 * hw);
+        enc_cmap_f32.alloc(256 * hw);
         enc_net.alloc(128 * hw);
         enc_inp.alloc(128 * hw);
     }
 
-    // Run feature encoder on one frame
+    // Run feature encoder on one frame (FP16 encoders, FP32 update state)
     void encode_frame(float* bgr_hwc) {
         t_encode.begin();
 
-        // Preprocess: BGR HWC -> RGB NCHW normalized
+        // Preprocess: BGR HWC -> RGB NCHW normalized (FP32)
         preprocess_image_kernel<<<(H*W+255)/256, 256>>>(
             bgr_hwc, preproc_buf.data, H, W);
 
         int hw = h * w;
 
-        // Run fnet: [1, 3, H, W] -> [1, 128, h, w]
+        // Run fnet (FP16): [1, 3, H, W] -> [1, 128, h, w] FP16
         fnet.forward(cudnn, preproc_buf.data, enc_fmap.data,
-                     buf_a.data, buf_b.data, buf_c.data, workspace.data, 1, H, W);
+                     half_buf_a.data, half_buf_b.data, half_buf_c.data,
+                     workspace.data, 1, H, W);
 
-        // Run cnet: [1, 3, H, W] -> [1, 256, h, w]
+        // Run cnet (FP16): [1, 3, H, W] -> [1, 256, h, w] FP16
         cnet.forward(cudnn, preproc_buf.data, enc_cmap.data,
-                     buf_a.data, buf_b.data, buf_c.data, workspace.data, 1, H, W);
+                     half_buf_a.data, half_buf_b.data, half_buf_c.data,
+                     workspace.data, 1, H, W);
 
-        // Split cnet output: [256, h, w] -> net[128, h, w] + inp[128, h, w]
-        slice_channels(enc_net.data, enc_cmap.data, 1, 256, 0, 128, hw);
-        slice_channels(enc_inp.data, enc_cmap.data, 1, 256, 128, 128, hw);
+        // Convert cnet output to FP32 for update module
+        half_to_float(enc_cmap.data, enc_cmap_f32.data, 256 * hw);
+
+        // Split cnet output (FP32): [256, h, w] -> net[128, h, w] + inp[128, h, w]
+        slice_channels(enc_net.data, enc_cmap_f32.data, 1, 256, 0, 128, hw);
+        slice_channels(enc_inp.data, enc_cmap_f32.data, 1, 256, 128, 128, hw);
 
         // Apply activations: tanh(net), relu(inp)
         tanh_inplace(enc_net.data, 128 * hw);
         relu_inplace(enc_inp.data, 128 * hw);
 
-        // Note: features stored in enc_fmap/enc_net/enc_inp
-        // Caller decides whether to add as keyframe
-
+        // Note: enc_fmap is FP16, enc_net/enc_inp are FP32
         t_encode.end();
     }
 
-    // Build correlation volume between frames i and j
+    // Build correlation volume between frames i and j (FP16 fmaps → FP32 output)
     void build_correlation(int i, int j) {
         int hw = h * w;
-        float* f1 = state.fmaps.data + i * 128 * hw;
-        float* f2 = state.fmaps.data + j * 128 * hw;
+        __half* f1 = state.fmaps.data + i * 128 * hw;
+        __half* f2 = state.fmaps.data + j * 128 * hw;
 
-        // All-pairs correlation: corr[src, tgt] = dot(fmap1[src], fmap2[tgt]) / C
-        // cuBLAS stores column-major but corr_index_kernel reads row-major.
-        // Row-major read: data[src*hw + tgt] = col-major C[tgt, src].
-        // So we compute C[i,j] = dot(f2[i], f1[j]) which makes
-        // data[src*hw + tgt] = C[tgt, src] = dot(f2[tgt], f1[src]) = corr(src, tgt) ✓
-        // PyTorch DROID-SLAM divides each fmap by 4.0 before matmul, giving 1/16 total scaling.
+        // FP16 × FP16 → FP32 correlation with tensor cores
         float alpha = 1.0f / 16.0f;
         float beta = 0.0f;
-        CUBLAS_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+        CUBLAS_CHECK(cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             hw, hw, 128,
             &alpha,
-            f2, hw,  // swapped: was f1
-            f1, hw,  // swapped: was f2
+            f2, CUDA_R_16F, hw,
+            f1, CUDA_R_16F, hw,
             &beta,
-            corr_volume.data, hw));
+            corr_volume.data, CUDA_R_32F, hw,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
         // Build pyramid via avg_pool2d
         // Level 0 IS corr_volume; build levels 1-3 via avg_pool
@@ -1216,28 +1371,29 @@ struct CudaDroid {
                                             float* coords_2hw, float* corr_out_196hw) {
         int hw = h * w;
 
-        // 1. Setup pointer arrays for cublasSgemmBatched
+        // 1. Setup pointer arrays for batched FP16 GEMM
         for (int e = 0; e < batch_size; e++) {
             int ii_val = state.ii_host[edge_start + e];
             int jj_val = state.jj_host[edge_start + e];
-            h_Aptr[e] = state.fmaps.data + jj_val * 128 * hw;
-            h_Bptr[e] = state.fmaps.data + ii_val * 128 * hw;
+            h_Aptr_h[e] = state.fmaps.data + jj_val * 128 * hw;
+            h_Bptr_h[e] = state.fmaps.data + ii_val * 128 * hw;
             h_Cptr[e] = batch_corr_vols.data + (size_t)e * hw * hw;
         }
-        CUDA_CHECK(cudaMemcpy(d_Aptr, h_Aptr, batch_size * sizeof(float*), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_Bptr, h_Bptr, batch_size * sizeof(float*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_Aptr_h, h_Aptr_h, batch_size * sizeof(__half*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_Bptr_h, h_Bptr_h, batch_size * sizeof(__half*), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_Cptr, h_Cptr, batch_size * sizeof(float*), cudaMemcpyHostToDevice));
 
-        // 2. Batched GEMM: all edge correlations in one call
+        // 2. Batched GEMM: FP16 × FP16 → FP32 with tensor cores
         float alpha = 1.0f / 16.0f, beta = 0.0f;
-        CUBLAS_CHECK(cublasSgemmBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+        CUBLAS_CHECK(cublasGemmBatchedEx(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             hw, hw, 128,
             &alpha,
-            (const float**)d_Aptr, hw,
-            (const float**)d_Bptr, hw,
+            (const void**)d_Aptr_h, CUDA_R_16F, hw,
+            (const void**)d_Bptr_h, CUDA_R_16F, hw,
             &beta,
-            d_Cptr, hw,
-            batch_size));
+            (void**)d_Cptr, CUDA_R_32F, hw,
+            batch_size,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
         // 3. Build pyramids via custom 2x2 avg_pool kernel
         {
@@ -1365,7 +1521,7 @@ struct CudaDroid {
 
         // 3. Store fmap temporarily at slot num_keyframes for correlation computation
         CUDA_CHECK(cudaMemcpy(state.fmaps.data + nk * 128 * hw, enc_fmap.data,
-                              128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                              128 * hw * sizeof(__half), cudaMemcpyDeviceToDevice));
 
         // 4. Motion filter: use GRU-predicted flow relative to last keyframe
         float flow = compute_motion_gru(nk - 1);
@@ -1917,11 +2073,16 @@ int main(int argc, char** argv) {
         int nk = droid.state.num_keyframes;
         printf("\n=== Debug Dump ===\n");
 
-        // Dump fmap stats for first 2 keyframes
+        // Dump fmap stats for first 2 keyframes (FP16 → FP32 for display)
         for (int kf = 0; kf < std::min(2, nk); kf++) {
+            // Convert FP16 fmaps to FP32 on GPU, then copy to host
+            GpuBuf fmap_f32_tmp;
+            fmap_f32_tmp.alloc(128 * hw);
+            half_to_float(droid.state.fmaps.data + kf * 128 * hw, fmap_f32_tmp.data, 128 * hw);
             std::vector<float> fmap(128 * hw);
-            CUDA_CHECK(cudaMemcpy(fmap.data(), droid.state.fmaps.data + kf * 128 * hw,
+            CUDA_CHECK(cudaMemcpy(fmap.data(), fmap_f32_tmp.data,
                                   128 * hw * sizeof(float), cudaMemcpyDeviceToHost));
+            fmap_f32_tmp.free();
             float fmin = 1e9, fmax = -1e9, fsum = 0;
             for (auto v : fmap) { fmin = std::min(fmin, v); fmax = std::max(fmax, v); fsum += v; }
             printf("KF%d fmap: mean=%.6f range=[%.4f, %.4f]\n", kf, fsum/(128*hw), fmin, fmax);

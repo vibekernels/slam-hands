@@ -10,7 +10,7 @@ Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0
 ## Quick start
 
 ```bash
-# Recommended: uses optimized settings (~28s for 62s of 1080p30 on RTX 5090)
+# Recommended: uses optimized settings (~27s for 62s of 1080p30 on RTX 5090)
 ./annotate.sh /path/to/video.mov
 
 # Or with explicit output directory:
@@ -26,7 +26,7 @@ python3 visualizer.py --port 8888
 
 # Service mode: keep models warm for fast repeated processing
 python3 visualizer.py --service --port 8888
-# First video: ~28s, subsequent: ~28s (vs ~39s cold start each time)
+# First video: ~27s, subsequent: ~27s (vs ~39s cold start each time)
 
 # Or use the service programmatically:
 python3 pipeline_service.py --listen
@@ -213,16 +213,16 @@ Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| CUDA SLAM | 26s | 70 fps, NVDEC decode + GPU resize, batched correlation |
-| CUDA hand pose (stride=1) | 16s | Parallel with SLAM, NVDEC decode, FP16 YOLO, batched WiLoR ViT |
+| CUDA SLAM | 14s standalone, ~25s concurrent | 130 fps, FP16 encoders + correlation, NVDEC decode + GPU resize |
+| CUDA hand pose (stride=1) | 15s | Parallel with SLAM, NVDEC decode, FP16 YOLO, batched WiLoR ViT |
 | Audio transcription | ~8s | Parakeet on CPU, fully overlapped |
 | Video conversion (h264_nvenc) | ~3s | NVENC runs concurrently (dedicated HW encoder) |
 | Dataset assembly | <1s | Parquet + info.json |
-| **Total** | **~28s** | Service mode (warm), all outputs included |
+| **Total** | **~27s** | Service mode (warm), all outputs included |
 
 Key optimizations:
 
-1. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. NVDEC hardware video decode with GPU resize eliminates CPU decode entirely. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos. Batched `cublasSgemmBatched` processes all edge correlations in a single GPU call per update step.
+1. **CUDA DROID-SLAM** — Pure CUDA reimplementation of DROID-SLAM (cuDNN convolutions, cuBLAS correlation, cuSOLVER bundle adjustment). No PyTorch dependency at inference. FP16 tensor core encoders (fnet/cnet) and FP16 correlation via `cublasGemmEx`/`cublasGemmBatchedEx` with FP32 accumulation — 2× faster than FP32 standalone (130 fps vs 70 fps). NVDEC hardware video decode with GPU resize eliminates CPU decode entirely. A sliding frontend window (default 15 keyframes) prevents quadratic BA cost scaling on long videos.
 2. **CUDA hand pose** — Pure CUDA reimplementation of the full hand pose pipeline: YOLOv8m detection, WiLoR ViT-H, MANO skinning, and RefineNet. No PyTorch dependency at inference. YOLO runs in FP16 with tensor cores and 8-frame batching (3.5x faster). WiLoR ViT uses FP16 GEMMs with FP32 accumulation via `cublasGemmEx`. All GPU buffers pre-allocated at startup.
 3. **NVDEC hardware video decode** — Hand processing uses NVIDIA's dedicated video decode hardware (`hevc_cuvid`) via FFmpeg. Decoded frames arrive directly in GPU memory (P010/NV12 format), converted to BGR by a custom CUDA kernel. Eliminates CPU decode (5.7s→0.6s) and host-to-device transfer (1.0s→0s).
 4. **Dual NVDEC streams** — Both SLAM and hand processing decode the same video independently via separate NVDEC hardware sessions. SLAM decodes at reduced resolution (584x328) with GPU resize, hands decode at full 1080p. No CPU decode, no Python piping, no shared memory needed.
