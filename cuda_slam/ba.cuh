@@ -486,15 +486,93 @@ struct BundleAdjustment {
         }
 
         if (!motion_only) {
-            // TODO: Schur complement for depth optimization
-            // For now, just do motion-only solve
-            // The full implementation would:
-            // 1. Accumulate Eii into per-keyframe E
-            // 2. Accumulate Cii into per-keyframe C
-            // 3. Compute Q = 1/C
-            // 4. Subtract Schur complement: S -= E*Q*E^T, b -= E*Q*w
-            // 5. Solve for dx
-            // 6. Back-substitute for dz
+            // Download per-edge Jacobian coupling terms
+            std::vector<float> Eii_h(M * 6 * HW), Eij_h(M * 6 * HW);
+            std::vector<float> Cii_h(M * HW), bz_h(M * HW);
+            Eii_buf.copyTo(Eii_h.data(), M * 6 * HW);
+            Eij_buf.copyTo(Eij_h.data(), M * 6 * HW);
+            Cii_buf.copyTo(Cii_h.data(), M * HW);
+            wi_buf.copyTo(bz_h.data(), M * HW);
+
+            // Download eta (GRU damping per keyframe)
+            std::vector<float> eta_h(t1 * HW);
+            CUDA_CHECK(cudaMemcpy(eta_h.data(), eta, t1 * HW * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+
+            // For each depth keyframe k referenced by edges, compute Schur complement
+            for (int k = 0; k < t1; k++) {
+                // Find all edges with ii[e] == k
+                std::vector<int> k_edges;
+                for (int e = 0; e < M; e++)
+                    if (ii_host[e] == k) k_edges.push_back(e);
+                if (k_edges.empty()) continue;
+
+                // Accumulate C_k and w_k for this depth keyframe
+                std::vector<float> C_k(HW, 0), w_k(HW, 0);
+                for (int e : k_edges) {
+                    for (int d = 0; d < HW; d++) {
+                        C_k[d] += Cii_h[e * HW + d];
+                        w_k[d] += bz_h[e * HW + d];
+                    }
+                }
+                // Add eta damping (matching PyTorch: C += 0.2*damping + EP)
+                for (int d = 0; d < HW; d++)
+                    C_k[d] += 0.2f * eta_h[k * HW + d] + 1e-7f;
+
+                // Q_k = 1/C_k
+                std::vector<float> Q_k(HW);
+                for (int d = 0; d < HW; d++)
+                    Q_k[d] = 1.0f / C_k[d];
+
+                // Build E coupling vectors per connected pose (only optimizable poses)
+                std::vector<std::pair<int, std::vector<float>>> pose_E_list;
+                auto get_or_add = [&](int p_idx) -> std::vector<float>& {
+                    for (auto& [idx, vec] : pose_E_list)
+                        if (idx == p_idx) return vec;
+                    pose_E_list.push_back({p_idx, std::vector<float>(6 * HW, 0)});
+                    return pose_E_list.back().second;
+                };
+
+                // Self-coupling (pose k, depth k): accumulate Eii
+                int k_idx = k - t0;
+                if (k_idx >= 0 && k_idx < P) {
+                    auto& Ek = get_or_add(k_idx);
+                    for (int e : k_edges)
+                        for (int n = 0; n < 6; n++)
+                            for (int d = 0; d < HW; d++)
+                                Ek[n * HW + d] += Eii_h[e * 6 * HW + n * HW + d];
+                }
+
+                // Cross-coupling (pose jj[e], depth k): accumulate Eij
+                for (int e : k_edges) {
+                    int p = jj_host[e] - t0;
+                    if (p < 0 || p >= P) continue;
+                    auto& Ep = get_or_add(p);
+                    for (int n = 0; n < 6; n++)
+                        for (int d = 0; d < HW; d++)
+                            Ep[n * HW + d] += Eij_h[e * 6 * HW + n * HW + d];
+                }
+
+                // Subtract Schur complement: S -= E * Q * E^T, b -= E * Q * w
+                for (auto& [p1, E1] : pose_E_list) {
+                    for (int n = 0; n < 6; n++) {
+                        float sum = 0;
+                        for (int d = 0; d < HW; d++)
+                            sum += E1[n * HW + d] * Q_k[d] * w_k[d];
+                        b_host[p1 * 6 + n] -= sum;
+                    }
+                    for (auto& [p2, E2] : pose_E_list) {
+                        for (int n = 0; n < 6; n++) {
+                            for (int m = 0; m < 6; m++) {
+                                float sum = 0;
+                                for (int d = 0; d < HW; d++)
+                                    sum += E1[n * HW + d] * Q_k[d] * E2[m * HW + d];
+                                S_host[(p1*6+n) * S_size + (p2*6+m)] -= sum;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Add damping
@@ -515,6 +593,97 @@ struct BundleAdjustment {
                               cudaMemcpyDeviceToDevice));
         pose_retr_kernel<<<1, BA_THREADS>>>(poses, dx_buf.data, t0, t1);
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        if (!motion_only) {
+            // Back-substitute for depth updates: dz = Q * (w - E^T * dx)
+            // Download dx
+            std::vector<float> dx_h(P * 6);
+            CUDA_CHECK(cudaMemcpy(dx_h.data(), dx_buf.data, P * 6 * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+
+            // Re-download per-edge Eii, Eij, Cii, bz for back-substitution
+            std::vector<float> Eii_h(M * 6 * HW), Eij_h(M * 6 * HW);
+            std::vector<float> Cii_h(M * HW), bz_h(M * HW);
+            Eii_buf.copyTo(Eii_h.data(), M * 6 * HW);
+            Eij_buf.copyTo(Eij_h.data(), M * 6 * HW);
+            Cii_buf.copyTo(Cii_h.data(), M * HW);
+            wi_buf.copyTo(bz_h.data(), M * HW);
+
+            std::vector<float> eta_h(t1 * HW);
+            CUDA_CHECK(cudaMemcpy(eta_h.data(), eta, t1 * HW * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+
+            // For each depth keyframe k, compute dz[k]
+            std::vector<float> all_dz(t1 * HW, 0);
+            for (int k = t0; k < t1; k++) {
+                int k_idx = k - t0;
+
+                std::vector<int> k_edges;
+                for (int e = 0; e < M; e++)
+                    if (ii_host[e] == k) k_edges.push_back(e);
+                if (k_edges.empty()) continue;
+
+                // Accumulate C_k, w_k
+                std::vector<float> C_k(HW, 0), w_k(HW, 0);
+                for (int e : k_edges) {
+                    for (int d = 0; d < HW; d++) {
+                        C_k[d] += Cii_h[e * HW + d];
+                        w_k[d] += bz_h[e * HW + d];
+                    }
+                }
+                for (int d = 0; d < HW; d++)
+                    C_k[d] += 0.2f * eta_h[k * HW + d] + 1e-7f;
+
+                // Compute E^T * dx contribution
+                // dw[d] = sum_p sum_n E[p,k,n,d] * dx[p,n]
+                std::vector<float> dw(HW, 0);
+
+                // From Eii: E[k_idx, k, n, d] * dx[k_idx, n]
+                if (k_idx >= 0 && k_idx < P) {
+                    // Accumulate Eii per keyframe
+                    std::vector<float> Ek(6 * HW, 0);
+                    for (int e : k_edges)
+                        for (int n = 0; n < 6; n++)
+                            for (int d = 0; d < HW; d++)
+                                Ek[n * HW + d] += Eii_h[e * 6 * HW + n * HW + d];
+                    for (int d = 0; d < HW; d++)
+                        for (int n = 0; n < 6; n++)
+                            dw[d] += Ek[n * HW + d] * dx_h[k_idx * 6 + n];
+                }
+
+                // From Eij: E[jj[e]-t0, k, n, d] * dx[jj[e]-t0, n]
+                for (int e : k_edges) {
+                    int p = jj_host[e] - t0;
+                    if (p < 0 || p >= P) continue;
+                    for (int d = 0; d < HW; d++)
+                        for (int n = 0; n < 6; n++)
+                            dw[d] += Eij_h[e * 6 * HW + n * HW + d] * dx_h[p * 6 + n];
+                }
+
+                // dz = Q * (w - dw), dampened
+                for (int d = 0; d < HW; d++) {
+                    float Q_kd = 1.0f / C_k[d];
+                    all_dz[k * HW + d] = Q_kd * (w_k[d] - dw[d]);
+                }
+            }
+
+            // Apply depth update: disps[k] += dz[k], clamp
+            std::vector<float> disps_h(t1 * HW);
+            CUDA_CHECK(cudaMemcpy(disps_h.data(), disps, t1 * HW * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+
+            for (int k = t0; k < t1; k++) {
+                for (int d = 0; d < HW; d++) {
+                    float val = disps_h[k * HW + d] + all_dz[k * HW + d];
+                    val = fmaxf(0.001f, val);
+                    if (val > 10.0f) val = 0.0f;
+                    disps_h[k * HW + d] = val;
+                }
+            }
+
+            CUDA_CHECK(cudaMemcpy(disps, disps_h.data(), t1 * HW * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+        }
     }
 
     void destroy() {

@@ -621,7 +621,7 @@ struct UpdateModule {
         agg_conv2.forward(cudnn, temp1, temp2, workspace, batch, h, w);
         relu_inplace(temp2, batch * 128 * HW);
         agg_eta_0.forward(cudnn, temp2, eta_out, workspace, batch, h, w);
-        softplus_inplace(eta_out, batch * 1 * HW, 0.01f);
+        softplus_inplace(eta_out, batch * 1 * HW, 1.0f);
     }
 };
 
@@ -647,6 +647,7 @@ struct DroidState {
 
     // Edge state (persistent across frames)
     std::vector<int> ii_host, jj_host;
+    std::vector<int> edge_age;  // Age counter per edge (increments each _update call)
     GpuIntBuf ii_gpu, jj_gpu;
 
     // Per-edge target, weight, and hidden state (persistent)
@@ -654,6 +655,16 @@ struct DroidState {
     GpuBuf weight;     // [MAX_EDGES, 2, h, w]
     GpuBuf edge_nets;  // [MAX_EDGES, 128, h, w]
     static const int MAX_EDGES = 2048;
+    int max_factors = 48;  // Maximum active edges (matching PyTorch)
+
+    // Inactive edge storage (frozen targets/weights from removed edges)
+    std::vector<int> ii_inac, jj_inac;
+    GpuBuf target_inac;  // [MAX_EDGES, 2, h, w]
+    GpuBuf weight_inac;  // [MAX_EDGES, 2, h, w]
+    int num_inac = 0;    // Number of inactive edges
+
+    // Per-keyframe damping from GRU (for BA Schur complement)
+    GpuBuf damping;      // [MAX_KF, h, w]
 
     void init(int fullH, int fullW, float fx, float fy, float cx, float cy) {
         H = fullH; W = fullW;
@@ -692,6 +703,15 @@ struct DroidState {
         edge_nets.alloc(MAX_EDGES * 128 * hw);
         ii_gpu.alloc(MAX_EDGES);
         jj_gpu.alloc(MAX_EDGES);
+
+        // Inactive edge buffers
+        target_inac.alloc(MAX_EDGES * 2 * hw);
+        weight_inac.alloc(MAX_EDGES * 2 * hw);
+
+        // Per-keyframe damping (initialized to 1e-6 matching PyTorch)
+        damping.alloc(MAX_KEYFRAMES * hw);
+        std::vector<float> init_damp(MAX_KEYFRAMES * hw, 1e-6f);
+        damping.copyFrom(init_damp.data(), MAX_KEYFRAMES * hw);
     }
 
     // Add a keyframe: store features at keyframe index, record timestamp
@@ -711,6 +731,28 @@ struct DroidState {
                                   7 * sizeof(float), cudaMemcpyDeviceToDevice));
         }
 
+        // Initialize disparity from 70th percentile of recent keyframes (matching PyTorch)
+        if (idx > 0) {
+            int depth_window = 3;
+            int start = std::max(0, idx - depth_window - 1);
+            int count = idx - start;
+            std::vector<float> recent_disps(count * hw);
+            CUDA_CHECK(cudaMemcpy(recent_disps.data(), disps.data + start * hw,
+                                  count * hw * sizeof(float), cudaMemcpyDeviceToHost));
+            // Compute per-pixel 70th percentile across recent keyframes
+            std::vector<float> new_disp(hw);
+            for (int p = 0; p < hw; p++) {
+                std::vector<float> vals(count);
+                for (int k = 0; k < count; k++)
+                    vals[k] = recent_disps[k * hw + p];
+                std::sort(vals.begin(), vals.end());
+                int q_idx = (int)(0.7f * (count - 1));
+                new_disp[p] = vals[q_idx];
+            }
+            CUDA_CHECK(cudaMemcpy(disps.data + idx * hw, new_disp.data(),
+                                  hw * sizeof(float), cudaMemcpyHostToDevice));
+        }
+
         kf_timestamps.push_back(frame_timestamp);
         num_keyframes++;
     }
@@ -720,25 +762,42 @@ struct DroidState {
         int start = std::max(0, kf_idx - radius);
         for (int j = start; j < kf_idx; j++) {
             // Bidirectional edges
-            ii_host.push_back(kf_idx);
-            jj_host.push_back(j);
-            ii_host.push_back(j);
-            jj_host.push_back(kf_idx);
+            ii_host.push_back(kf_idx); jj_host.push_back(j); edge_age.push_back(0);
+            ii_host.push_back(j); jj_host.push_back(kf_idx); edge_age.push_back(0);
         }
     }
 
-    int num_edges() const { return (int)ii_host.size(); }
+    // Check if edge (i,j) already exists in active or inactive sets
+    bool has_edge(int i, int j) const {
+        for (size_t e = 0; e < ii_host.size(); e++)
+            if (ii_host[e] == i && jj_host[e] == j) return true;
+        for (size_t e = 0; e < ii_inac.size(); e++)
+            if (ii_inac[e] == i && jj_inac[e] == j) return true;
+        return false;
+    }
 
-    // Remove edges where BOTH endpoints are older than min_kf.
-    // Keep any edge that has at least one endpoint >= min_kf.
-    void remove_old_edges(int min_kf, int hw) {
+    // Store edges as inactive (preserve their targets/weights) and remove from active
+    void store_and_remove_edges(const std::vector<bool>& mask) {
+        int hw = h * w;
         int n = (int)ii_host.size();
-        if (n == 0) return;
-        std::vector<int> new_ii, new_jj;
-        new_ii.reserve(n); new_jj.reserve(n);
+        std::vector<int> new_ii, new_jj, new_age;
+        new_ii.reserve(n); new_jj.reserve(n); new_age.reserve(n);
+
         for (int e = 0; e < n; e++) {
-            if (ii_host[e] >= min_kf || jj_host[e] >= min_kf) {
-                // Compact edge hidden state
+            if (mask[e]) {
+                // Store as inactive
+                if (num_inac < MAX_EDGES) {
+                    CUDA_CHECK(cudaMemcpy(target_inac.data + num_inac * 2 * hw,
+                                          target.data + e * 2 * hw,
+                                          2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                    CUDA_CHECK(cudaMemcpy(weight_inac.data + num_inac * 2 * hw,
+                                          weight.data + e * 2 * hw,
+                                          2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                    ii_inac.push_back(ii_host[e]);
+                    jj_inac.push_back(jj_host[e]);
+                    num_inac++;
+                }
+            } else {
                 int new_idx = (int)new_ii.size();
                 if (new_idx != e) {
                     CUDA_CHECK(cudaMemcpy(edge_nets.data + new_idx * 128 * hw,
@@ -753,10 +812,31 @@ struct DroidState {
                 }
                 new_ii.push_back(ii_host[e]);
                 new_jj.push_back(jj_host[e]);
+                new_age.push_back(edge_age[e]);
             }
         }
         ii_host = std::move(new_ii);
         jj_host = std::move(new_jj);
+        edge_age = std::move(new_age);
+    }
+
+    // Increment age of all active edges
+    void age_edges() {
+        for (auto& a : edge_age) a++;
+    }
+
+    int num_edges() const { return (int)ii_host.size(); }
+
+    // Remove edges where BOTH endpoints are older than min_kf (store as inactive).
+    void remove_old_edges(int min_kf, int hw) {
+        int n = (int)ii_host.size();
+        if (n == 0) return;
+        std::vector<bool> mask(n, false);
+        for (int e = 0; e < n; e++) {
+            if (ii_host[e] < min_kf && jj_host[e] < min_kf)
+                mask[e] = true;
+        }
+        store_and_remove_edges(mask);
     }
 
     void sync_edges_to_gpu() {
@@ -766,6 +846,83 @@ struct DroidState {
         jj_gpu.alloc(n);
         ii_gpu.copyFrom(ii_host.data(), n);
         jj_gpu.copyFrom(jj_host.data(), n);
+    }
+
+    // Remove keyframe at index ix: compact all arrays and update edge indices
+    // Matches PyTorch DROID-SLAM factor_graph.rm_keyframe()
+    void rm_keyframe(int ix) {
+        int hw = h * w;
+        int t = num_keyframes;
+        if (ix < 0 || ix >= t) return;
+
+        // Shift GPU buffers left to fill the gap
+        for (int k = ix; k < t - 1; k++) {
+            CUDA_CHECK(cudaMemcpy(poses.data + k * 7, poses.data + (k+1) * 7,
+                                  7 * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(disps.data + k * hw, disps.data + (k+1) * hw,
+                                  hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(fmaps.data + k * 128 * hw, fmaps.data + (k+1) * 128 * hw,
+                                  128 * hw * sizeof(__half), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(nets.data + k * 128 * hw, nets.data + (k+1) * 128 * hw,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(inps.data + k * 128 * hw, inps.data + (k+1) * 128 * hw,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+        kf_timestamps.erase(kf_timestamps.begin() + ix);
+        num_keyframes--;
+
+        // Update active edge indices: remove edges involving ix, decrement indices >= ix
+        int n = (int)ii_host.size();
+        std::vector<int> new_ii, new_jj, new_age;
+        new_ii.reserve(n); new_jj.reserve(n); new_age.reserve(n);
+        for (int e = 0; e < n; e++) {
+            int ei = ii_host[e], ej = jj_host[e];
+            if (ei == ix || ej == ix) continue;
+            if (ei > ix) ei--;
+            if (ej > ix) ej--;
+            int new_idx = (int)new_ii.size();
+            if (new_idx != e) {
+                CUDA_CHECK(cudaMemcpy(edge_nets.data + new_idx * 128 * hw,
+                                      edge_nets.data + e * 128 * hw,
+                                      128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(target.data + new_idx * 2 * hw,
+                                      target.data + e * 2 * hw,
+                                      2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(weight.data + new_idx * 2 * hw,
+                                      weight.data + e * 2 * hw,
+                                      2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            }
+            new_ii.push_back(ei);
+            new_jj.push_back(ej);
+            new_age.push_back(edge_age[e]);
+        }
+        ii_host = std::move(new_ii);
+        jj_host = std::move(new_jj);
+        edge_age = std::move(new_age);
+
+        // Update inactive edge indices
+        std::vector<int> new_ii_inac, new_jj_inac;
+        int new_num_inac = 0;
+        for (int e = 0; e < num_inac; e++) {
+            int ei = ii_inac[e], ej = jj_inac[e];
+            if (ei == ix || ej == ix) continue;
+            if (ei > ix) ei--;
+            if (ej > ix) ej--;
+            if (new_num_inac != e) {
+                CUDA_CHECK(cudaMemcpy(target_inac.data + new_num_inac * 2 * hw,
+                                      target_inac.data + e * 2 * hw,
+                                      2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(weight_inac.data + new_num_inac * 2 * hw,
+                                      weight_inac.data + e * 2 * hw,
+                                      2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            }
+            new_ii_inac.push_back(ei);
+            new_jj_inac.push_back(ej);
+            new_num_inac++;
+        }
+        ii_inac = std::move(new_ii_inac);
+        jj_inac = std::move(new_jj_inac);
+        num_inac = new_num_inac;
     }
 };
 
@@ -1258,6 +1415,7 @@ struct CudaDroid {
         alloc_encoder_bufs();
         alloc_motion_filter_bufs();
         alloc_coords0();
+        alloc_dist_bufs();
         printf("CudaDroid initialized: %dx%d -> %dx%d\n", H, W, h, w);
     }
 
@@ -1433,6 +1591,256 @@ struct CudaDroid {
     int edge_radius = 2;
     int frontend_window = 25;  // sliding window size (matches PyTorch DROID-SLAM)
     int update_steps = 3;     // GRU update steps per keyframe
+    float keyframe_thresh = 4.0f;  // Keyframe pruning threshold (PyTorch default)
+    float beta = 0.3f;             // Depth weighting for distance metric
+    // Pruning runs after update_steps GRU+BA steps (no additional iters after check)
+
+    // Temporary buffers for frame distance computation
+    GpuBuf dist_buf;
+    GpuIntBuf dist_ii, dist_jj;
+    static const int MAX_DIST_PAIRS = 1024;
+
+    void alloc_dist_bufs() {
+        dist_buf.alloc(MAX_DIST_PAIRS);
+        dist_ii.alloc(MAX_DIST_PAIRS);
+        dist_jj.alloc(MAX_DIST_PAIRS);
+    }
+
+    // Compute bidirectional frame distance between two keyframes
+    float compute_frame_distance(int kf_a, int kf_b) {
+        int h_ii[2] = {kf_a, kf_b};
+        int h_jj[2] = {kf_b, kf_a};
+        dist_ii.copyFrom(h_ii, 2);
+        dist_jj.copyFrom(h_jj, 2);
+
+        frame_distance_kernel<<<2, 256>>>(
+            state.poses.data, state.disps.data, state.intrinsics.data,
+            dist_ii.data, dist_jj.data, dist_buf.data,
+            2, h, w, beta);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        float h_dist[2];
+        CUDA_CHECK(cudaMemcpy(h_dist, dist_buf.data, 2 * sizeof(float), cudaMemcpyDeviceToHost));
+        return 0.5f * (h_dist[0] + h_dist[1]);
+    }
+
+    // Compute frame distances for multiple pairs at once
+    void compute_frame_distances_batch(const std::vector<int>& pairs_ii,
+                                       const std::vector<int>& pairs_jj,
+                                       std::vector<float>& dists) {
+        int n = (int)pairs_ii.size();
+        if (n == 0) return;
+        int batch = std::min(n, MAX_DIST_PAIRS);
+        dist_ii.copyFrom(pairs_ii.data(), batch);
+        dist_jj.copyFrom(pairs_jj.data(), batch);
+
+        frame_distance_kernel<<<batch, 256>>>(
+            state.poses.data, state.disps.data, state.intrinsics.data,
+            dist_ii.data, dist_jj.data, dist_buf.data,
+            batch, h, w, beta);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        dists.resize(batch);
+        CUDA_CHECK(cudaMemcpy(dists.data(), dist_buf.data, batch * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+    }
+
+    // Add proximity factors (matching PyTorch add_proximity_factors)
+    // Adds edges between spatially-similar keyframes in a window
+    void add_proximity_factors(int t0, int t1, int rad, int nms,
+                               float thresh, bool remove_old) {
+        int t = state.num_keyframes;
+        if (t < 2) return;
+        t0 = std::max(0, t0);
+        t1 = std::max(0, t1);
+
+        // 1. Compute distances for all pairs (i in [t0,t), j in [t1,t))
+        std::vector<int> all_ii, all_jj;
+        for (int i = t0; i < t; i++) {
+            for (int j = t1; j < t; j++) {
+                all_ii.push_back(i);
+                all_jj.push_back(j);
+            }
+        }
+
+        int num_pairs = (int)all_ii.size();
+        if (num_pairs == 0) return;
+
+        std::vector<float> dists;
+        compute_frame_distances_batch(all_ii, all_jj, dists);
+
+        int jrange = t - t1;
+
+        // 2. Invalidate: pairs too close temporally, or already existing
+        for (int k = 0; k < num_pairs; k++) {
+            int i = all_ii[k], j = all_jj[k];
+            if (i - rad < j) dists[k] = 1e6f;
+            if (dists[k] > 100.0f) dists[k] = 1e6f;
+        }
+
+        // NMS against existing edges (active + inactive)
+        auto suppress = [&](int i, int j) {
+            for (int di = -nms; di <= nms; di++) {
+                for (int dj = -nms; dj <= nms; dj++) {
+                    if (abs(di) + abs(dj) <= std::max(std::min(abs(i-j)-2, nms), 0)) {
+                        int i1 = i + di, j1 = j + dj;
+                        if (i1 >= t0 && i1 < t && j1 >= t1 && j1 < t) {
+                            int idx = (i1 - t0) * jrange + (j1 - t1);
+                            if (idx >= 0 && idx < num_pairs) dists[idx] = 1e6f;
+                        }
+                    }
+                }
+            }
+        };
+
+        for (size_t e = 0; e < state.ii_host.size(); e++)
+            suppress(state.ii_host[e], state.jj_host[e]);
+        for (size_t e = 0; e < state.ii_inac.size(); e++)
+            suppress(state.ii_inac[e], state.jj_inac[e]);
+
+        // 3. Seed with mandatory neighborhood edges
+        std::vector<std::pair<int,int>> es;
+        for (int i = t0; i < t; i++) {
+            for (int j = std::max(i - rad - 1, 0); j < i; j++) {
+                if (!state.has_edge(i, j)) { es.push_back({i, j}); es.push_back({j, i}); }
+                int idx = (i - t0) * jrange + (j - t1);
+                if (idx >= 0 && idx < num_pairs) dists[idx] = 1e6f;
+            }
+        }
+
+        // 4. Greedily add best distance-based edges
+        std::vector<int> sorted_idx(num_pairs);
+        std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
+        std::sort(sorted_idx.begin(), sorted_idx.end(),
+                  [&](int a, int b) { return dists[a] < dists[b]; });
+
+        for (int k : sorted_idx) {
+            if (dists[k] > thresh) continue;
+            if (state.max_factors > 0 && (int)(state.ii_host.size() + es.size()) > state.max_factors)
+                break;
+
+            int i = all_ii[k], j = all_jj[k];
+            es.push_back({i, j});
+            es.push_back({j, i});
+            suppress(i, j);
+        }
+
+        // 5. If we'd exceed max_factors, remove oldest edges first
+        if (remove_old && state.max_factors > 0 && es.size() > 0) {
+            int total_after = (int)state.ii_host.size() + (int)es.size();
+            if (total_after > state.max_factors) {
+                // Sort active edges by age, remove oldest to make room
+                int to_remove = total_after - state.max_factors;
+                std::vector<int> age_idx(state.edge_age.size());
+                std::iota(age_idx.begin(), age_idx.end(), 0);
+                std::sort(age_idx.begin(), age_idx.end(),
+                          [&](int a, int b) { return state.edge_age[a] > state.edge_age[b]; });
+                std::vector<bool> mask(state.ii_host.size(), false);
+                for (int r = 0; r < std::min(to_remove, (int)age_idx.size()); r++)
+                    mask[age_idx[r]] = true;
+                state.store_and_remove_edges(mask);
+            }
+        }
+
+        // 6. Add new edges
+        int hw = h * w;
+        int prev = (int)state.ii_host.size();
+        for (auto& [ei, ej] : es) {
+            if (!state.has_edge(ei, ej)) {
+                state.ii_host.push_back(ei);
+                state.jj_host.push_back(ej);
+                state.edge_age.push_back(0);
+            }
+        }
+
+        // Initialize hidden states for new edges
+        int new_count = (int)state.ii_host.size();
+        for (int e = prev; e < new_count; e++) {
+            int ii_val = state.ii_host[e];
+            CUDA_CHECK(cudaMemcpy(state.edge_nets.data + e * 128 * hw,
+                                  state.nets.data + ii_val * 128 * hw,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            // Zero-initialize target and weight for new edges
+            CUDA_CHECK(cudaMemset(state.weight.data + e * 2 * hw, 0, 2 * hw * sizeof(float)));
+        }
+    }
+
+    int max_age = 20;  // Maximum edge age before storing as inactive
+    float frontend_thresh = 16.0f;
+    int frontend_radius = 2;
+    int frontend_nms = 1;
+    bool is_initialized = false;
+
+    // Run heavy initialization (matching PyTorch _initialize)
+    // Called once when warmup keyframes are reached
+    void run_initialization() {
+        int N = state.num_keyframes;
+        int hw = h * w;
+        if (N < 2) return;
+
+        // 1. Add neighborhood edges (radius 3) for all warmup keyframes
+        state.ii_host.clear();
+        state.jj_host.clear();
+        state.edge_age.clear();
+        for (int i = 0; i < N; i++) {
+            for (int j = std::max(0, i - 3); j < i; j++) {
+                state.ii_host.push_back(i); state.jj_host.push_back(j); state.edge_age.push_back(0);
+                state.ii_host.push_back(j); state.jj_host.push_back(i); state.edge_age.push_back(0);
+            }
+        }
+
+        // Initialize hidden states for all edges
+        for (int e = 0; e < (int)state.ii_host.size(); e++) {
+            int ii_val = state.ii_host[e];
+            CUDA_CHECK(cudaMemcpy(state.edge_nets.data + e * 128 * hw,
+                                  state.nets.data + ii_val * 128 * hw,
+                                  128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemset(state.weight.data + e * 2 * hw, 0, 2 * hw * sizeof(float)));
+        }
+        state.sync_edges_to_gpu();
+
+        // 2. First optimization pass: 8 GRU+BA iterations with t0=1
+        int total_edges = state.num_edges();
+        if (total_edges > 0) {
+            run_update_pass(total_edges, 8);
+        }
+
+        // 3. Add proximity factors
+        add_proximity_factors(0, 0, 2, 2, frontend_thresh, /*remove_old=*/false);
+        state.sync_edges_to_gpu();
+
+        // Re-initialize new edges
+        total_edges = state.num_edges();
+        for (int e = 0; e < total_edges; e++) {
+            // Only init edges that don't have initialized nets yet
+            // (new edges from proximity)
+        }
+
+        // 4. Second optimization pass: 8 GRU+BA iterations with t0=1
+        if (total_edges > 0) {
+            run_update_pass(total_edges, 8);
+        }
+
+        // 5. Remove very old edges from warmup (matching PyTorch: ii < warmup-4)
+        {
+            int n = (int)state.ii_host.size();
+            std::vector<bool> mask(n, false);
+            for (int e = 0; e < n; e++) {
+                if (state.ii_host[e] < warmup - 4) mask[e] = true;
+            }
+            state.store_and_remove_edges(mask);
+        }
+
+        // Initialize next frame's state
+        int last = N - 1;
+        CUDA_CHECK(cudaMemcpy(state.poses.data + N * 7,
+                              state.poses.data + last * 7,
+                              7 * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        is_initialized = true;
+        printf("Initialization complete: %d keyframes, %d edges\n",
+               N, state.num_edges());
+    }
 
     // Buffers for GRU-based motion filter (single edge)
     GpuBuf mf_corr, mf_coords, mf_motion, mf_nets, mf_inps;
@@ -1526,8 +1934,8 @@ struct CudaDroid {
         // 4. Motion filter: use GRU-predicted flow relative to last keyframe
         float flow = compute_motion_gru(nk - 1);
 
-        // During warmup or if flow exceeds threshold, add as keyframe
-        if (flow < filter_thresh && nk >= warmup) {
+        // Skip frame if not enough motion (no warmup bypass — matching PyTorch)
+        if (flow < filter_thresh) {
             t_total.end();
             return;  // Not enough motion, skip
         }
@@ -1536,30 +1944,58 @@ struct CudaDroid {
         state.add_keyframe(frame_t, enc_fmap.data, enc_net.data, enc_inp.data);
         int new_kf = state.num_keyframes - 1;
 
-        // 6. Add edges connecting new keyframe to recent keyframes
-        int prev_num_edges = state.num_edges();
+        // 6. Add temporal edges + manage edge lifecycle
         state.add_edges_for_keyframe(new_kf, edge_radius);
+        state.age_edges();
+
+        // Remove old edges based on age (store as inactive)
+        {
+            int n = (int)state.ii_host.size();
+            if (n > 0) {
+                std::vector<bool> old_mask(n, false);
+                for (int e = 0; e < n; e++)
+                    if (state.edge_age[e] > max_age) old_mask[e] = true;
+                state.store_and_remove_edges(old_mask);
+            }
+        }
 
         // Prune edges outside the frontend window
         if (new_kf >= frontend_window) {
-            state.remove_old_edges(new_kf - frontend_window + 1, hw);
+            state.remove_old_edges(new_kf - frontend_window + 1, h * w);
         }
+
+        // 7. Add proximity factors (matching PyTorch _update)
+        add_proximity_factors(
+            new_kf - 5,
+            std::max(new_kf - frontend_window, 0),
+            frontend_radius, frontend_nms,
+            frontend_thresh, /*remove_old=*/true);
 
         state.sync_edges_to_gpu();
         int total_edges = state.num_edges();
-
-        // Initialize hidden states for new edges from keyframe nets
-        for (int e = prev_num_edges; e < total_edges; e++) {
-            int ii_val = state.ii_host[e];
-            CUDA_CHECK(cudaMemcpy(state.edge_nets.data + e * 128 * hw,
-                                  state.nets.data + ii_val * 128 * hw,
-                                  128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
-        }
-
         if (total_edges == 0) { t_total.end(); return; }
 
-        // 7. Run full DROID-SLAM update: N steps of [reproject + corr + GRU + BA]
-        run_update_pass(total_edges, update_steps);
+        // 8. PyTorch pattern: iters1=3 optimization, prune check, iters2=2 if not pruned
+        run_update_pass(total_edges, 3);
+
+        // 9. Keyframe pruning (matching PyTorch droid_frontend._update)
+        bool pruned = false;
+        int nk_now = state.num_keyframes;
+        if (nk_now >= 4) {
+            float d = compute_frame_distance(nk_now - 4, nk_now - 2);
+            if (d < 2.0f * keyframe_thresh) {
+                state.rm_keyframe(nk_now - 3);
+                state.sync_edges_to_gpu();
+                pruned = true;
+            }
+        }
+
+        // 10. If not pruned, run 2 more optimization iterations
+        if (!pruned) {
+            total_edges = state.num_edges();
+            if (total_edges > 0)
+                run_update_pass(total_edges, 2);
+        }
 
         t_total.end();
     }
@@ -1674,11 +2110,16 @@ struct CudaDroid {
                 }
 
 
-                // 7. Save hidden states
+                // 7. Save hidden states + per-keyframe damping
                 for (int e = 0; e < batch_size; e++) {
                     CUDA_CHECK(cudaMemcpy(state.edge_nets.data + (bs + e) * 128 * hw,
                                           batch_nets.data + e * 128 * hw,
                                           128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                    // Store GRU eta into per-keyframe damping (overwrite, matching PyTorch)
+                    int kf = state.ii_host[bs + e];
+                    CUDA_CHECK(cudaMemcpy(state.damping.data + kf * hw,
+                                          batch_eta.data + e * hw,
+                                          hw * sizeof(float), cudaMemcpyDeviceToDevice));
                 }
             }
 
@@ -1686,22 +2127,21 @@ struct CudaDroid {
             t_update.end();
 
 
-            // 8. BA with all edges (2 iterations like PyTorch)
+            // 8. BA with active edges only, t0=1
             t_ba.begin();
-            int t0 = 1;
-            int t1 = state.num_keyframes;
+            int t0_ba = 1;
+            int t1_ba = state.num_keyframes;
+
             for (int ba_iter = 0; ba_iter < 2; ba_iter++) {
                 ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
                            state.target.data, state.weight.data,
-                           state.disps.data,
+                           state.damping.data,
                            state.ii_gpu.data, state.jj_gpu.data,
                            state.ii_host.data(), state.jj_host.data(),
-                           total_edges, t0, t1,
+                           total_edges, t0_ba, t1_ba,
                            1e-4f, 0.1f, true);
             }
             t_ba.end();
-
-            // (verbose pose output removed)
         }
     }
 
@@ -1742,11 +2182,11 @@ struct CudaDroid {
             // BA with ALL edges
             ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
                        state.target.data, state.weight.data,
-                       state.disps.data,
+                       state.damping.data,
                        state.ii_gpu.data, state.jj_gpu.data,
                        state.ii_host.data(), state.jj_host.data(),
                        total_edges, 1, N,
-                       1e-4f, 0.1f, true);
+                       1e-5f, 1e-2f, true);
         }
         printf("Backend done\n");
     }
@@ -1791,6 +2231,7 @@ int main(int argc, char** argv) {
     int resize_h = 0, resize_w = 0;
     int frontend_window = 25;
     int update_steps = 3;
+    float keyframe_thresh = 4.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--weights") == 0 && i+1 < argc) weight_dir = argv[++i];
@@ -1816,6 +2257,7 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--frontend-window") == 0 && i+1 < argc) frontend_window = atoi(argv[++i]);
         else if (strcmp(argv[i], "--update-steps") == 0 && i+1 < argc) update_steps = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--keyframe-thresh") == 0 && i+1 < argc) keyframe_thresh = atof(argv[++i]);
         else if (strcmp(argv[i], "--debug-dump") == 0) {
             // After processing 2 frames, dump intermediate values
             // This is handled after the main loop
@@ -1866,6 +2308,7 @@ int main(int argc, char** argv) {
     droid.init(frameH, frameW, calib[0], calib[1], calib[2], calib[3], weight_dir);
     droid.frontend_window = frontend_window;
     droid.update_steps = update_steps;
+    droid.keyframe_thresh = keyframe_thresh;
     if (debug_dump) droid.verbose = true;
 
     // Allocate frame buffer on GPU
