@@ -10,7 +10,7 @@ Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0
 ## Quick start
 
 ```bash
-# Recommended: uses optimized settings (~27s for 62s of 1080p30 on RTX 5090)
+# Recommended: uses optimized settings (~25s for 62s of 1080p30 on RTX 5090)
 ./annotate.sh /path/to/video.mov
 
 # Or with explicit output directory:
@@ -26,7 +26,7 @@ python3 visualizer.py --port 8888
 
 # Service mode: keep models warm for fast repeated processing
 python3 visualizer.py --service --port 8888
-# First video: ~27s, subsequent: ~27s (vs ~39s cold start each time)
+# First video: ~25s, subsequent: ~25s (vs ~39s cold start each time)
 
 # Or use the service programmatically:
 python3 pipeline_service.py --listen
@@ -213,12 +213,12 @@ Benchmarked on 1829 frames (61s) of 1920x1080 30fps iPhone video, RTX 5090:
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| CUDA SLAM | 14s standalone, ~25s concurrent | 130 fps, FP16 encoders + correlation, NVDEC decode + GPU resize |
-| CUDA hand pose (stride=1) | 15s | Parallel with SLAM, NVDEC decode, FP16 YOLO, batched WiLoR ViT |
+| CUDA SLAM | 14s standalone, ~23s concurrent | 130 fps, FP16 encoders + correlation, NVDEC decode + GPU resize |
+| CUDA hand pose (stride=1) | 13s | Parallel with SLAM, NVDEC decode, FP16 YOLO, batched WiLoR ViT |
 | Audio transcription | ~8s | Parakeet on CPU, fully overlapped |
 | Video conversion (h264_nvenc) | ~3s | NVENC runs concurrently (dedicated HW encoder) |
 | Dataset assembly | <1s | Parquet + info.json |
-| **Total** | **~27s** | Service mode (warm), all outputs included |
+| **Total** | **~25s** | Service mode (warm), CUDA MPS enabled, all outputs included |
 
 Key optimizations:
 
@@ -227,7 +227,8 @@ Key optimizations:
 3. **NVDEC hardware video decode** — Hand processing uses NVIDIA's dedicated video decode hardware (`hevc_cuvid`) via FFmpeg. Decoded frames arrive directly in GPU memory (P010/NV12 format), converted to BGR by a custom CUDA kernel. Eliminates CPU decode (5.7s→0.6s) and host-to-device transfer (1.0s→0s).
 4. **Dual NVDEC streams** — Both SLAM and hand processing decode the same video independently via separate NVDEC hardware sessions. SLAM decodes at reduced resolution (584x328) with GPU resize, hands decode at full 1080p. No CPU decode, no Python piping, no shared memory needed.
 6. **Concurrent NVENC video conversion** — NVENC uses a dedicated hardware encoder separate from CUDA cores, so it runs concurrently with SLAM and hand detection. Started at the beginning of the pipeline rather than waiting for inference to complete.
-7. **Service mode** — `pipeline_service.py` keeps models loaded across videos. One-time ~2s startup, then each video skips model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
+7. **CUDA MPS** — NVIDIA Multi-Process Service lets SLAM and hand processing share one GPU context, eliminating context-switch overhead between the two CUDA processes (~27s→~25s).
+8. **Service mode** — `pipeline_service.py` keeps models loaded across videos. One-time ~2s startup, then each video skips model loading. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
 ---
 

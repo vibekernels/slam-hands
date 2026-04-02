@@ -150,12 +150,48 @@ class PipelineService:
         self._ready = False
         self._hand_proc = None
 
+        self._mps_active = False
+
         t_start = time.perf_counter()
+        self._start_mps()
         self._start_hand_worker()
         self._init_slam()
         t_total = time.perf_counter() - t_start
         print(f"[Service] Ready in {t_total:.1f}s", flush=True)
         self._ready = True
+
+    def _start_mps(self):
+        """Start NVIDIA MPS daemon for better GPU sharing between SLAM and hand processes."""
+        try:
+            # Stop any existing MPS daemon
+            subprocess.run("echo quit | nvidia-cuda-mps-control",
+                           shell=True, capture_output=True, timeout=5)
+            # Start MPS control daemon
+            subprocess.run(["nvidia-cuda-mps-control", "-d"],
+                           capture_output=True, timeout=5)
+            time.sleep(0.5)
+            # Start server for our UID
+            result = subprocess.run(
+                f"echo 'start_server -uid {os.getuid()}' | nvidia-cuda-mps-control",
+                shell=True, capture_output=True, timeout=5, text=True)
+            if result.returncode == 0:
+                self._mps_active = True
+                print("[Service] CUDA MPS enabled", flush=True)
+            else:
+                print(f"[Service] CUDA MPS start_server failed: {result.stderr.strip()}", flush=True)
+        except Exception as e:
+            print(f"[Service] CUDA MPS not available: {e}", flush=True)
+
+    def _stop_mps(self):
+        """Stop NVIDIA MPS daemon."""
+        if not self._mps_active:
+            return
+        try:
+            subprocess.run("echo quit | nvidia-cuda-mps-control",
+                           shell=True, capture_output=True, timeout=5)
+            self._mps_active = False
+        except Exception:
+            pass
 
     def _start_hand_worker(self):
         """Start persistent cuda_hand binary in --listen mode."""
@@ -458,6 +494,7 @@ class PipelineService:
                 self._hand_proc.kill()
                 self._hand_proc.wait(timeout=5)
         self._hand_proc = None
+        self._stop_mps()
         print("[Service] Shutdown complete", flush=True)
 
     def __del__(self):
