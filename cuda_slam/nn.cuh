@@ -559,6 +559,15 @@ struct GpuHalfBuf {
     ~GpuHalfBuf() { free(); }
 };
 
+// Round FP32 to FP16 precision (simulates autocast input casting)
+__global__ void round_to_fp16_kernel(float* __restrict__ data, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] = __half2float(__float2half(data[i]));
+}
+inline void round_to_fp16(float* data, int n) {
+    round_to_fp16_kernel<<<(n+255)/256, 256>>>(data, n);
+}
+
 // FP32 ↔ FP16 conversion kernels
 __global__ void float_to_half_kernel(const float* __restrict__ in, __half* __restrict__ out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

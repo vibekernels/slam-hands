@@ -457,6 +457,11 @@ struct ConvGRU {
         int total_inp = batch * (128 + 64) * HW;  // inp+corr+flow
         int total_cat = batch * 448 * HW;          // net+inp+corr+flow
 
+        // Match PyTorch autocast: Conv2d casts inputs to FP16.
+        // Round net to FP16 precision to match autocast behavior.
+        // This is the most impactful rounding since net accumulates across GRU iterations.
+        round_to_fp16(net, NC * HW);
+
         // Build cat_buf = [net(128), inp(128), corr(128), flow(64)] = 448 channels, NCHW
         concat4_kernel<<<(batch*448*HW+255)/256, 256>>>(
             cat_buf.data,
@@ -465,9 +470,12 @@ struct ConvGRU {
 
         // Compute global context: sigmoid(w(net)) * net, then spatial mean
         w_conv.forward(cudnn, net, gate_buf.data, workspace, batch, h, w);
+        round_to_fp16(gate_buf.data, NC * HW);
         sigmoid_inplace(gate_buf.data, NC * HW);
+        round_to_fp16(gate_buf.data, NC * HW);
         // gate = sigmoid(w(net)) * net
         mul_kernel<<<(NC*HW+255)/256, 256>>>(gate_buf.data, net, NC * HW);
+        round_to_fp16(gate_buf.data, NC * HW);
         // Global average pool: [batch, 128, h, w] -> [batch, 128, 1, 1]
         int threads = std::min(256, HW);
         int t = 1; while (t < threads) t <<= 1; threads = t;
@@ -475,16 +483,23 @@ struct ConvGRU {
             gate_buf.data, glo_buf.data, 128, HW);
 
         // z = sigmoid(convz(cat) + convz_glo(glo))
+        // Under autocast: conv outputs FP16, add is FP16, sigmoid produces FP16
         convz.forward(cudnn, cat_buf.data, z_buf.data, workspace, batch, h, w);
+        round_to_fp16(z_buf.data, NC * HW);
         convz_glo.forward(cudnn, glo_buf.data, z_glo.data, workspace, batch, 1, 1);
+        round_to_fp16(z_glo.data, NC);
         broadcast_add_kernel<<<NC, 256>>>(z_buf.data, z_glo.data, NC, HW);
         sigmoid_inplace(z_buf.data, NC * HW);
+        round_to_fp16(z_buf.data, NC * HW);
 
         // r = sigmoid(convr(cat) + convr_glo(glo))
         convr.forward(cudnn, cat_buf.data, r_buf.data, workspace, batch, h, w);
+        round_to_fp16(r_buf.data, NC * HW);
         convr_glo.forward(cudnn, glo_buf.data, r_glo.data, workspace, batch, 1, 1);
+        round_to_fp16(r_glo.data, NC);
         broadcast_add_kernel<<<NC, 256>>>(r_buf.data, r_glo.data, NC, HW);
         sigmoid_inplace(r_buf.data, NC * HW);
+        round_to_fp16(r_buf.data, NC * HW);
 
         // gru_input = cat(r*net, inp, corr, flow) = 448 channels
         // r*net -> rnet_buf
@@ -499,12 +514,18 @@ struct ConvGRU {
 
         // q = tanh(convq(gru_input) + convq_glo(glo))
         convq.forward(cudnn, gru_inp_buf.data, q_buf.data, workspace, batch, h, w);
+        round_to_fp16(q_buf.data, NC * HW);
         convq_glo.forward(cudnn, glo_buf.data, q_glo.data, workspace, batch, 1, 1);
+        round_to_fp16(q_glo.data, NC);
         broadcast_add_kernel<<<NC, 256>>>(q_buf.data, q_glo.data, NC, HW);
         tanh_inplace(q_buf.data, NC * HW);
+        round_to_fp16(q_buf.data, NC * HW);
 
         // net = (1-z)*net + z*q
         gru_update_kernel<<<(NC*HW+255)/256, 256>>>(net, z_buf.data, q_buf.data, NC * HW);
+
+        // Round net to FP16 to match PyTorch autocast (net stays FP16 across iterations)
+        round_to_fp16(net, NC * HW);
     }
 };
 
@@ -568,60 +589,68 @@ struct UpdateModule {
         flow_enc_buf.alloc(batch * 64 * h * w);
     }
 
-    // Forward pass of the update module
-    // corr_features: [batch, 196, h, w] - raw correlation features
-    // motion: [batch, 4, h, w] - motion features (flow residuals)
-    // net: [batch, 128, h, w] - GRU hidden state (modified in place)
-    // inp: [batch, 128, h, w] - context features
-    // delta_out: [batch, 3, h, w] - flow correction output (2 flow + 1 depth)
-    // weight_out: [batch, 3, h, w] - weight output (2 flow + 1 depth)
-    // eta_out: [batch, 1, h, w] - damping output
+    // Forward pass of the update module (GRU + delta/weight heads + agg_conv1)
+    // agg_conv1_out: [batch, 128, h, w] - per-edge features for scatter_mean
     void forward(cudnnHandle_t cudnn, float* corr_features, float* motion,
                  float* net, float* inp,
-                 float* delta_out, float* weight_out, float* eta_out,
+                 float* delta_out, float* weight_out, float* agg_conv1_out,
                  float* temp1, float* temp2, float* workspace,
                  int batch, int h, int w) {
         int HW = h * w;
 
         // Encode correlation features: 196 -> 128
+        // Under PyTorch autocast, Conv2d outputs are FP16
         corr_enc_0.forward(cudnn, corr_features, temp1, workspace, batch, h, w);
         relu_inplace(temp1, batch * 128 * HW);
+        round_to_fp16(temp1, batch * 128 * HW);
         corr_enc_2.forward(cudnn, temp1, temp2, workspace, batch, h, w);
         relu_inplace(temp2, batch * 128 * HW);
-        // temp2 now has encoded correlation: [batch, 128, h, w]
+        round_to_fp16(temp2, batch * 128 * HW);
 
         // Encode flow features: 4 -> 64
         flow_enc_0.forward(cudnn, motion, temp1, workspace, batch, h, w);
         relu_inplace(temp1, batch * 128 * HW);
+        round_to_fp16(temp1, batch * 128 * HW);
         flow_enc_2.forward(cudnn, temp1, flow_enc_buf.data, workspace, batch, h, w);
         relu_inplace(flow_enc_buf.data, batch * 64 * HW);
-        // flow_enc_buf now has encoded flow: [batch, 64, h, w]
+        round_to_fp16(flow_enc_buf.data, batch * 64 * HW);
 
         // GRU update
         gru.forward(cudnn, net, inp, temp2, flow_enc_buf.data, workspace, batch, h, w);
 
-        // Delta head
+        // Delta head (FP16 under autocast)
         delta_0.forward(cudnn, net, temp1, workspace, batch, h, w);
         relu_inplace(temp1, batch * 128 * HW);
+        round_to_fp16(temp1, batch * 128 * HW);
         delta_2.forward(cudnn, temp1, delta_out, workspace, batch, h, w);
+        round_to_fp16(delta_out, batch * 3 * HW);
 
-        // (debug output removed)
-
-        // Weight head
+        // Weight head (FP16 under autocast)
         weight_0.forward(cudnn, net, temp1, workspace, batch, h, w);
         relu_inplace(temp1, batch * 128 * HW);
+        round_to_fp16(temp1, batch * 128 * HW);
         weight_2.forward(cudnn, temp1, weight_out, workspace, batch, h, w);
         sigmoid_inplace(weight_out, batch * 3 * HW);
+        round_to_fp16(weight_out, batch * 3 * HW);
 
-        // GraphAgg: compute eta (damping)
-        agg_conv1.forward(cudnn, net, temp1, workspace, batch, h, w);
-        relu_inplace(temp1, batch * 128 * HW);
-        // TODO: scatter_mean aggregation by keyframe index
-        // For now, just pass through (works for single-keyframe edges)
-        agg_conv2.forward(cudnn, temp1, temp2, workspace, batch, h, w);
-        relu_inplace(temp2, batch * 128 * HW);
-        agg_eta_0.forward(cudnn, temp2, eta_out, workspace, batch, h, w);
-        softplus_inplace(eta_out, batch * 1 * HW, 1.0f);
+        // GraphAgg phase 1: conv1 + relu (per-edge, FP16 under autocast)
+        // Output stored in agg_conv1_out for scatter_mean outside this function
+        agg_conv1.forward(cudnn, net, agg_conv1_out, workspace, batch, h, w);
+        relu_inplace(agg_conv1_out, batch * 128 * HW);
+        round_to_fp16(agg_conv1_out, batch * 128 * HW);
+    }
+
+    // GraphAgg phase 2: after scatter_mean, run conv2 + relu + eta + softplus
+    // agg_features: [num_kf, 128, h, w] - scatter_mean aggregated features
+    // eta_out: [num_kf, 1, h, w] - damping output
+    void compute_eta(cudnnHandle_t cudnn, float* agg_features, float* eta_out,
+                     float* temp1, float* temp2, float* workspace,
+                     int num_kf, int h, int w) {
+        int HW = h * w;
+        agg_conv2.forward(cudnn, agg_features, temp1, workspace, num_kf, h, w);
+        relu_inplace(temp1, num_kf * 128 * HW);
+        agg_eta_0.forward(cudnn, temp1, eta_out, workspace, num_kf, h, w);
+        softplus_inplace(eta_out, num_kf * 1 * HW, 0.01f);
     }
 };
 
@@ -731,27 +760,8 @@ struct DroidState {
                                   7 * sizeof(float), cudaMemcpyDeviceToDevice));
         }
 
-        // Initialize disparity from 70th percentile of recent keyframes (matching PyTorch)
-        if (idx > 0) {
-            int depth_window = 3;
-            int start = std::max(0, idx - depth_window - 1);
-            int count = idx - start;
-            std::vector<float> recent_disps(count * hw);
-            CUDA_CHECK(cudaMemcpy(recent_disps.data(), disps.data + start * hw,
-                                  count * hw * sizeof(float), cudaMemcpyDeviceToHost));
-            // Compute per-pixel 70th percentile across recent keyframes
-            std::vector<float> new_disp(hw);
-            for (int p = 0; p < hw; p++) {
-                std::vector<float> vals(count);
-                for (int k = 0; k < count; k++)
-                    vals[k] = recent_disps[k * hw + p];
-                std::sort(vals.begin(), vals.end());
-                int q_idx = (int)(0.7f * (count - 1));
-                new_disp[p] = vals[q_idx];
-            }
-            CUDA_CHECK(cudaMemcpy(disps.data + idx * hw, new_disp.data(),
-                                  hw * sizeof(float), cudaMemcpyHostToDevice));
-        }
+        // Disparity for new keyframe: already pre-initialized by _init_next_state
+        // from previous iteration (matching PyTorch pattern). No explicit init here.
 
         kf_timestamps.push_back(frame_timestamp);
         num_keyframes++;
@@ -1285,7 +1295,7 @@ struct CudaDroid {
     cudnnHandle_t cudnn;
     cublasHandle_t cublas;
 
-    HalfBasicEncoder fnet, cnet;  // FP16 encoders with tensor cores
+    HalfBasicEncoder fnet, cnet;  // FP16 encoders (matches PyTorch autocast)
     UpdateModule update;           // stays FP32
     BundleAdjustment ba;
     DroidState state;
@@ -1321,7 +1331,10 @@ struct CudaDroid {
     GpuBuf batch_inps;    // [MAX_BATCH, 128, h, w] - gathered inp features
     GpuBuf batch_delta;   // [MAX_BATCH, 3, h, w]
     GpuBuf batch_weight;  // [MAX_BATCH, 3, h, w]
-    GpuBuf batch_eta;     // [MAX_BATCH, 1, h, w]
+    GpuBuf batch_agg1;    // [MAX_BATCH, 128, h, w] - agg_conv1 output per edge batch
+    GpuBuf all_agg1;      // [MAX_EDGES, 128, h, w] - agg_conv1 output for all edges
+    GpuBuf kf_agg;        // [MAX_KF, 128, h, w] - scatter_mean aggregated per keyframe
+    GpuBuf kf_eta;        // [MAX_KF, 1, h, w] - eta after conv2+softplus per keyframe
 
     // Timers
     CudaTimer t_encode{"encode"};
@@ -1410,7 +1423,10 @@ struct CudaDroid {
         batch_inps.alloc(MAX_BATCH_EDGES * 128 * hw);
         batch_delta.alloc(MAX_BATCH_EDGES * 3 * hw);
         batch_weight.alloc(MAX_BATCH_EDGES * 3 * hw);
-        batch_eta.alloc(MAX_BATCH_EDGES * 1 * hw);
+        batch_agg1.alloc(MAX_BATCH_EDGES * 128 * hw);
+        all_agg1.alloc((size_t)state.max_factors * 128 * hw);
+        kf_agg.alloc((size_t)DroidState::MAX_KEYFRAMES * 128 * hw);
+        kf_eta.alloc(DroidState::MAX_KEYFRAMES * 1 * hw);
 
         alloc_encoder_bufs();
         alloc_motion_filter_bufs();
@@ -1586,7 +1602,7 @@ struct CudaDroid {
     }
 
     // Motion filter parameters (matching DROID-SLAM defaults)
-    float filter_thresh = 2.4f;
+    float filter_thresh = 2.5f;
     int warmup = 8;
     int edge_radius = 2;
     int frontend_window = 25;  // sliding window size (matches PyTorch DROID-SLAM)
@@ -1770,8 +1786,9 @@ struct CudaDroid {
     int frontend_radius = 2;
     int frontend_nms = 1;
     bool is_initialized = false;
+    bool frontend_motion_only = true;  // Use motion-only in frontend, full BA only in init+backend
 
-    // Run heavy initialization (matching PyTorch _initialize)
+    // Run heavy initialization (matching PyTorch _initialize + _init_next_state)
     // Called once when warmup keyframes are reached
     void run_initialization() {
         int N = state.num_keyframes;
@@ -1779,6 +1796,7 @@ struct CudaDroid {
         if (N < 2) return;
 
         // 1. Add neighborhood edges (radius 3) for all warmup keyframes
+        // Matching: self.graph.add_neighborhood_factors(self.t0, self.t1, r=3)
         state.ii_host.clear();
         state.jj_host.clear();
         state.edge_age.clear();
@@ -1799,29 +1817,50 @@ struct CudaDroid {
         }
         state.sync_edges_to_gpu();
 
-        // 2. First optimization pass: 8 GRU+BA iterations with t0=1
+        // 2. First 8 GRU+BA iterations with forced t0=1, use_inactive=True
+        // Matching: for itr in range(8): self.graph.update(1, use_inactive=True)
+        // NOTE: PyTorch _initialize() uses default motion_only=False (full Schur complement)
         int total_edges = state.num_edges();
         if (total_edges > 0) {
-            run_update_pass(total_edges, 8);
+            run_update_pass(total_edges, 8, /*use_inactive=*/true, /*forced_t0=*/1,
+                           /*ba_lm=*/1e-4f, /*ba_ep=*/0.1f, /*motion_only=*/false);
         }
 
-        // 3. Add proximity factors
+        // 3. Add proximity factors (remove=False)
+        // Matching: self.graph.add_proximity_factors(0, 0, rad=2, nms=2, ...)
         add_proximity_factors(0, 0, 2, 2, frontend_thresh, /*remove_old=*/false);
         state.sync_edges_to_gpu();
 
-        // Re-initialize new edges
+        // 4. Second 8 GRU+BA iterations with forced t0=1, use_inactive=True
         total_edges = state.num_edges();
-        for (int e = 0; e < total_edges; e++) {
-            // Only init edges that don't have initialized nets yet
-            // (new edges from proximity)
-        }
-
-        // 4. Second optimization pass: 8 GRU+BA iterations with t0=1
         if (total_edges > 0) {
-            run_update_pass(total_edges, 8);
+            run_update_pass(total_edges, 8, /*use_inactive=*/true, /*forced_t0=*/1,
+                           /*ba_lm=*/1e-4f, /*ba_ep=*/0.1f, /*motion_only=*/false);
         }
 
-        // 5. Remove very old edges from warmup (matching PyTorch: ii < warmup-4)
+        // 5. Set next frame state (matching PyTorch _initialize lines 138-139)
+        // poses[t1] = poses[t1-1], disps[t1] = disps[t1-4:t1].mean()
+        CUDA_CHECK(cudaMemcpy(state.poses.data + N * 7,
+                              state.poses.data + (N-1) * 7,
+                              7 * sizeof(float), cudaMemcpyDeviceToDevice));
+        {
+            int start = std::max(0, N - 4);
+            int count = N - start;
+            std::vector<float> recent_disps(count * hw);
+            CUDA_CHECK(cudaMemcpy(recent_disps.data(), state.disps.data + start * hw,
+                                  count * hw * sizeof(float), cudaMemcpyDeviceToHost));
+            std::vector<float> mean_disp(hw, 0.0f);
+            for (int p = 0; p < hw; p++) {
+                for (int k = 0; k < count; k++)
+                    mean_disp[p] += recent_disps[k * hw + p];
+                mean_disp[p] /= count;
+            }
+            CUDA_CHECK(cudaMemcpy(state.disps.data + N * hw, mean_disp.data(),
+                                  hw * sizeof(float), cudaMemcpyHostToDevice));
+        }
+
+        // 6. Remove edges with ii < warmup-4 (store as inactive)
+        // Matching: self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
         {
             int n = (int)state.ii_host.size();
             std::vector<bool> mask(n, false);
@@ -1831,15 +1870,43 @@ struct CudaDroid {
             state.store_and_remove_edges(mask);
         }
 
-        // Initialize next frame's state
-        int last = N - 1;
-        CUDA_CHECK(cudaMemcpy(state.poses.data + N * 7,
-                              state.poses.data + last * 7,
-                              7 * sizeof(float), cudaMemcpyDeviceToDevice));
+        // 7. _init_next_state: overwrite disps[t1] with quantile(disps[t1-3:t1-1], 0.5)
+        // Matching: self.video.disps[self.t1] = quantile(disps[t1-3:t1-1], 0.5)
+        if (N >= 3) {
+            int start = N - 3;
+            int end = N - 1;  // exclusive
+            int count = end - start;
+            std::vector<float> recent_disps(count * hw);
+            CUDA_CHECK(cudaMemcpy(recent_disps.data(), state.disps.data + start * hw,
+                                  count * hw * sizeof(float), cudaMemcpyDeviceToHost));
+            std::vector<float> new_disp(hw);
+            for (int p = 0; p < hw; p++) {
+                std::vector<float> vals(count);
+                for (int k = 0; k < count; k++)
+                    vals[k] = recent_disps[k * hw + p];
+                std::sort(vals.begin(), vals.end());
+                new_disp[p] = 0.5f * (vals[0] + vals[1]);
+            }
+            CUDA_CHECK(cudaMemcpy(state.disps.data + N * hw, new_disp.data(),
+                                  hw * sizeof(float), cudaMemcpyHostToDevice));
+        }
 
         is_initialized = true;
-        printf("Initialization complete: %d keyframes, %d edges\n",
-               N, state.num_edges());
+
+        // Debug: print mean disparity per keyframe after initialization
+        {
+            std::vector<float> disps_dbg(N * hw);
+            CUDA_CHECK(cudaMemcpy(disps_dbg.data(), state.disps.data, N * hw * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            for (int k = 0; k < N; k++) {
+                float sum = 0;
+                for (int p = 0; p < hw; p++) sum += disps_dbg[k * hw + p];
+                fprintf(stderr, "  Init KF %d: mean_disp=%.4f\n", k, sum / hw);
+            }
+        }
+
+        printf("Initialization complete: %d keyframes, %d edges, %d inactive\n",
+               N, state.num_edges(), state.num_inac);
     }
 
     // Buffers for GRU-based motion filter (single edge)
@@ -1911,6 +1978,7 @@ struct CudaDroid {
     }
 
     // Process one frame with motion filtering and persistent edges
+    // Matches PyTorch DroidFrontend.__call__ → _update() → _init_next_state()
     void process_frame(int frame_t, float* bgr_hwc_gpu) {
         t_total.begin();
 
@@ -1942,13 +2010,26 @@ struct CudaDroid {
 
         // 5. Accept as keyframe
         state.add_keyframe(frame_t, enc_fmap.data, enc_net.data, enc_inp.data);
-        int new_kf = state.num_keyframes - 1;
+        int new_kf = state.num_keyframes - 1;  // = t1-1 in PyTorch terms
 
-        // 6. Add temporal edges + manage edge lifecycle
-        state.add_edges_for_keyframe(new_kf, edge_radius);
-        state.age_edges();
+        // 5b. Check if warmup reached — run initialization instead of normal _update
+        // Matching PyTorch: if not is_initialized and counter == warmup: _initialize()
+        if (!is_initialized && state.num_keyframes == warmup) {
+            run_initialization();
+            // Note: normalize() deferred to backend (matching PyTorch)
+            t_total.end();
+            return;
+        }
+        if (!is_initialized) {
+            // Not enough keyframes yet for initialization, just return
+            t_total.end();
+            return;
+        }
 
-        // Remove old edges based on age (store as inactive)
+        // === PyTorch _update() flow (factor_graph operations) ===
+
+        // 6. Remove old edges based on age (store as inactive) — BEFORE adding new
+        // Matching: self.graph.rm_factors(self.graph.age > self.max_age, store=True)
         {
             int n = (int)state.ii_host.size();
             if (n > 0) {
@@ -1959,15 +2040,12 @@ struct CudaDroid {
             }
         }
 
-        // Prune edges outside the frontend window
-        if (new_kf >= frontend_window) {
-            state.remove_old_edges(new_kf - frontend_window + 1, h * w);
-        }
-
-        // 7. Add proximity factors (matching PyTorch _update)
+        // 7. Add proximity factors (handles BOTH temporal + proximity edges)
+        // Matching: self.graph.add_proximity_factors(t1-5, max(t1-window,0), ...)
+        // PyTorch t1 = new_kf + 1 (after increment), so t1-5 = new_kf-4
         add_proximity_factors(
-            new_kf - 5,
-            std::max(new_kf - frontend_window, 0),
+            new_kf + 1 - 5,  // t1 - 5
+            std::max(new_kf + 1 - frontend_window, 0),  // max(t1 - window, 0)
             frontend_radius, frontend_nms,
             frontend_thresh, /*remove_old=*/true);
 
@@ -1975,10 +2053,12 @@ struct CudaDroid {
         int total_edges = state.num_edges();
         if (total_edges == 0) { t_total.end(); return; }
 
-        // 8. PyTorch pattern: iters1=3 optimization, prune check, iters2=2 if not pruned
-        run_update_pass(total_edges, 3);
+        // 8. iters1=3 optimization (each step ages edges, matching PyTorch)
+        run_update_pass(total_edges, 3, /*use_inactive=*/true, /*forced_t0=*/-1,
+                        /*ba_lm=*/1e-4f, /*ba_ep=*/0.1f, frontend_motion_only);
 
-        // 9. Keyframe pruning (matching PyTorch droid_frontend._update)
+        // 9. Keyframe pruning (matching PyTorch: distance([t1-4], [t1-2]))
+        // PyTorch t1 = new_kf + 1, so t1-4 = new_kf-3, t1-2 = new_kf-1
         bool pruned = false;
         int nk_now = state.num_keyframes;
         if (nk_now >= 4) {
@@ -1994,7 +2074,55 @@ struct CudaDroid {
         if (!pruned) {
             total_edges = state.num_edges();
             if (total_edges > 0)
-                run_update_pass(total_edges, 2);
+                run_update_pass(total_edges, 2, /*use_inactive=*/true, /*forced_t0=*/-1,
+                                /*ba_lm=*/1e-4f, /*ba_ep=*/0.1f, frontend_motion_only);
+        }
+
+        // 11. _init_next_state: set pose/disp for NEXT keyframe slot
+        // Matching PyTorch: poses[t1] = poses[t1-1], disps[t1] = quantile(disps[t1-3:t1-1], 0.5)
+        {
+            int N = state.num_keyframes;
+            // Copy pose from last keyframe to next slot
+            CUDA_CHECK(cudaMemcpy(state.poses.data + N * 7,
+                                  state.poses.data + (N-1) * 7,
+                                  7 * sizeof(float), cudaMemcpyDeviceToDevice));
+
+            // Set disparity for next slot: median of disps[N-3:N-1] (2 frames)
+            if (N >= 3) {
+                int start = N - 3;  // t1-3
+                int end = N - 1;    // t1-1 (exclusive in Python, so indices are [N-3, N-2])
+                int count = end - start;  // 2
+                std::vector<float> recent_disps(count * hw);
+                CUDA_CHECK(cudaMemcpy(recent_disps.data(), state.disps.data + start * hw,
+                                      count * hw * sizeof(float), cudaMemcpyDeviceToHost));
+                std::vector<float> new_disp(hw);
+                for (int p = 0; p < hw; p++) {
+                    std::vector<float> vals(count);
+                    for (int k = 0; k < count; k++)
+                        vals[k] = recent_disps[k * hw + p];
+                    std::sort(vals.begin(), vals.end());
+                    // quantile 0.5 of 2 elements = average
+                    new_disp[p] = 0.5f * (vals[0] + vals[1]);
+                }
+                CUDA_CHECK(cudaMemcpy(state.disps.data + N * hw, new_disp.data(),
+                                      hw * sizeof(float), cudaMemcpyHostToDevice));
+            } else if (N >= 1) {
+                // Not enough frames for quantile, copy from last
+                CUDA_CHECK(cudaMemcpy(state.disps.data + N * hw,
+                                      state.disps.data + (N-1) * hw,
+                                      hw * sizeof(float), cudaMemcpyDeviceToDevice));
+            }
+        }
+
+        // Debug: print mean disparity of latest keyframe
+        {
+            int N = state.num_keyframes;
+            std::vector<float> d(hw);
+            CUDA_CHECK(cudaMemcpy(d.data(), state.disps.data + (N-1) * hw, hw * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            float sum = 0; for (int p = 0; p < hw; p++) sum += d[p];
+            fprintf(stderr, "KF %d (frame %d): mean_disp=%.4f, edges=%d, inactive=%d\n",
+                   N-1, frame_t, sum/hw, state.num_edges(), state.num_inac);
         }
 
         t_total.end();
@@ -2018,29 +2146,23 @@ struct CudaDroid {
         coords0_buf.copyFrom(grid.data(), MAX_BATCH_EDGES * 2 * hw);
     }
 
-    // Run full DROID-SLAM update: 3 steps of [reproject + corr + GRU + BA]
-    void run_update_pass(int total_edges, int num_steps = 3) {
-        int hw = h * w;
+    // GPU buffers for combined active+inactive edges for BA
+    GpuIntBuf ba_ii_gpu, ba_jj_gpu;
+    GpuBuf ba_target, ba_weight;
 
-        // Load persistent edge hidden states into batch buffers (for all edges, batched)
-        // First, load inps (constant across steps)
-        for (int bs = 0; bs < total_edges; bs += MAX_BATCH_EDGES) {
-            int batch_size = std::min(MAX_BATCH_EDGES, total_edges - bs);
-            for (int e = 0; e < batch_size; e++) {
-                int ii_val = state.ii_host[bs + e];
-                CUDA_CHECK(cudaMemcpy(batch_inps.data + e * 128 * hw,
-                                      state.inps.data + ii_val * 128 * hw,
-                                      128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
-            }
-            // Store inp batch back to a persistent location (we'll re-load it each step)
-            // Actually, let's just re-gather inps each batch. They don't change.
-        }
+    // Run full DROID-SLAM update: N steps of [reproject + corr + GRU + BA]
+    // Matches PyTorch factor_graph.update() — each step includes edge aging
+    void run_update_pass(int total_edges, int num_steps = 3,
+                         bool use_inactive = true, int forced_t0 = -1,
+                         float ba_lm = 1e-4f, float ba_ep = 0.1f,
+                         bool motion_only = true) {
+        int hw = h * w;
 
         for (int step = 0; step < num_steps; step++) {
             t_corr.begin();
             t_update.begin();
 
-            // Process all edges in batches: reproject, correlate, GRU
+            // Process all active edges in batches: reproject, correlate, GRU
             for (int bs = 0; bs < total_edges; bs += MAX_BATCH_EDGES) {
                 int batch_size = std::min(MAX_BATCH_EDGES, total_edges - bs);
 
@@ -2059,19 +2181,10 @@ struct CudaDroid {
                 batch_build_and_sample_correlation(batch_size, bs,
                     batch_coords.data, batch_corr.data);
 
-                // 3. Compute motion: [flow, residual] = [coords1 - coords0, target - coords1]
-                // For step 0: target = coords1, so residual = 0, flow = coords1 - identity
-                // For step > 0: target was set in previous step, residual = target - coords1
+                // 4. Compute motion: [flow, residual]
                 {
-                    // flow channels 0,1: coords1 - coords0
-                    // flow channels 2,3: target - coords1 (zero for first step)
                     int total = batch_size * hw;
-                    // Compute on CPU for clarity (small data transfer)
                     CUDA_CHECK(cudaMemset(batch_motion.data, 0, batch_size * 4 * hw * sizeof(float)));
-
-                    // flow_x = coords1_x - pixel_x, flow_y = coords1_y - pixel_y
-                    // These are batched, and we already have batch_coords (coords1) and coords0_buf
-                    // Let's launch a kernel for this
                     compute_motion_kernel<<<(total+255)/256, 256>>>(
                         batch_motion.data,
                         batch_coords.data,
@@ -2080,7 +2193,7 @@ struct CudaDroid {
                         batch_size, hw);
                 }
 
-                // 4. Load hidden states and inps
+                // 5. Load hidden states and inps
                 for (int e = 0; e < batch_size; e++) {
                     CUDA_CHECK(cudaMemcpy(batch_nets.data + e * 128 * hw,
                                           state.edge_nets.data + (bs + e) * 128 * hw,
@@ -2091,15 +2204,15 @@ struct CudaDroid {
                                           128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
                 }
 
-                // 5. GRU update
+                // 6. GRU update (outputs agg_conv1 features instead of eta)
                 update.forward(cudnn,
                     batch_corr.data, batch_motion.data,
                     batch_nets.data, batch_inps.data,
-                    batch_delta.data, batch_weight.data, batch_eta.data,
+                    batch_delta.data, batch_weight.data, batch_agg1.data,
                     buf_a.data, buf_b.data, workspace.data,
                     batch_size, h, w);
 
-                // 6. target = coords1 + delta
+                // 7. target = coords1 + delta
                 {
                     int total = batch_size * 2 * hw;
                     compute_target_kernel<<<(total+255)/256, 256>>>(
@@ -2109,40 +2222,186 @@ struct CudaDroid {
                         batch_size, hw);
                 }
 
-
-                // 7. Save hidden states + per-keyframe damping
+                // 8. Save hidden states + copy agg_conv1 output to all_agg1
                 for (int e = 0; e < batch_size; e++) {
                     CUDA_CHECK(cudaMemcpy(state.edge_nets.data + (bs + e) * 128 * hw,
                                           batch_nets.data + e * 128 * hw,
                                           128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
-                    // Store GRU eta into per-keyframe damping (overwrite, matching PyTorch)
-                    int kf = state.ii_host[bs + e];
-                    CUDA_CHECK(cudaMemcpy(state.damping.data + kf * hw,
-                                          batch_eta.data + e * hw,
-                                          hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                    CUDA_CHECK(cudaMemcpy(all_agg1.data + (size_t)(bs + e) * 128 * hw,
+                                          batch_agg1.data + (size_t)e * 128 * hw,
+                                          128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
                 }
+            }
+
+            // GraphAgg scatter_mean: aggregate per-edge conv1 features to per-keyframe
+            {
+                size_t kf_feat_size = (size_t)128 * hw;
+                CUDA_CHECK(cudaMemset(kf_agg.data, 0,
+                    (size_t)state.num_keyframes * kf_feat_size * sizeof(float)));
+                std::vector<int> kf_count(state.num_keyframes, 0);
+
+                // Accumulate per-edge features into per-keyframe buffers
+                for (int e = 0; e < total_edges; e++) {
+                    int kf = state.ii_host[e];
+                    scale_add_kernel<<<(kf_feat_size+255)/256, 256>>>(
+                        kf_agg.data + kf * kf_feat_size,
+                        all_agg1.data + (size_t)e * kf_feat_size, 1.0f,
+                        (int)kf_feat_size);
+                    kf_count[kf]++;
+                }
+
+                // Divide by count (scatter_mean)
+                for (int kf = 0; kf < state.num_keyframes; kf++) {
+                    if (kf_count[kf] > 1) {
+                        float inv = 1.0f / (float)kf_count[kf];
+                        scale_add_kernel<<<(kf_feat_size+255)/256, 256>>>(
+                            kf_agg.data + kf * kf_feat_size,
+                            kf_agg.data + kf * kf_feat_size,
+                            inv - 1.0f, (int)kf_feat_size);
+                    }
+                }
+
+                // Run conv2 + relu + eta_conv + softplus on per-keyframe features
+                update.compute_eta(cudnn, kf_agg.data, kf_eta.data,
+                    buf_a.data, buf_b.data, workspace.data,
+                    state.num_keyframes, h, w);
+
+                // Copy eta to damping buffer
+                CUDA_CHECK(cudaMemcpy(state.damping.data, kf_eta.data,
+                    (size_t)state.num_keyframes * hw * sizeof(float),
+                    cudaMemcpyDeviceToDevice));
             }
 
             t_corr.end();
             t_update.end();
 
-
-            // 8. BA with active edges only, t0=1
+            // 9. Dynamic t0 (matching PyTorch: t0 = max(1, ii.min()+1))
             t_ba.begin();
-            int t0_ba = 1;
+            int t0_ba;
+            if (forced_t0 >= 0) {
+                t0_ba = forced_t0;
+            } else {
+                int min_ii = state.num_keyframes;
+                for (int e = 0; e < total_edges; e++)
+                    min_ii = std::min(min_ii, state.ii_host[e]);
+                t0_ba = std::max(1, min_ii + 1);
+            }
             int t1_ba = state.num_keyframes;
 
-            for (int ba_iter = 0; ba_iter < 2; ba_iter++) {
-                ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
-                           state.target.data, state.weight.data,
-                           state.damping.data,
-                           state.ii_gpu.data, state.jj_gpu.data,
-                           state.ii_host.data(), state.jj_host.data(),
-                           total_edges, t0_ba, t1_ba,
-                           1e-4f, 0.1f, true);
+            // 10. Build combined active + inactive edge set for BA
+            std::vector<int> ba_ii_h, ba_jj_h;
+            int ba_total;
+
+            if (use_inactive && state.num_inac > 0) {
+                // Filter inactive edges: both endpoints >= t0-3 (matching PyTorch)
+                ba_ii_h = state.ii_host;
+                ba_jj_h = state.jj_host;
+                for (int e = 0; e < state.num_inac; e++) {
+                    if (state.ii_inac[e] >= t0_ba - 3 && state.jj_inac[e] >= t0_ba - 3) {
+                        ba_ii_h.push_back(state.ii_inac[e]);
+                        ba_jj_h.push_back(state.jj_inac[e]);
+                    }
+                }
+                ba_total = (int)ba_ii_h.size();
+
+                // Upload combined edges
+                ba_ii_gpu.alloc(ba_total);
+                ba_jj_gpu.alloc(ba_total);
+                ba_ii_gpu.copyFrom(ba_ii_h.data(), ba_total);
+                ba_jj_gpu.copyFrom(ba_jj_h.data(), ba_total);
+
+                // Upload combined target/weight (active first, then inactive)
+                ba_target.alloc(ba_total * 2 * hw);
+                ba_weight.alloc(ba_total * 2 * hw);
+                // Copy active edges' target/weight
+                CUDA_CHECK(cudaMemcpy(ba_target.data, state.target.data,
+                                      total_edges * 2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(ba_weight.data, state.weight.data,
+                                      total_edges * 2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                // Copy filtered inactive edges' target/weight
+                int inac_count = 0;
+                for (int e = 0; e < state.num_inac; e++) {
+                    if (state.ii_inac[e] >= t0_ba - 3 && state.jj_inac[e] >= t0_ba - 3) {
+                        CUDA_CHECK(cudaMemcpy(ba_target.data + (total_edges + inac_count) * 2 * hw,
+                                              state.target_inac.data + e * 2 * hw,
+                                              2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                        CUDA_CHECK(cudaMemcpy(ba_weight.data + (total_edges + inac_count) * 2 * hw,
+                                              state.weight_inac.data + e * 2 * hw,
+                                              2 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                        inac_count++;
+                    }
+                }
+
+                for (int ba_iter = 0; ba_iter < 2; ba_iter++) {
+                    ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
+                               ba_target.data, ba_weight.data,
+                               state.damping.data,
+                               ba_ii_gpu.data, ba_jj_gpu.data,
+                               ba_ii_h.data(), ba_jj_h.data(),
+                               ba_total, t0_ba, t1_ba,
+                               ba_lm, ba_ep, motion_only);
+                }
+            } else {
+                for (int ba_iter = 0; ba_iter < 2; ba_iter++) {
+                    ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
+                               state.target.data, state.weight.data,
+                               state.damping.data,
+                               state.ii_gpu.data, state.jj_gpu.data,
+                               state.ii_host.data(), state.jj_host.data(),
+                               total_edges, t0_ba, t1_ba,
+                               ba_lm, ba_ep, motion_only);
+                }
             }
             t_ba.end();
+
+            // 11. Age all active edges (matching PyTorch: self.age += 1 at end of update)
+            // PyTorch ages once per graph.update() call. With iters1+iters2=5 calls per frame,
+            // edges age 5 per frame. We age once per step in run_update_pass, matching this.
+            state.age_edges();
         }
+    }
+
+    // Convenience: run_update_pass without aging (for initialization)
+    void run_update_pass_no_age(int total_edges, int num_steps = 3,
+                                bool use_inactive = true, int forced_t0 = -1,
+                                float ba_lm = 1e-4f, float ba_ep = 0.1f,
+                                bool motion_only = true) {
+        std::vector<int> saved_ages = state.edge_age;
+        run_update_pass(total_edges, num_steps, use_inactive, forced_t0, ba_lm, ba_ep, motion_only);
+        state.edge_age = saved_ages;
+    }
+
+    // Normalize depth and poses (matching PyTorch video.normalize())
+    void normalize() {
+        int N = state.num_keyframes;
+        int hw = h * w;
+        if (N < 1) return;
+
+        // Compute mean disparity across all keyframes
+        std::vector<float> disps_h(N * hw);
+        CUDA_CHECK(cudaMemcpy(disps_h.data(), state.disps.data, N * hw * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        double sum = 0;
+        for (int i = 0; i < N * hw; i++) sum += disps_h[i];
+        float s = (float)(sum / (N * hw));
+        if (s < 1e-8f) return;
+
+        // Scale disparities: disps /= s
+        for (int i = 0; i < N * hw; i++) disps_h[i] /= s;
+        CUDA_CHECK(cudaMemcpy(state.disps.data, disps_h.data(), N * hw * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        // Scale translations: poses[:, :3] *= s
+        std::vector<float> poses_h(N * 7);
+        CUDA_CHECK(cudaMemcpy(poses_h.data(), state.poses.data, N * 7 * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        for (int i = 0; i < N; i++) {
+            poses_h[i*7 + 0] *= s;
+            poses_h[i*7 + 1] *= s;
+            poses_h[i*7 + 2] *= s;
+        }
+        CUDA_CHECK(cudaMemcpy(state.poses.data, poses_h.data(), N * 7 * sizeof(float),
+                              cudaMemcpyHostToDevice));
     }
 
     // Backend optimization: rebuild dense edges and run multiple update+BA iterations
@@ -2151,16 +2410,21 @@ struct CudaDroid {
         int hw = h * w;
         if (N < 3) return;
 
+        // Normalize (matching PyTorch backend: normalize before optimization)
+        normalize();
+
         printf("Backend: %d iterations, radius %d, %d keyframes\n", iters, radius, N);
 
         // Build dense proximity edges (replacing frontend edges)
         state.ii_host.clear();
         state.jj_host.clear();
+        state.edge_age.clear();
         for (int i = 0; i < N; i++) {
             for (int j = std::max(0, i - radius); j < std::min(N, i + radius + 1); j++) {
                 if (i != j) {
                     state.ii_host.push_back(i);
                     state.jj_host.push_back(j);
+                    state.edge_age.push_back(0);
                 }
             }
         }
@@ -2175,18 +2439,11 @@ struct CudaDroid {
                                   128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
         }
 
+        // Backend uses update_lowmem pattern: each iteration = 1 step of GRU+BA
+        // Matching PyTorch: lm=1e-5, ep=1e-2, motion_only=false, t0=1
         for (int iter = 0; iter < iters; iter++) {
-            // Run update pass: corr + GRU on all edges (batched)
-            run_update_pass(total_edges);
-
-            // BA with ALL edges
-            ba.iterate(state.poses.data, state.disps.data, state.intrinsics.data,
-                       state.target.data, state.weight.data,
-                       state.damping.data,
-                       state.ii_gpu.data, state.jj_gpu.data,
-                       state.ii_host.data(), state.jj_host.data(),
-                       total_edges, 1, N,
-                       1e-5f, 1e-2f, true);
+            run_update_pass(total_edges, 1, /*use_inactive=*/false, /*forced_t0=*/1,
+                           /*ba_lm=*/1e-5f, /*ba_ep=*/1e-2f, /*motion_only=*/false);
         }
         printf("Backend done\n");
     }

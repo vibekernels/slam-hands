@@ -382,18 +382,41 @@ struct BundleAdjustment {
                               cudaMemcpyHostToDevice));
     }
 
-    // Solve dense linear system S * x = b via Cholesky on GPU
-    // S: [N, N], b: [N, 1], result in b
-    void cholesky_solve(float* S_gpu, float* b_gpu, int N) {
-        int lwork = 0;
-        cusolverDnSpotrf_bufferSize(cusolver, CUBLAS_FILL_MODE_LOWER,
-                                    N, S_gpu, N, &lwork);
-        workspace_cusolver.alloc(lwork);
-        cusolverDnSpotrf(cusolver, CUBLAS_FILL_MODE_LOWER,
-                         N, S_gpu, N,
-                         workspace_cusolver.data, lwork, devInfo);
-        cusolverDnSpotrs(cusolver, CUBLAS_FILL_MODE_LOWER,
-                         N, 1, S_gpu, N, b_gpu, N, devInfo);
+    // Solve dense linear system S * x = b via Cholesky on CPU in double precision
+    // (matching PyTorch's Eigen float64 solver)
+    void cholesky_solve_double(std::vector<double>& S, std::vector<double>& b, int N,
+                               std::vector<float>& dx_out) {
+        // Simple Cholesky LLT factorization
+        // L is stored in lower triangle of S (in-place)
+        for (int j = 0; j < N; j++) {
+            double sum = 0;
+            for (int k = 0; k < j; k++)
+                sum += S[j*N+k] * S[j*N+k];
+            S[j*N+j] = sqrt(S[j*N+j] - sum);
+            for (int i = j+1; i < N; i++) {
+                double sum2 = 0;
+                for (int k = 0; k < j; k++)
+                    sum2 += S[i*N+k] * S[j*N+k];
+                S[i*N+j] = (S[i*N+j] - sum2) / S[j*N+j];
+            }
+        }
+        // Forward substitution: L*y = b
+        for (int i = 0; i < N; i++) {
+            double sum = 0;
+            for (int k = 0; k < i; k++)
+                sum += S[i*N+k] * b[k];
+            b[i] = (b[i] - sum) / S[i*N+i];
+        }
+        // Back substitution: L^T*x = y
+        for (int i = N-1; i >= 0; i--) {
+            double sum = 0;
+            for (int k = i+1; k < N; k++)
+                sum += S[k*N+i] * b[k];
+            b[i] = (b[i] - sum) / S[i*N+i];
+        }
+        dx_out.resize(N);
+        for (int i = 0; i < N; i++)
+            dx_out[i] = (float)b[i];
     }
 
     // Run one BA iteration
@@ -428,11 +451,10 @@ struct BundleAdjustment {
             M, H, W);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Assemble global Hessian on CPU (simpler for first version)
-        // H is [P, P, 6, 6] dense
+        // Assemble global Hessian on CPU in DOUBLE precision (matching PyTorch's Eigen solver)
         int S_size = P * 6;
-        std::vector<float> S_host(S_size * S_size, 0.0f);
-        std::vector<float> b_host(S_size, 0.0f);
+        std::vector<double> S_host(S_size * S_size, 0.0);
+        std::vector<double> b_host(S_size, 0.0);
 
         // Download Hs and vs
         std::vector<float> Hs_host(4 * M * 36);
@@ -441,9 +463,6 @@ struct BundleAdjustment {
         vs_buf.copyTo(vs_host.data(), 2 * M * 6);
 
         // Scatter Hessian blocks into global matrix
-        // Edges may reference fixed poses (index < t0), which are out of range.
-        // Like PyTorch, we skip contributions where the index is out-of-range,
-        // but keep contributions where only one endpoint is out-of-range.
         for (int e = 0; e < M; e++) {
             int i_idx = ii_host[e] - t0;
             int j_idx = jj_host[e] - t0;
@@ -451,38 +470,32 @@ struct BundleAdjustment {
             bool j_valid = (j_idx >= 0 && j_idx < P);
             if (!i_valid && !j_valid) continue;
 
-            // H[ii,ii] += Hs[0, e]
             if (i_valid)
                 for (int r = 0; r < 6; r++)
                     for (int c = 0; c < 6; c++)
-                        S_host[(i_idx*6+r)*S_size + (i_idx*6+c)] += Hs_host[0*M*36 + e*36 + r*6 + c];
+                        S_host[(i_idx*6+r)*S_size + (i_idx*6+c)] += (double)Hs_host[0*M*36 + e*36 + r*6 + c];
 
-            // H[ii,jj] += Hs[1, e]
             if (i_valid && j_valid)
                 for (int r = 0; r < 6; r++)
                     for (int c = 0; c < 6; c++)
-                        S_host[(i_idx*6+r)*S_size + (j_idx*6+c)] += Hs_host[1*M*36 + e*36 + r*6 + c];
+                        S_host[(i_idx*6+r)*S_size + (j_idx*6+c)] += (double)Hs_host[1*M*36 + e*36 + r*6 + c];
 
-            // H[jj,ii] += Hs[2, e]
             if (i_valid && j_valid)
                 for (int r = 0; r < 6; r++)
                     for (int c = 0; c < 6; c++)
-                        S_host[(j_idx*6+r)*S_size + (i_idx*6+c)] += Hs_host[2*M*36 + e*36 + r*6 + c];
+                        S_host[(j_idx*6+r)*S_size + (i_idx*6+c)] += (double)Hs_host[2*M*36 + e*36 + r*6 + c];
 
-            // H[jj,jj] += Hs[3, e]
             if (j_valid)
                 for (int r = 0; r < 6; r++)
                     for (int c = 0; c < 6; c++)
-                        S_host[(j_idx*6+r)*S_size + (j_idx*6+c)] += Hs_host[3*M*36 + e*36 + r*6 + c];
+                        S_host[(j_idx*6+r)*S_size + (j_idx*6+c)] += (double)Hs_host[3*M*36 + e*36 + r*6 + c];
 
-            // b[ii] += vs[0, e]
             if (i_valid)
                 for (int n = 0; n < 6; n++)
-                    b_host[i_idx*6+n] += vs_host[0*M*6 + e*6 + n];
-            // b[jj] += vs[1, e]
+                    b_host[i_idx*6+n] += (double)vs_host[0*M*6 + e*6 + n];
             if (j_valid)
                 for (int n = 0; n < 6; n++)
-                    b_host[j_idx*6+n] += vs_host[1*M*6 + e*6 + n];
+                    b_host[j_idx*6+n] += (double)vs_host[1*M*6 + e*6 + n];
         }
 
         if (!motion_only) {
@@ -556,17 +569,17 @@ struct BundleAdjustment {
                 // Subtract Schur complement: S -= E * Q * E^T, b -= E * Q * w
                 for (auto& [p1, E1] : pose_E_list) {
                     for (int n = 0; n < 6; n++) {
-                        float sum = 0;
+                        double sum = 0;
                         for (int d = 0; d < HW; d++)
-                            sum += E1[n * HW + d] * Q_k[d] * w_k[d];
+                            sum += (double)E1[n * HW + d] * (double)Q_k[d] * (double)w_k[d];
                         b_host[p1 * 6 + n] -= sum;
                     }
                     for (auto& [p2, E2] : pose_E_list) {
                         for (int n = 0; n < 6; n++) {
                             for (int m = 0; m < 6; m++) {
-                                float sum = 0;
+                                double sum = 0;
                                 for (int d = 0; d < HW; d++)
-                                    sum += E1[n * HW + d] * Q_k[d] * E2[m * HW + d];
+                                    sum += (double)E1[n * HW + d] * (double)Q_k[d] * (double)E2[m * HW + d];
                                 S_host[(p1*6+n) * S_size + (p2*6+m)] -= sum;
                             }
                         }
@@ -575,31 +588,24 @@ struct BundleAdjustment {
             }
         }
 
-        // Add damping
+        // Add damping (in double)
         for (int i = 0; i < S_size; i++)
-            S_host[i*S_size + i] += ep + lm * S_host[i*S_size + i];
+            S_host[i*S_size + i] += (double)ep + (double)lm * S_host[i*S_size + i];
 
-        // Upload and solve
-        S_buf.alloc(S_size * S_size);
-        b_buf.alloc(S_size);
-        S_buf.copyFrom(S_host.data(), S_size * S_size);
-        b_buf.copyFrom(b_host.data(), S_size);
-
-        cholesky_solve(S_buf.data, b_buf.data, S_size);
+        // Solve in double precision on CPU
+        std::vector<float> dx_f32;
+        cholesky_solve_double(S_host, b_host, S_size, dx_f32);
 
         // Apply pose retraction
         dx_buf.alloc(P * 6);
-        CUDA_CHECK(cudaMemcpy(dx_buf.data, b_buf.data, P * 6 * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(dx_buf.data, dx_f32.data(), P * 6 * sizeof(float),
+                              cudaMemcpyHostToDevice));
         pose_retr_kernel<<<1, BA_THREADS>>>(poses, dx_buf.data, t0, t1);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         if (!motion_only) {
             // Back-substitute for depth updates: dz = Q * (w - E^T * dx)
-            // Download dx
-            std::vector<float> dx_h(P * 6);
-            CUDA_CHECK(cudaMemcpy(dx_h.data(), dx_buf.data, P * 6 * sizeof(float),
-                                  cudaMemcpyDeviceToHost));
+            std::vector<float>& dx_h = dx_f32;
 
             // Re-download per-edge Eii, Eij, Cii, bz for back-substitution
             std::vector<float> Eii_h(M * 6 * HW), Eij_h(M * 6 * HW);
@@ -614,8 +620,9 @@ struct BundleAdjustment {
                                   cudaMemcpyDeviceToHost));
 
             // For each depth keyframe k, compute dz[k]
+            // Include ALL keyframes referenced by edges (matching PyTorch's kx)
             std::vector<float> all_dz(t1 * HW, 0);
-            for (int k = t0; k < t1; k++) {
+            for (int k = 0; k < t1; k++) {
                 int k_idx = k - t0;
 
                 std::vector<int> k_edges;
@@ -672,12 +679,18 @@ struct BundleAdjustment {
             CUDA_CHECK(cudaMemcpy(disps_h.data(), disps, t1 * HW * sizeof(float),
                                   cudaMemcpyDeviceToHost));
 
-            for (int k = t0; k < t1; k++) {
+            // Update ALL keyframes that had dz computed (matching PyTorch)
+            for (int k = 0; k < t1; k++) {
+                // Only update keyframes that had edges
+                bool has_edges = false;
+                for (int e = 0; e < M; e++) {
+                    if (ii_host[e] == k) { has_edges = true; break; }
+                }
+                if (!has_edges) continue;
+
                 for (int d = 0; d < HW; d++) {
                     float val = disps_h[k * HW + d] + all_dz[k * HW + d];
-                    val = fmaxf(0.001f, val);
-                    if (val > 10.0f) val = 0.0f;
-                    disps_h[k * HW + d] = val;
+                    disps_h[k * HW + d] = fmaxf(0.001f, val);
                 }
             }
 
