@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <numeric>
 #include <set>
+#include <map>
 #include <chrono>
 
 #include <cuda.h>
@@ -647,10 +648,14 @@ struct UpdateModule {
                      float* temp1, float* temp2, float* workspace,
                      int num_kf, int h, int w) {
         int HW = h * w;
+        // Round scatter_mean output to FP16 (PyTorch stays FP16 throughout GraphAgg)
+        round_to_fp16(agg_features, num_kf * 128 * HW);
         agg_conv2.forward(cudnn, agg_features, temp1, workspace, num_kf, h, w);
         relu_inplace(temp1, num_kf * 128 * HW);
+        round_to_fp16(temp1, num_kf * 128 * HW);  // conv2 output is FP16 under autocast
         agg_eta_0.forward(cudnn, temp1, eta_out, workspace, num_kf, h, w);
-        softplus_inplace(eta_out, num_kf * 1 * HW, 0.01f);
+        round_to_fp16(eta_out, num_kf * 1 * HW);  // eta_conv output is FP16 under autocast
+        softplus_inplace(eta_out, num_kf * 1 * HW, 0.01f);  // 0.01 * softplus (matching PyTorch GraphAgg return)
     }
 };
 
@@ -1263,6 +1268,12 @@ __global__ void compute_motion_kernel(
     motion[e * 4 * HW + 3 * HW + k] = fminf(fmaxf(ty - c1y, -64.0f), 64.0f);
 }
 
+// Clamp disparities to minimum value
+__global__ void clamp_disps_kernel(float* disps, int n, float min_val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) disps[idx] = fmaxf(disps[idx], min_val);
+}
+
 // Compute target = coords + delta (first 2 channels of delta)
 // Also extract weight (first 2 channels of weight output)
 __global__ void compute_target_kernel(
@@ -1645,20 +1656,23 @@ struct CudaDroid {
                                        const std::vector<int>& pairs_jj,
                                        std::vector<float>& dists) {
         int n = (int)pairs_ii.size();
+        dists.resize(n);
         if (n == 0) return;
-        int batch = std::min(n, MAX_DIST_PAIRS);
-        dist_ii.copyFrom(pairs_ii.data(), batch);
-        dist_jj.copyFrom(pairs_jj.data(), batch);
 
-        frame_distance_kernel<<<batch, 256>>>(
-            state.poses.data, state.disps.data, state.intrinsics.data,
-            dist_ii.data, dist_jj.data, dist_buf.data,
-            batch, h, w, beta);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        for (int offset = 0; offset < n; offset += MAX_DIST_PAIRS) {
+            int batch = std::min(MAX_DIST_PAIRS, n - offset);
+            dist_ii.copyFrom(pairs_ii.data() + offset, batch);
+            dist_jj.copyFrom(pairs_jj.data() + offset, batch);
 
-        dists.resize(batch);
-        CUDA_CHECK(cudaMemcpy(dists.data(), dist_buf.data, batch * sizeof(float),
-                              cudaMemcpyDeviceToHost));
+            frame_distance_kernel<<<batch, 256>>>(
+                state.poses.data, state.disps.data, state.intrinsics.data,
+                dist_ii.data, dist_jj.data, dist_buf.data,
+                batch, h, w, beta);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            CUDA_CHECK(cudaMemcpy(dists.data() + offset, dist_buf.data,
+                                  batch * sizeof(float), cudaMemcpyDeviceToHost));
+        }
     }
 
     // Add proximity factors (matching PyTorch add_proximity_factors)
@@ -1785,8 +1799,10 @@ struct CudaDroid {
     float frontend_thresh = 16.0f;
     int frontend_radius = 2;
     int frontend_nms = 1;
+    float backend_thresh = 22.0f;
+    int backend_nms = 3;
     bool is_initialized = false;
-    bool frontend_motion_only = true;  // Use motion-only in frontend, full BA only in init+backend
+    bool frontend_motion_only = false;  // Full BA (poses + disparity) in frontend, matching PyTorch
 
     // Run heavy initialization (matching PyTorch _initialize + _init_next_state)
     // Called once when warmup keyframes are reached
@@ -1893,18 +1909,6 @@ struct CudaDroid {
 
         is_initialized = true;
 
-        // Debug: print mean disparity per keyframe after initialization
-        {
-            std::vector<float> disps_dbg(N * hw);
-            CUDA_CHECK(cudaMemcpy(disps_dbg.data(), state.disps.data, N * hw * sizeof(float),
-                                  cudaMemcpyDeviceToHost));
-            for (int k = 0; k < N; k++) {
-                float sum = 0;
-                for (int p = 0; p < hw; p++) sum += disps_dbg[k * hw + p];
-                fprintf(stderr, "  Init KF %d: mean_disp=%.4f\n", k, sum / hw);
-            }
-        }
-
         printf("Initialization complete: %d keyframes, %d edges, %d inactive\n",
                N, state.num_edges(), state.num_inac);
     }
@@ -1922,7 +1926,7 @@ struct CudaDroid {
         mf_inps.alloc(128 * hw);
         mf_delta.alloc(3 * hw);
         mf_weight.alloc(3 * hw);
-        mf_eta.alloc(hw);
+        mf_eta.alloc(128 * hw);  // agg_conv1 outputs 128 channels, not 1
     }
 
     // Compute GRU-predicted optical flow between last keyframe and current frame
@@ -1938,15 +1942,15 @@ struct CudaDroid {
         std::vector<float> grid(2 * hw);
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) {
-                grid[0 * h * w + y * w + x] = (float)x;  // x channel
-                grid[1 * h * w + y * w + x] = (float)y;  // y channel
+                grid[0 * h * w + y * w + x] = (float)x;
+                grid[1 * h * w + y * w + x] = (float)y;
             }
         mf_coords.copyFrom(grid.data(), 2 * hw);
 
         // Sample correlation at identity coords
         sample_correlation(mf_coords.data, mf_corr.data);
 
-        // Initialize nets from last keyframe, inps from last keyframe
+        // Initialize nets/inps from last keyframe
         CUDA_CHECK(cudaMemcpy(mf_nets.data, state.nets.data + last_kf_idx * 128 * hw,
                               128 * hw * sizeof(float), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(mf_inps.data, state.inps.data + last_kf_idx * 128 * hw,
@@ -1974,6 +1978,7 @@ struct CudaDroid {
             float dy = delta_host[1 * hw + k];
             sum_mag += sqrtf(dx * dx + dy * dy);
         }
+
         return sum_mag / hw;
     }
 
@@ -2004,8 +2009,15 @@ struct CudaDroid {
 
         // Skip frame if not enough motion (no warmup bypass — matching PyTorch)
         if (flow < filter_thresh) {
+            if (frame_t < 45 || frame_t % 50 == 0)
+                fprintf(stderr, "  SKIP frame %d: flow=%.4f < thresh=%.1f (last_kf=%d, nk=%d)\n",
+                        frame_t, flow, filter_thresh, nk-1, nk);
             t_total.end();
             return;  // Not enough motion, skip
+        } else {
+            if (frame_t < 45 || frame_t % 50 == 0)
+                fprintf(stderr, "  ACCEPT frame %d: flow=%.4f > thresh=%.1f\n",
+                        frame_t, flow, filter_thresh);
         }
 
         // 5. Accept as keyframe
@@ -2087,11 +2099,13 @@ struct CudaDroid {
                                   state.poses.data + (N-1) * 7,
                                   7 * sizeof(float), cudaMemcpyDeviceToDevice));
 
-            // Set disparity for next slot: median of disps[N-3:N-1] (2 frames)
-            if (N >= 3) {
-                int start = N - 3;  // t1-3
-                int end = N - 1;    // t1-1 (exclusive in Python, so indices are [N-3, N-2])
-                int count = end - start;  // 2
+            // Set disparity for next slot: quantile(0.7) of disps[N-4:N-1] (3 frames)
+            // Matching PyTorch: disps[t1] = quantile(disps[t1-depth_window-1:t1-1], 0.7)
+            // where depth_window=3, so disps[t1-4:t1-1]
+            if (N >= 4) {
+                int start = N - 4;  // t1 - depth_window - 1
+                int end = N - 1;    // t1 - 1 (exclusive)
+                int count = end - start;  // 3
                 std::vector<float> recent_disps(count * hw);
                 CUDA_CHECK(cudaMemcpy(recent_disps.data(), state.disps.data + start * hw,
                                       count * hw * sizeof(float), cudaMemcpyDeviceToHost));
@@ -2101,9 +2115,22 @@ struct CudaDroid {
                     for (int k = 0; k < count; k++)
                         vals[k] = recent_disps[k * hw + p];
                     std::sort(vals.begin(), vals.end());
-                    // quantile 0.5 of 2 elements = average
-                    new_disp[p] = 0.5f * (vals[0] + vals[1]);
+                    // quantile 0.7 of 3 sorted values: index = 0.7*(3-1) = 1.4
+                    // interpolate between vals[1] and vals[2]
+                    new_disp[p] = vals[1] + 0.4f * (vals[2] - vals[1]);
                 }
+                CUDA_CHECK(cudaMemcpy(state.disps.data + N * hw, new_disp.data(),
+                                      hw * sizeof(float), cudaMemcpyHostToDevice));
+            } else if (N >= 3) {
+                // Fallback: median of 2 frames
+                int start = N - 3;
+                int count = 2;
+                std::vector<float> recent_disps(count * hw);
+                CUDA_CHECK(cudaMemcpy(recent_disps.data(), state.disps.data + start * hw,
+                                      count * hw * sizeof(float), cudaMemcpyDeviceToHost));
+                std::vector<float> new_disp(hw);
+                for (int p = 0; p < hw; p++)
+                    new_disp[p] = 0.5f * (recent_disps[0 * hw + p] + recent_disps[1 * hw + p]);
                 CUDA_CHECK(cudaMemcpy(state.disps.data + N * hw, new_disp.data(),
                                       hw * sizeof(float), cudaMemcpyHostToDevice));
             } else if (N >= 1) {
@@ -2112,17 +2139,6 @@ struct CudaDroid {
                                       state.disps.data + (N-1) * hw,
                                       hw * sizeof(float), cudaMemcpyDeviceToDevice));
             }
-        }
-
-        // Debug: print mean disparity of latest keyframe
-        {
-            int N = state.num_keyframes;
-            std::vector<float> d(hw);
-            CUDA_CHECK(cudaMemcpy(d.data(), state.disps.data + (N-1) * hw, hw * sizeof(float),
-                                  cudaMemcpyDeviceToHost));
-            float sum = 0; for (int p = 0; p < hw; p++) sum += d[p];
-            fprintf(stderr, "KF %d (frame %d): mean_disp=%.4f, edges=%d, inactive=%d\n",
-                   N-1, frame_t, sum/hw, state.num_edges(), state.num_inac);
         }
 
         t_total.end();
@@ -2157,6 +2173,9 @@ struct CudaDroid {
                          float ba_lm = 1e-4f, float ba_ep = 0.1f,
                          bool motion_only = true) {
         int hw = h * w;
+
+        // Ensure all_agg1 is large enough for total_edges (backend may exceed max_factors)
+        all_agg1.alloc((size_t)total_edges * 128 * hw);
 
         for (int step = 0; step < num_steps; step++) {
             t_corr.begin();
@@ -2234,42 +2253,59 @@ struct CudaDroid {
             }
 
             // GraphAgg scatter_mean: aggregate per-edge conv1 features to per-keyframe
+            // Only process keyframes that appear in active edges (matching PyTorch:
+            // self.damping[torch.unique(self.ii)] = damping — only active edge keyframes updated)
             {
                 size_t kf_feat_size = (size_t)128 * hw;
-                CUDA_CHECK(cudaMemset(kf_agg.data, 0,
-                    (size_t)state.num_keyframes * kf_feat_size * sizeof(float)));
-                std::vector<int> kf_count(state.num_keyframes, 0);
 
-                // Accumulate per-edge features into per-keyframe buffers
+                // Find unique keyframes in active edge set
+                std::set<int> active_kf_set;
+                for (int e = 0; e < total_edges; e++)
+                    active_kf_set.insert(state.ii_host[e]);
+                std::vector<int> active_kfs(active_kf_set.begin(), active_kf_set.end());
+                int num_active_kf = (int)active_kfs.size();
+
+                // Build compact scatter_mean: map active_kf -> contiguous index
+                CUDA_CHECK(cudaMemset(kf_agg.data, 0,
+                    (size_t)num_active_kf * kf_feat_size * sizeof(float)));
+                std::vector<int> kf_count(num_active_kf, 0);
+                std::map<int, int> kf_to_compact;
+                for (int i = 0; i < num_active_kf; i++)
+                    kf_to_compact[active_kfs[i]] = i;
+
+                // Accumulate per-edge features into compact per-keyframe buffers
                 for (int e = 0; e < total_edges; e++) {
-                    int kf = state.ii_host[e];
+                    int compact_idx = kf_to_compact[state.ii_host[e]];
                     scale_add_kernel<<<(kf_feat_size+255)/256, 256>>>(
-                        kf_agg.data + kf * kf_feat_size,
+                        kf_agg.data + compact_idx * kf_feat_size,
                         all_agg1.data + (size_t)e * kf_feat_size, 1.0f,
                         (int)kf_feat_size);
-                    kf_count[kf]++;
+                    kf_count[compact_idx]++;
                 }
 
                 // Divide by count (scatter_mean)
-                for (int kf = 0; kf < state.num_keyframes; kf++) {
-                    if (kf_count[kf] > 1) {
-                        float inv = 1.0f / (float)kf_count[kf];
+                for (int i = 0; i < num_active_kf; i++) {
+                    if (kf_count[i] > 1) {
+                        float inv = 1.0f / (float)kf_count[i];
                         scale_add_kernel<<<(kf_feat_size+255)/256, 256>>>(
-                            kf_agg.data + kf * kf_feat_size,
-                            kf_agg.data + kf * kf_feat_size,
+                            kf_agg.data + i * kf_feat_size,
+                            kf_agg.data + i * kf_feat_size,
                             inv - 1.0f, (int)kf_feat_size);
                     }
                 }
 
-                // Run conv2 + relu + eta_conv + softplus on per-keyframe features
+                // Run conv2 + relu + eta_conv + softplus only on active keyframes
                 update.compute_eta(cudnn, kf_agg.data, kf_eta.data,
                     buf_a.data, buf_b.data, workspace.data,
-                    state.num_keyframes, h, w);
+                    num_active_kf, h, w);
 
-                // Copy eta to damping buffer
-                CUDA_CHECK(cudaMemcpy(state.damping.data, kf_eta.data,
-                    (size_t)state.num_keyframes * hw * sizeof(float),
-                    cudaMemcpyDeviceToDevice));
+                // Copy eta only for active keyframes (leave others unchanged)
+                for (int i = 0; i < num_active_kf; i++) {
+                    int kf = active_kfs[i];
+                    CUDA_CHECK(cudaMemcpy(state.damping.data + kf * hw,
+                                          kf_eta.data + i * hw,
+                                          hw * sizeof(float), cudaMemcpyDeviceToDevice));
+                }
             }
 
             t_corr.end();
@@ -2352,6 +2388,13 @@ struct CudaDroid {
                                ba_lm, ba_ep, motion_only);
                 }
             }
+            // Clamp disparities after BA iterations (matching PyTorch disps.clamp_(min=0.001))
+            if (!motion_only) {
+                int t1_clamp = state.num_keyframes;
+                clamp_disps_kernel<<<(t1_clamp * hw + 255) / 256, 256>>>(
+                    state.disps.data, t1_clamp * hw, 0.001f);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
             t_ba.end();
 
             // 11. Age all active edges (matching PyTorch: self.age += 1 at end of update)
@@ -2404,7 +2447,7 @@ struct CudaDroid {
                               cudaMemcpyHostToDevice));
     }
 
-    // Backend optimization: rebuild dense edges and run multiple update+BA iterations
+    // Backend optimization: rebuild edges using add_proximity_factors and run update+BA
     void backend(int iters, int radius = 2) {
         int N = state.num_keyframes;
         int hw = h * w;
@@ -2415,21 +2458,20 @@ struct CudaDroid {
 
         printf("Backend: %d iterations, radius %d, %d keyframes\n", iters, radius, N);
 
-        // Build dense proximity edges (replacing frontend edges)
+        // Clear edges and rebuild using add_proximity_factors (matching PyTorch backend)
+        // PyTorch: graph.add_proximity_factors(rad=backend_radius, nms=backend_nms,
+        //          thresh=backend_thresh, beta=beta)
         state.ii_host.clear();
         state.jj_host.clear();
         state.edge_age.clear();
-        for (int i = 0; i < N; i++) {
-            for (int j = std::max(0, i - radius); j < std::min(N, i + radius + 1); j++) {
-                if (i != j) {
-                    state.ii_host.push_back(i);
-                    state.jj_host.push_back(j);
-                    state.edge_age.push_back(0);
-                }
-            }
-        }
+        state.ii_inac.clear();
+        state.jj_inac.clear();
+        state.num_inac = 0;
+        state.max_factors = 16 * N;  // Backend uses max_factors=16*t (matching PyTorch)
+        add_proximity_factors(0, 0, radius, backend_nms, backend_thresh, /*remove_old=*/false);
         state.sync_edges_to_gpu();
         int total_edges = state.num_edges();
+        printf("Backend edges: %d (proximity + distance-based)\n", total_edges);
 
         // Initialize edge hidden states from keyframe nets
         for (int e = 0; e < total_edges; e++) {

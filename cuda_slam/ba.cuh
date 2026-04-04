@@ -451,6 +451,7 @@ struct BundleAdjustment {
             M, H, W);
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        // Debug: dump Cii stats after Jacobian computation
         // Assemble global Hessian on CPU in DOUBLE precision (matching PyTorch's Eigen solver)
         int S_size = P * 6;
         std::vector<double> S_host(S_size * S_size, 0.0);
@@ -679,18 +680,15 @@ struct BundleAdjustment {
             CUDA_CHECK(cudaMemcpy(disps_h.data(), disps, t1 * HW * sizeof(float),
                                   cudaMemcpyDeviceToHost));
 
-            // Update ALL keyframes that had dz computed (matching PyTorch)
+            // Update keyframes that had dz computed (no clamp here - done externally)
             for (int k = 0; k < t1; k++) {
-                // Only update keyframes that had edges
                 bool has_edges = false;
                 for (int e = 0; e < M; e++) {
                     if (ii_host[e] == k) { has_edges = true; break; }
                 }
-                if (!has_edges) continue;
-
-                for (int d = 0; d < HW; d++) {
-                    float val = disps_h[k * HW + d] + all_dz[k * HW + d];
-                    disps_h[k * HW + d] = fmaxf(0.001f, val);
+                if (has_edges) {
+                    for (int d = 0; d < HW; d++)
+                        disps_h[k * HW + d] += all_dz[k * HW + d];
                 }
             }
 
