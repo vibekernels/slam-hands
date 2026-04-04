@@ -243,6 +243,38 @@ Key optimizations:
 5. **Concurrent NVENC video conversion** — NVENC uses a dedicated hardware encoder separate from CUDA cores, so it runs concurrently with SLAM and hand detection. Started at the beginning of the pipeline rather than waiting for inference to complete.
 6. **Service mode** — `pipeline_service.py` keeps models loaded across videos via a persistent `cuda_pipeline --listen` worker. One-time ~9s startup (WiLoR weight loading), then each video reuses warm GPU buffers. SLAM state resets in-place without reallocating memory or reloading weights. Use `--service` flag with the visualizer or `--listen` for batch processing.
 
+### Pipeline timing (service mode, RTX 5090)
+
+```
+  Model loading:    10.9s  (one-time)
+  Run 1 (cold):     23.1s
+  Run 2 (warm):     20.1s
+  Run 3 (warm):     20.9s
+```
+
+### SLAM accuracy (TUM RGB-D benchmark)
+
+CUDA reimplementation matches PyTorch DROID-SLAM:
+
+| Sequence | CUDA | PyTorch | Paper |
+|----------|------|---------|-------|
+| fr1_desk | 0.021m | 0.021m | 0.018m |
+| fr1_room | 0.077m | 0.072m | 0.047m |
+
+ATE RMSE after Sim(3) alignment. Both implementations use the same weights (`droid.pth`), motion threshold (2.5), and backend parameters (distance-based co-visibility edges, radius 2, nms 3, threshold 22.0).
+
+### Bundle adjustment performance
+
+GPU Schur complement assembly vs previous CPU implementation (1812 BA iterations on fr1_desk):
+
+| Phase | GPU | CPU (previous) | Speedup |
+|-------|-----|----------------|---------|
+| Jacobian | 0.10 ms/iter | 0.10 ms/iter | — |
+| Schur complement | 0.28 ms/iter | 36.9 ms/iter | **132x** |
+| Cholesky solve | 0.01 ms/iter | 0.01 ms/iter | — |
+| Back-substitution | 0.09 ms/iter | 3.7 ms/iter | **42x** |
+| **Total BA** | **0.9s** | **74s** | **81x** |
+
 ---
 
 ## Video conversion (standalone)
