@@ -7,6 +7,9 @@
 #include <vector>
 #include <algorithm>
 #include <numeric>
+#include <chrono>
+#include <set>
+#include <map>
 
 #define BA_THREADS 256
 
@@ -239,6 +242,62 @@ __global__ void accum_kernel(
     }
 }
 
+// Same as accum_kernel but adds to output (+=) instead of overwriting
+__global__ void accum_add_kernel(
+    const float* __restrict__ inps,
+    const int* __restrict__ ptrs,
+    const int* __restrict__ idxs,
+    float* __restrict__ outs,
+    int D)
+{
+    const int block_id = blockIdx.x;
+    int start = ptrs[block_id];
+    int end = ptrs[block_id + 1];
+
+    for (int k = threadIdx.x; k < D; k += blockDim.x) {
+        float x = 0;
+        for (int i = start; i < end; i++)
+            x += inps[idxs[i] * D + k];
+        outs[block_id * D + k] += x;
+    }
+}
+
+// Add eta damping to C and compute Q = 1/C
+__global__ void damping_Q_kernel(
+    float* __restrict__ C,           // [N_kf, HW] — modified in place
+    const float* __restrict__ eta,   // [max_kf, HW]
+    const int* __restrict__ kf_map,  // [N_kf] — compact to absolute kf index
+    float* __restrict__ Q,           // [N_kf, HW] — output
+    int N_kf, int HW, float ep)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int kf = idx / HW;
+    int d = idx % HW;
+    if (kf >= N_kf) return;
+    int abs_kf = kf_map[kf];
+    float c = C[kf * HW + d] + 0.2f * eta[abs_kf * HW + d] + ep;
+    C[kf * HW + d] = c;
+    Q[kf * HW + d] = 1.0f / c;
+}
+
+// Compute dz = Q * (w - dw) and apply to disps
+__global__ void depth_update_kernel(
+    const float* __restrict__ Q,      // [N_kf, HW]
+    const float* __restrict__ w,      // [N_kf, HW]
+    const float* __restrict__ dw,     // [N_kf, HW]
+    float* __restrict__ disps,        // [max_kf, HW]
+    const int* __restrict__ kf_map,   // [N_kf]
+    int N_kf, int HW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int kf = idx / HW;
+    int d = idx % HW;
+    if (kf >= N_kf) return;
+    int abs_kf = kf_map[kf];
+    float dz = Q[kf * HW + d] * (w[kf * HW + d] - dw[kf * HW + d]);
+    disps[abs_kf * HW + d] += dz;
+}
+
 // ============ EEt kernel: S -= E * Q * E^T ============
 
 __global__ void EEt6x6_kernel(
@@ -352,42 +411,10 @@ struct BundleAdjustment {
         CUDA_CHECK(cudaMalloc(&devInfo, sizeof(int)));
     }
 
-    // Simple scatter-accumulate on CPU (small arrays)
-    // Accumulates data[src] into out[dst] where src maps to dst via (ix, kx)
-    void accum_cpu(const float* data_gpu, int data_rows, int D,
-                   const int* ii_host, int num_edges,
-                   const int* kx_host, int num_kf,
-                   float* out_gpu) {
-        // Download data
-        std::vector<float> data(data_rows * D);
-        CUDA_CHECK(cudaMemcpy(data.data(), data_gpu, data_rows * D * sizeof(float),
-                              cudaMemcpyDeviceToHost));
-
-        std::vector<float> out(num_kf * D, 0.0f);
-
-        // For each keyframe k, accumulate all edges where ii[edge] maps to k
-        for (int e = 0; e < num_edges; e++) {
-            int src = e;
-            // Find which output row this edge maps to
-            for (int k = 0; k < num_kf; k++) {
-                if (ii_host[e] == kx_host[k]) {
-                    for (int d = 0; d < D; d++)
-                        out[k * D + d] += data[src * D + d];
-                    break;
-                }
-            }
-        }
-
-        CUDA_CHECK(cudaMemcpy(out_gpu, out.data(), num_kf * D * sizeof(float),
-                              cudaMemcpyHostToDevice));
-    }
-
     // Solve dense linear system S * x = b via Cholesky on CPU in double precision
     // (matching PyTorch's Eigen float64 solver)
     void cholesky_solve_double(std::vector<double>& S, std::vector<double>& b, int N,
                                std::vector<float>& dx_out) {
-        // Simple Cholesky LLT factorization
-        // L is stored in lower triangle of S (in-place)
         for (int j = 0; j < N; j++) {
             double sum = 0;
             for (int k = 0; k < j; k++)
@@ -400,14 +427,12 @@ struct BundleAdjustment {
                 S[i*N+j] = (S[i*N+j] - sum2) / S[j*N+j];
             }
         }
-        // Forward substitution: L*y = b
         for (int i = 0; i < N; i++) {
             double sum = 0;
             for (int k = 0; k < i; k++)
                 sum += S[i*N+k] * b[k];
             b[i] = (b[i] - sum) / S[i*N+i];
         }
-        // Back substitution: L^T*x = y
         for (int i = N-1; i >= 0; i--) {
             double sum = 0;
             for (int k = i+1; k < N; k++)
@@ -419,8 +444,35 @@ struct BundleAdjustment {
             dx_out[i] = (float)b[i];
     }
 
-    // Run one BA iteration
-    // Returns dx [P, 6] and optionally dz [num_kf, HW]
+    // Upload int vector to GPU, returns device pointer (caller must cudaFree)
+    int* upload_ints(const std::vector<int>& v) {
+        if (v.empty()) return nullptr;
+        int* d;
+        CUDA_CHECK(cudaMalloc(&d, v.size() * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d, v.data(), v.size() * sizeof(int), cudaMemcpyHostToDevice));
+        return d;
+    }
+
+    // Build CSR-like ptrs/idxs from per-row source lists
+    static void build_ptrs_idxs(const std::vector<std::vector<int>>& sources,
+                                std::vector<int>& ptrs, std::vector<int>& idxs) {
+        int N = sources.size();
+        ptrs.resize(N + 1);
+        ptrs[0] = 0;
+        for (int i = 0; i < N; i++)
+            ptrs[i+1] = ptrs[i] + (int)sources[i].size();
+        idxs.resize(ptrs[N]);
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < (int)sources[i].size(); j++)
+                idxs[ptrs[i] + j] = sources[i][j];
+    }
+
+    // Profiling counters
+    double prof_jac_ms = 0, prof_pose_hs_ms = 0, prof_schur_ms = 0;
+    double prof_solve_ms = 0, prof_backsub_ms = 0;
+    int prof_count = 0;
+
+    // Run one BA iteration with GPU Schur complement
     void iterate(
         float* poses, float* disps, float* intrinsics,
         float* target, float* weight,
@@ -432,8 +484,12 @@ struct BundleAdjustment {
     {
         int P = t1 - t0;
         int M = num_edges;
+        auto tick = [](){ return std::chrono::high_resolution_clock::now(); };
+        auto ms_fn = [](auto a, auto b){ return std::chrono::duration<double,std::milli>(b-a).count(); };
 
-        // Allocate per-edge buffers
+        auto t_start = tick();
+
+        // ── 1. Compute Jacobians on GPU ──
         Hs_buf.alloc(4 * M * 36); Hs_buf.zero();
         vs_buf.alloc(2 * M * 6); vs_buf.zero();
         Eii_buf.alloc(M * 6 * HW); Eii_buf.zero();
@@ -441,7 +497,6 @@ struct BundleAdjustment {
         Cii_buf.alloc(M * HW); Cii_buf.zero();
         wi_buf.alloc(M * HW); wi_buf.zero();
 
-        // Compute Jacobians
         projective_transform_kernel<<<M, BA_THREADS>>>(
             target, weight, poses, disps, intrinsics,
             ii_gpu, jj_gpu,
@@ -450,251 +505,311 @@ struct BundleAdjustment {
             Cii_buf.data, wi_buf.data,
             M, H, W);
         CUDA_CHECK(cudaDeviceSynchronize());
+        auto t_jac = tick();
 
-        // Debug: dump Cii stats after Jacobian computation
-        // Assemble global Hessian on CPU in DOUBLE precision (matching PyTorch's Eigen solver)
+        // ── 2. Scatter pose Hessian blocks into S/b on CPU (small download) ──
         int S_size = P * 6;
         std::vector<double> S_host(S_size * S_size, 0.0);
         std::vector<double> b_host(S_size, 0.0);
 
-        // Download Hs and vs
         std::vector<float> Hs_host(4 * M * 36);
         std::vector<float> vs_host(2 * M * 6);
         Hs_buf.copyTo(Hs_host.data(), 4 * M * 36);
         vs_buf.copyTo(vs_host.data(), 2 * M * 6);
 
-        // Scatter Hessian blocks into global matrix
         for (int e = 0; e < M; e++) {
             int i_idx = ii_host[e] - t0;
             int j_idx = jj_host[e] - t0;
-            bool i_valid = (i_idx >= 0 && i_idx < P);
-            bool j_valid = (j_idx >= 0 && j_idx < P);
-            if (!i_valid && !j_valid) continue;
+            bool iv = (i_idx >= 0 && i_idx < P);
+            bool jv = (j_idx >= 0 && j_idx < P);
+            if (!iv && !jv) continue;
 
-            if (i_valid)
+            if (iv)
                 for (int r = 0; r < 6; r++)
                     for (int c = 0; c < 6; c++)
                         S_host[(i_idx*6+r)*S_size + (i_idx*6+c)] += (double)Hs_host[0*M*36 + e*36 + r*6 + c];
-
-            if (i_valid && j_valid)
+            if (iv && jv)
                 for (int r = 0; r < 6; r++)
-                    for (int c = 0; c < 6; c++)
+                    for (int c = 0; c < 6; c++) {
                         S_host[(i_idx*6+r)*S_size + (j_idx*6+c)] += (double)Hs_host[1*M*36 + e*36 + r*6 + c];
-
-            if (i_valid && j_valid)
-                for (int r = 0; r < 6; r++)
-                    for (int c = 0; c < 6; c++)
                         S_host[(j_idx*6+r)*S_size + (i_idx*6+c)] += (double)Hs_host[2*M*36 + e*36 + r*6 + c];
-
-            if (j_valid)
+                    }
+            if (jv)
                 for (int r = 0; r < 6; r++)
                     for (int c = 0; c < 6; c++)
                         S_host[(j_idx*6+r)*S_size + (j_idx*6+c)] += (double)Hs_host[3*M*36 + e*36 + r*6 + c];
 
-            if (i_valid)
+            if (iv)
                 for (int n = 0; n < 6; n++)
                     b_host[i_idx*6+n] += (double)vs_host[0*M*6 + e*6 + n];
-            if (j_valid)
+            if (jv)
                 for (int n = 0; n < 6; n++)
                     b_host[j_idx*6+n] += (double)vs_host[1*M*6 + e*6 + n];
         }
 
+        auto t_pose_hs = tick();
+
+        // Track GPU index pointers for cleanup
+        std::vector<int*> gpu_idx_ptrs;
+        auto track = [&](int* p) { if (p) gpu_idx_ptrs.push_back(p); return p; };
+
+        int N_E = 0, N_kf = 0, N_pairs = 0;
+        struct EEtPoseMap { int pose_i, pose_j; };
+        std::vector<EEtPoseMap> eet_pose_map;
+        std::vector<int> E_row_pose;
+        // GPU pointers needed for back-substitution (set in Schur block, used after solve)
+        int* d_evt_idx = nullptr;
+        int* d_kf_map = nullptr;
+        int* d_bs_ptrs = nullptr;
+        int* d_bs_idxs = nullptr;
+
         if (!motion_only) {
-            // Download per-edge Jacobian coupling terms
-            std::vector<float> Eii_h(M * 6 * HW), Eij_h(M * 6 * HW);
-            std::vector<float> Cii_h(M * HW), bz_h(M * HW);
-            Eii_buf.copyTo(Eii_h.data(), M * 6 * HW);
-            Eij_buf.copyTo(Eij_h.data(), M * 6 * HW);
-            Cii_buf.copyTo(Cii_h.data(), M * HW);
-            wi_buf.copyTo(bz_h.data(), M * HW);
+            // ── 3. Build index structures on CPU ──
 
-            // Download eta (GRU damping per keyframe)
-            std::vector<float> eta_h(t1 * HW);
-            CUDA_CHECK(cudaMemcpy(eta_h.data(), eta, t1 * HW * sizeof(float),
-                                  cudaMemcpyDeviceToHost));
+            // Unique depth keyframes from ii
+            std::set<int> kf_set;
+            for (int e = 0; e < M; e++) kf_set.insert(ii_host[e]);
+            std::vector<int> kf_list(kf_set.begin(), kf_set.end());
+            N_kf = kf_list.size();
+            std::map<int, int> kf_compact;
+            for (int i = 0; i < N_kf; i++) kf_compact[kf_list[i]] = i;
 
-            // For each depth keyframe k referenced by edges, compute Schur complement
-            for (int k = 0; k < t1; k++) {
-                // Find all edges with ii[e] == k
-                std::vector<int> k_edges;
-                for (int e = 0; e < M; e++)
-                    if (ii_host[e] == k) k_edges.push_back(e);
-                if (k_edges.empty()) continue;
+            // Enumerate (pose, kf) pairs → E rows
+            std::map<std::pair<int,int>, int> pair_to_E;
+            struct ERowInfo { int pose_idx; int kf_compact_idx; };
+            std::vector<ERowInfo> E_rows_info;
 
-                // Accumulate C_k and w_k for this depth keyframe
-                std::vector<float> C_k(HW, 0), w_k(HW, 0);
-                for (int e : k_edges) {
-                    for (int d = 0; d < HW; d++) {
-                        C_k[d] += Cii_h[e * HW + d];
-                        w_k[d] += bz_h[e * HW + d];
-                    }
+            auto get_E_row = [&](int pose_idx, int kf_abs) -> int {
+                auto key = std::make_pair(pose_idx, kf_abs);
+                auto it = pair_to_E.find(key);
+                if (it != pair_to_E.end()) return it->second;
+                int r = E_rows_info.size();
+                pair_to_E[key] = r;
+                E_rows_info.push_back({pose_idx, kf_compact[kf_abs]});
+                return r;
+            };
+
+            for (int e = 0; e < M; e++) {
+                int pi = ii_host[e] - t0;
+                if (pi >= 0 && pi < P) get_E_row(pi, ii_host[e]);
+                int pj = jj_host[e] - t0;
+                if (pj >= 0 && pj < P) get_E_row(pj, ii_host[e]);
+            }
+            N_E = E_rows_info.size();
+
+            // Build Eii accum sources: edge e → E_row[(ii[e]-t0, ii[e])]
+            std::vector<std::vector<int>> eii_src(N_E);
+            for (int e = 0; e < M; e++) {
+                int pi = ii_host[e] - t0;
+                if (pi >= 0 && pi < P) {
+                    int r = pair_to_E[{pi, ii_host[e]}];
+                    eii_src[r].push_back(e);
                 }
-                // Add eta damping (matching PyTorch: C += 0.2*damping + EP)
-                for (int d = 0; d < HW; d++)
-                    C_k[d] += 0.2f * eta_h[k * HW + d] + 1e-7f;
+            }
 
-                // Q_k = 1/C_k
-                std::vector<float> Q_k(HW);
-                for (int d = 0; d < HW; d++)
-                    Q_k[d] = 1.0f / C_k[d];
-
-                // Build E coupling vectors per connected pose (only optimizable poses)
-                std::vector<std::pair<int, std::vector<float>>> pose_E_list;
-                auto get_or_add = [&](int p_idx) -> std::vector<float>& {
-                    for (auto& [idx, vec] : pose_E_list)
-                        if (idx == p_idx) return vec;
-                    pose_E_list.push_back({p_idx, std::vector<float>(6 * HW, 0)});
-                    return pose_E_list.back().second;
-                };
-
-                // Self-coupling (pose k, depth k): accumulate Eii
-                int k_idx = k - t0;
-                if (k_idx >= 0 && k_idx < P) {
-                    auto& Ek = get_or_add(k_idx);
-                    for (int e : k_edges)
-                        for (int n = 0; n < 6; n++)
-                            for (int d = 0; d < HW; d++)
-                                Ek[n * HW + d] += Eii_h[e * 6 * HW + n * HW + d];
+            // Build Eij accum sources: edge e → E_row[(jj[e]-t0, ii[e])]
+            std::vector<std::vector<int>> eij_src(N_E);
+            for (int e = 0; e < M; e++) {
+                int pj = jj_host[e] - t0;
+                if (pj >= 0 && pj < P) {
+                    int r = pair_to_E[{pj, ii_host[e]}];
+                    eij_src[r].push_back(e);
                 }
+            }
 
-                // Cross-coupling (pose jj[e], depth k): accumulate Eij
-                for (int e : k_edges) {
-                    int p = jj_host[e] - t0;
-                    if (p < 0 || p >= P) continue;
-                    auto& Ep = get_or_add(p);
-                    for (int n = 0; n < 6; n++)
-                        for (int d = 0; d < HW; d++)
-                            Ep[n * HW + d] += Eij_h[e * 6 * HW + n * HW + d];
-                }
+            // Build C/w accum sources: edge e → kf_compact[ii[e]]
+            std::vector<std::vector<int>> c_src(N_kf);
+            for (int e = 0; e < M; e++)
+                c_src[kf_compact[ii_host[e]]].push_back(e);
 
-                // Subtract Schur complement: S -= E * Q * E^T, b -= E * Q * w
-                for (auto& [p1, E1] : pose_E_list) {
-                    for (int n = 0; n < 6; n++) {
-                        double sum = 0;
-                        for (int d = 0; d < HW; d++)
-                            sum += (double)E1[n * HW + d] * (double)Q_k[d] * (double)w_k[d];
-                        b_host[p1 * 6 + n] -= sum;
-                    }
-                    for (auto& [p2, E2] : pose_E_list) {
-                        for (int n = 0; n < 6; n++) {
-                            for (int m = 0; m < 6; m++) {
-                                double sum = 0;
-                                for (int d = 0; d < HW; d++)
-                                    sum += (double)E1[n * HW + d] * (double)Q_k[d] * (double)E2[m * HW + d];
-                                S_host[(p1*6+n) * S_size + (p2*6+m)] -= sum;
-                            }
-                        }
+            // Build EEt pair list: for each kf, all pairs of E rows
+            std::vector<std::vector<int>> kf_E_rows(N_kf);
+            for (int r = 0; r < N_E; r++)
+                kf_E_rows[E_rows_info[r].kf_compact_idx].push_back(r);
+
+            std::vector<int> eet_idx;
+            for (int kc = 0; kc < N_kf; kc++) {
+                auto& rows = kf_E_rows[kc];
+                for (int r1 : rows) {
+                    for (int r2 : rows) {
+                        eet_idx.push_back(r1);
+                        eet_idx.push_back(r2);
+                        eet_idx.push_back(kc);
+                        eet_pose_map.push_back({E_rows_info[r1].pose_idx, E_rows_info[r2].pose_idx});
                     }
                 }
             }
+            N_pairs = eet_pose_map.size();
+
+            // Ev index: E row → compact kf
+            std::vector<int> ev_idx(N_E);
+            E_row_pose.resize(N_E);
+            for (int r = 0; r < N_E; r++) {
+                ev_idx[r] = E_rows_info[r].kf_compact_idx;
+                E_row_pose[r] = E_rows_info[r].pose_idx;
+            }
+
+            // EvT index: E row → pose index in dx
+            std::vector<int> evt_idx(N_E);
+            for (int r = 0; r < N_E; r++)
+                evt_idx[r] = E_rows_info[r].pose_idx;
+
+            // Convert to flat CSR arrays
+            std::vector<int> eii_ptrs, eii_idxs, eij_ptrs, eij_idxs;
+            std::vector<int> c_ptrs, c_idxs, bs_ptrs, bs_idxs;
+            build_ptrs_idxs(eii_src, eii_ptrs, eii_idxs);
+            build_ptrs_idxs(eij_src, eij_ptrs, eij_idxs);
+            build_ptrs_idxs(c_src, c_ptrs, c_idxs);
+            build_ptrs_idxs(kf_E_rows, bs_ptrs, bs_idxs);
+
+            // ── 4. Upload indices to GPU ──
+            int* d_eii_ptrs = track(upload_ints(eii_ptrs));
+            int* d_eii_idxs = track(upload_ints(eii_idxs));
+            int* d_eij_ptrs = track(upload_ints(eij_ptrs));
+            int* d_eij_idxs = track(upload_ints(eij_idxs));
+            int* d_c_ptrs   = track(upload_ints(c_ptrs));
+            int* d_c_idxs   = track(upload_ints(c_idxs));
+            int* d_eet_idx  = track(upload_ints(eet_idx));
+            int* d_ev_idx   = track(upload_ints(ev_idx));
+            d_evt_idx       = track(upload_ints(evt_idx));
+            d_kf_map        = track(upload_ints(kf_list));
+            d_bs_ptrs       = track(upload_ints(bs_ptrs));
+            d_bs_idxs       = track(upload_ints(bs_idxs));
+
+            // ── 5. GPU accumulation: Eii/Eij → E, Cii/bz → C/w ──
+            E_buf.alloc(N_E * 6 * HW); E_buf.zero();
+            if (N_E > 0) {
+                accum_kernel<<<N_E, BA_THREADS>>>(
+                    Eii_buf.data, d_eii_ptrs, d_eii_idxs, E_buf.data, 6 * HW);
+                accum_add_kernel<<<N_E, BA_THREADS>>>(
+                    Eij_buf.data, d_eij_ptrs, d_eij_idxs, E_buf.data, 6 * HW);
+            }
+
+            C_buf.alloc(N_kf * HW); C_buf.zero();
+            w_buf.alloc(N_kf * HW); w_buf.zero();
+            if (N_kf > 0) {
+                accum_kernel<<<N_kf, BA_THREADS>>>(
+                    Cii_buf.data, d_c_ptrs, d_c_idxs, C_buf.data, HW);
+                accum_kernel<<<N_kf, BA_THREADS>>>(
+                    wi_buf.data, d_c_ptrs, d_c_idxs, w_buf.data, HW);
+            }
+
+            // ── 6. Damping + Q on GPU ──
+            Q_buf.alloc(N_kf * HW);
+            if (N_kf > 0) {
+                int total = N_kf * HW;
+                damping_Q_kernel<<<(total + 255) / 256, 256>>>(
+                    C_buf.data, eta, d_kf_map, Q_buf.data, N_kf, HW, 1e-7f);
+            }
+
+            // ── 7. GPU Schur complement: EEt → S blocks ──
+            S_buf.alloc(std::max(N_pairs, 1) * 36); S_buf.zero();
+            if (N_pairs > 0) {
+                EEt6x6_kernel<<<N_pairs, BA_THREADS>>>(
+                    E_buf.data, Q_buf.data, d_eet_idx, S_buf.data, HW, N_pairs);
+            }
+
+            // ── 8. GPU Ev: b correction ──
+            GpuBuf b_corr_buf;
+            b_corr_buf.alloc(std::max(N_E, 1) * 6); b_corr_buf.zero();
+            if (N_E > 0) {
+                Ev6x1_kernel<<<N_E, BA_THREADS>>>(
+                    E_buf.data, Q_buf.data, w_buf.data, d_ev_idx,
+                    b_corr_buf.data, HW, N_E);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            // ── 9. Download small S blocks + b corrections, scatter into S_host/b_host ──
+            if (N_pairs > 0) {
+                std::vector<float> S_pairs_h(N_pairs * 36);
+                S_buf.copyTo(S_pairs_h.data(), N_pairs * 36);
+                for (int p = 0; p < N_pairs; p++) {
+                    int p1 = eet_pose_map[p].pose_i;
+                    int p2 = eet_pose_map[p].pose_j;
+                    for (int n = 0; n < 6; n++)
+                        for (int m = 0; m < 6; m++)
+                            S_host[(p1*6+n)*S_size + (p2*6+m)] -= (double)S_pairs_h[p*36 + n*6 + m];
+                }
+            }
+            if (N_E > 0) {
+                std::vector<float> b_corr_h(N_E * 6);
+                b_corr_buf.copyTo(b_corr_h.data(), N_E * 6);
+                for (int r = 0; r < N_E; r++) {
+                    int p = E_row_pose[r];
+                    for (int n = 0; n < 6; n++)
+                        b_host[p*6+n] -= (double)b_corr_h[r*6+n];
+                }
+            }
+            b_corr_buf.free();
         }
 
-        // Add damping (in double)
+        auto t_schur = tick();
+
+        // ── 10. LM damping + Cholesky solve on CPU ──
         for (int i = 0; i < S_size; i++)
             S_host[i*S_size + i] += (double)ep + (double)lm * S_host[i*S_size + i];
 
-        // Solve in double precision on CPU
         std::vector<float> dx_f32;
         cholesky_solve_double(S_host, b_host, S_size, dx_f32);
+        auto t_solve = tick();
 
-        // Apply pose retraction
+        // ── 11. Apply pose retraction ──
         dx_buf.alloc(P * 6);
         CUDA_CHECK(cudaMemcpy(dx_buf.data, dx_f32.data(), P * 6 * sizeof(float),
                               cudaMemcpyHostToDevice));
         pose_retr_kernel<<<1, BA_THREADS>>>(poses, dx_buf.data, t0, t1);
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        if (!motion_only) {
-            // Back-substitute for depth updates: dz = Q * (w - E^T * dx)
-            std::vector<float>& dx_h = dx_f32;
+        if (!motion_only && N_E > 0) {
+            // ── 12. GPU back-substitution: E^T * dx → dw per E row ──
+            GpuBuf dw_per_E;
+            dw_per_E.alloc(N_E * HW); dw_per_E.zero();
 
-            // Re-download per-edge Eii, Eij, Cii, bz for back-substitution
-            std::vector<float> Eii_h(M * 6 * HW), Eij_h(M * 6 * HW);
-            std::vector<float> Cii_h(M * HW), bz_h(M * HW);
-            Eii_buf.copyTo(Eii_h.data(), M * 6 * HW);
-            Eij_buf.copyTo(Eij_h.data(), M * 6 * HW);
-            Cii_buf.copyTo(Cii_h.data(), M * HW);
-            wi_buf.copyTo(bz_h.data(), M * HW);
+            EvT6x1_kernel<<<N_E, BA_THREADS>>>(
+                E_buf.data, dx_buf.data, d_evt_idx,
+                dw_per_E.data, HW, N_E, P);
 
-            std::vector<float> eta_h(t1 * HW);
-            CUDA_CHECK(cudaMemcpy(eta_h.data(), eta, t1 * HW * sizeof(float),
-                                  cudaMemcpyDeviceToHost));
+            // ── 13. Accumulate dw by kf → [N_kf, HW] ──
+            GpuBuf dw_buf;
+            dw_buf.alloc(N_kf * HW); dw_buf.zero();
 
-            // For each depth keyframe k, compute dz[k]
-            // Include ALL keyframes referenced by edges (matching PyTorch's kx)
-            std::vector<float> all_dz(t1 * HW, 0);
-            for (int k = 0; k < t1; k++) {
-                int k_idx = k - t0;
+            accum_kernel<<<N_kf, BA_THREADS>>>(
+                dw_per_E.data, d_bs_ptrs, d_bs_idxs,
+                dw_buf.data, HW);
 
-                std::vector<int> k_edges;
-                for (int e = 0; e < M; e++)
-                    if (ii_host[e] == k) k_edges.push_back(e);
-                if (k_edges.empty()) continue;
+            // ── 14. dz = Q*(w-dw), apply to disps on GPU ──
+            int total = N_kf * HW;
+            depth_update_kernel<<<(total + 255) / 256, 256>>>(
+                Q_buf.data, w_buf.data, dw_buf.data, disps,
+                d_kf_map, N_kf, HW);
 
-                // Accumulate C_k, w_k
-                std::vector<float> C_k(HW, 0), w_k(HW, 0);
-                for (int e : k_edges) {
-                    for (int d = 0; d < HW; d++) {
-                        C_k[d] += Cii_h[e * HW + d];
-                        w_k[d] += bz_h[e * HW + d];
-                    }
-                }
-                for (int d = 0; d < HW; d++)
-                    C_k[d] += 0.2f * eta_h[k * HW + d] + 1e-7f;
-
-                // Compute E^T * dx contribution
-                // dw[d] = sum_p sum_n E[p,k,n,d] * dx[p,n]
-                std::vector<float> dw(HW, 0);
-
-                // From Eii: E[k_idx, k, n, d] * dx[k_idx, n]
-                if (k_idx >= 0 && k_idx < P) {
-                    // Accumulate Eii per keyframe
-                    std::vector<float> Ek(6 * HW, 0);
-                    for (int e : k_edges)
-                        for (int n = 0; n < 6; n++)
-                            for (int d = 0; d < HW; d++)
-                                Ek[n * HW + d] += Eii_h[e * 6 * HW + n * HW + d];
-                    for (int d = 0; d < HW; d++)
-                        for (int n = 0; n < 6; n++)
-                            dw[d] += Ek[n * HW + d] * dx_h[k_idx * 6 + n];
-                }
-
-                // From Eij: E[jj[e]-t0, k, n, d] * dx[jj[e]-t0, n]
-                for (int e : k_edges) {
-                    int p = jj_host[e] - t0;
-                    if (p < 0 || p >= P) continue;
-                    for (int d = 0; d < HW; d++)
-                        for (int n = 0; n < 6; n++)
-                            dw[d] += Eij_h[e * 6 * HW + n * HW + d] * dx_h[p * 6 + n];
-                }
-
-                // dz = Q * (w - dw), dampened
-                for (int d = 0; d < HW; d++) {
-                    float Q_kd = 1.0f / C_k[d];
-                    all_dz[k * HW + d] = Q_kd * (w_k[d] - dw[d]);
-                }
-            }
-
-            // Apply depth update: disps[k] += dz[k], clamp
-            std::vector<float> disps_h(t1 * HW);
-            CUDA_CHECK(cudaMemcpy(disps_h.data(), disps, t1 * HW * sizeof(float),
-                                  cudaMemcpyDeviceToHost));
-
-            // Update keyframes that had dz computed (no clamp here - done externally)
-            for (int k = 0; k < t1; k++) {
-                bool has_edges = false;
-                for (int e = 0; e < M; e++) {
-                    if (ii_host[e] == k) { has_edges = true; break; }
-                }
-                if (has_edges) {
-                    for (int d = 0; d < HW; d++)
-                        disps_h[k * HW + d] += all_dz[k * HW + d];
-                }
-            }
-
-            CUDA_CHECK(cudaMemcpy(disps, disps_h.data(), t1 * HW * sizeof(float),
-                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            dw_per_E.free();
+            dw_buf.free();
+        } else {
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
+
+        auto t_end = tick();
+
+        // Free GPU index arrays
+        for (int* p : gpu_idx_ptrs) cudaFree(p);
+
+        prof_jac_ms += ms_fn(t_start, t_jac);
+        prof_pose_hs_ms += ms_fn(t_jac, t_pose_hs);
+        prof_schur_ms += ms_fn(t_pose_hs, t_schur);
+        prof_solve_ms += ms_fn(t_schur, t_solve);
+        prof_backsub_ms += ms_fn(t_solve, t_end);
+        prof_count++;
+    }
+
+    void print_profile() {
+        if (prof_count == 0) return;
+        fprintf(stderr, "  BA profile (%d iterations):\n", prof_count);
+        fprintf(stderr, "    Jacobian:   %8.1f ms total, %6.2f ms/iter\n", prof_jac_ms, prof_jac_ms/prof_count);
+        fprintf(stderr, "    Pose Hs:    %8.1f ms total, %6.2f ms/iter\n", prof_pose_hs_ms, prof_pose_hs_ms/prof_count);
+        fprintf(stderr, "    Schur:      %8.1f ms total, %6.2f ms/iter\n", prof_schur_ms, prof_schur_ms/prof_count);
+        fprintf(stderr, "    Solve:      %8.1f ms total, %6.2f ms/iter\n", prof_solve_ms, prof_solve_ms/prof_count);
+        fprintf(stderr, "    BackSub:    %8.1f ms total, %6.2f ms/iter\n", prof_backsub_ms, prof_backsub_ms/prof_count);
     }
 
     void destroy() {

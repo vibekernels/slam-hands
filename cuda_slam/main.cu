@@ -2503,6 +2503,7 @@ struct CudaDroid {
         printf("  Total:       %8.2f ms total, %6.2f ms/frame (%5.1f fps)\n",
                t_total.elapsed_ms, t_total.elapsed_ms / num_frames,
                1000.0f * num_frames / t_total.elapsed_ms);
+        ba.print_profile();
     }
 
     void destroy() {
