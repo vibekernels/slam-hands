@@ -1,6 +1,6 @@
 # robot-video
 
-Annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) datasets following the [EgoVerse](https://arxiv.org/abs/2501.14394) format with:
+Experimental annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) datasets following the [EgoVerse](https://arxiv.org/abs/2501.14394) format with:
 
 - **SLAM camera poses** (7-DoF: translation + quaternion) via CUDA DROID-SLAM
 - **3D hand poses** (21 MANO keypoints per hand) via WiLoR
