@@ -1,4 +1,4 @@
-# robot-video
+# slam-hands
 
 Experimental annotation pipeline for egocentric robot learning videos. Produces [LeRobot v3.0](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) datasets following the [EgoVerse](https://arxiv.org/abs/2501.14394) format with:
 
